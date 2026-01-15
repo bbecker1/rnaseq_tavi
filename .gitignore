@@ -1,0 +1,8 @@
+dat/
+res/
+*.fastq.gz
+*.bam
+*.sam
+*.rds
+.Rhistory
+.RData
