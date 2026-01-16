@@ -1,0 +1,470 @@
+---
+title: "DEanalysis"
+---
+
+<https://hbctraining.github.io/Intro-to-DGE/schedule/links-to-lessons.html>
+
+```{r}
+#Pakete werden aus separatem Setup Skript geladen
+source("../../org/setup_packages.R")
+
+library(tidyverse)   # %>% , dplyr, ggplot2, stringr, tibble, ...
+library(readxl)
+library(janitor)
+library(DESeq2)
+library(tximport)
+library(pheatmap)
+library(RColorBrewer)
+library(ggrepel)
+library(cowplot)
+library(DEGreport)
+library(clusterProfiler)
+library(DOSE)
+library(org.Hs.eg.db)
+library(pathview)
+library(AnnotationHub)
+library(ensembldb)
+library(apeglm)
+library(ashr)
+
+sessionInfo()
+```
+
+```{r}
+#| echo: false
+#| warning: false
+# Pfade
+salmon <- "../../dat/salmon_files"
+tx2g   <- "../../dat/info_files/tx2gene.tsv"
+excel  <- "../../dat/info_files/CCGA_sequencing_NM_ventricular_dysfunction_RNAseq_2342.xlsx"
+
+# Salmon-Files einlesen
+files <- list.files(
+  path      = salmon,
+  full.names = TRUE,
+  pattern   = "_quant\\.sf$"
+)
+
+# Saubere Namen für tximport
+names(files) <- basename(files) %>%
+  str_remove("_quant\\.sf$") %>%    # Endung entfernen
+  str_remove("-L[0-9]+$")           # evtl. Library-Nummer entfernen
+
+# Duplikate ausschließen
+stopifnot(length(files) > 1)
+stopifnot(!anyDuplicated(names(files)))
+
+# tx2gene einlesen
+tx2gene <- read.delim(tx2g)
+tx2gene[,1] <- sub("\\..*$", "", tx2gene[,1])  # Versionsnummer entfernen
+tx2gene <- tx2gene[, c(1,2)]                    # Nur tx_id und gene_id
+
+# tximport
+txi_cache <- "../../res/cache/txi_salmon_tximport.rds"
+dir.create(dirname(txi_cache), recursive = TRUE, showWarnings = FALSE)
+
+if (file.exists(txi_cache)) {
+  message("✅ Lade tximport Cache: ", txi_cache)
+  txi <- readRDS(txi_cache)
+} else {
+  message("⏳ Rechne tximport…")
+  txi <- tximport(
+    files,
+    type = "salmon",
+    tx2gene = tx2gene,
+    countsFromAbundance = "lengthScaledTPM",
+    ignoreTxVersion = TRUE
+  )
+  saveRDS(txi, txi_cache)
+  message("💾 Gespeichert: ", txi_cache)
+}
+
+# Sample-Namen in txi bereinigen
+colnames(txi$counts)    <- str_remove(colnames(txi$counts), "_quant\\.sf$")
+colnames(txi$abundance) <- str_remove(colnames(txi$abundance), "_quant\\.sf$")
+colnames(txi$length)    <- str_remove(colnames(txi$length), "_quant\\.sf$")
+
+# ─── 6️⃣ Metadata einlesen ───
+md <- read_excel(excel, sheet = "Metadata", skip = 1) %>%
+  janitor::clean_names() %>%
+  mutate(sample_id = str_remove(library_id, "-L[0-9]+$") %>% str_trim())
+
+input <- read_excel(excel, sheet = 3, skip = 1) %>%
+  janitor::clean_names() %>%
+  mutate(
+    valve_treated = if_else(str_starts(sample_name, regex("^t", TRUE)),
+                            "tricuspid valve",
+                            "aortic valve"),
+    timepoint = str_extract(sample_name, "(?<=_).*"),
+    pid       = str_extract(sample_name, "^[^_]+")
+  ) %>%
+  dplyr::select(external_id, valve_treated, timepoint, pid)
+
+md <- left_join(md, input, by = "external_id")
+stopifnot(all(!is.na(md$valve_treated)))
+
+# ============================================================
+# ✅ DIAGNOSTIK: Counts-Samples vs. Metadata-Samples
+# (sehr häufige Fehlerquelle: IDs passen nicht 1:1)
+# ============================================================
+counts_samples <- colnames(txi$counts)
+
+in_counts_not_meta <- setdiff(counts_samples, md$sample_id)
+in_meta_not_counts <- setdiff(md$sample_id, counts_samples)
+
+message("Samples in counts but not metadata: ", length(in_counts_not_meta))
+message("Samples in metadata but not counts: ", length(in_meta_not_counts))
+
+if (length(in_counts_not_meta) > 0) {
+  message("→ In counts, not in metadata:")
+  print(in_counts_not_meta)
+}
+
+if (length(in_meta_not_counts) > 0) {
+  message("→ In metadata, not in counts:")
+  print(in_meta_not_counts)
+}
+
+# Abbrechen, wenn es Mismatches gibt
+stopifnot(length(in_counts_not_meta) == 0, length(in_meta_not_counts) == 0)
+
+
+# Nur Aorten-Samples behalten
+keep_aortic <- intersect(colnames(txi$counts),
+                         md$sample_id[md$valve_treated == "aortic valve"])
+
+stopifnot(length(keep_aortic) > 1)
+stopifnot(!anyDuplicated(keep_aortic))
+
+txi_aortic <- list(
+  counts    = txi$counts[, keep_aortic, drop = FALSE],
+  abundance = txi$abundance[, keep_aortic, drop = FALSE],
+  length    = txi$length[, keep_aortic, drop = FALSE]
+)
+
+
+md_aortic <- md[md$sample_id %in% keep_aortic, ]
+
+cat("Anzahl Aorten-Samples:", length(keep_aortic), "\n")
+head(md_aortic)
+
+
+```
+
+```{r}
+#| echo: false
+#| warning: false
+
+### Exploring RNA-seq count data
+
+#Die Count-Verteilung einer einzelnen Probe ansehen
+counts_aortic <- as.data.frame(txi_aortic$counts)
+
+sample <- colnames(counts_aortic)[1]
+
+ggplot(counts_aortic) +
+  geom_histogram(aes(x = .data[[sample]]), bins = 200) +
+  xlab("Raw expression counts") +
+  ylab("Number of genes")
+
+# Mean–Variance Plot (RNA-seq count data) für Aorten-Counts
+
+# 2) Mean und Varianz pro Gen (über alle ausgewählten Samples/Spalten)
+mean_counts     <- apply(counts_aortic, 1, mean, na.rm = TRUE)  # '1' = zeilenweise (Gene)
+variance_counts <- apply(counts_aortic, 1, var,  na.rm = TRUE)
+
+# 3) Dataframe für ggplot
+df_mv <- data.frame(
+  mean_counts = mean_counts,
+  variance_counts = variance_counts
+)
+
+# Gene mit mean/var <= 0 entfernen (log10 braucht > 0)
+df_mv <- dplyr::filter(
+  df_mv,
+  mean_counts > 0,
+  variance_counts > 0
+)
+
+# 4) Plot: log10-mean vs log10-variance, rote Linie = x=y
+ggplot(df_mv) +
+  geom_point(aes(x = mean_counts, y = variance_counts), alpha = 0.4) +
+  scale_x_log10(limits = c(1, 1e9)) +
+  scale_y_log10(limits = c(1, 1e9)) +
+  geom_abline(intercept = 0, slope = 1, color = "red") +
+  labs(
+    title = "Mean–Variance Relationship (Aortic valve RNA-seq counts)",
+    x = "Mean of counts per gene (log10)",
+    y = "Variance of counts per gene (log10)"
+  )
+# Daten passen nicht zur Poission-Verteilung, weil die Varianz >> Mittelwert (Overdispersion). Besonders bei höher exprimierten Genene ist die Varianz viel größer. Das rechtfertigt die Verwendung der Negativ-Binomial-Modelle von DESeq2
+
+# ============================================================
+# DESeq2: Normalisierung (Size-Factor / "median-of-ratios")
+# Kontext: Salmon -> tximport -> DESeq2
+# Ziel: Normalisierte Counts erzeugen (nur für Visualisierung/QC),
+#       NICHT als Input für DE-Tests verwenden.
+# ============================================================
+
+# ------------------------------------------------------------
+# VORAUSSETZUNGEN (existieren bereits im Workspace)
+#   txi        : komplettes tximport-Objekt (aus tximport())
+#   txi_aortic : gefiltertes tximport-Objekt für Aorten-Samples
+#               (list mit counts/abundance/length)
+#   md_aortic  : Metadata passend zu Aorten-Samples
+#               (mind. sample_id, pid, timepoint)
+# ------------------------------------------------------------
+
+# ------------------------------------------------------------
+# 1) Metadata für DESeq2 vorbereiten
+#    - sample_id muss character sein (IDs)
+#    - pid/timepoint als factor (Design-Variablen)
+#    - rownames(meta) müssen exakt die Sample-IDs sein
+# ------------------------------------------------------------
+meta <- md_aortic %>%
+  mutate(
+    sample_id = as.character(sample_id),
+    pid       = factor(pid),        # Patient-ID
+    timepoint = factor(timepoint)   
+  ) %>%
+  as.data.frame()
+
+rownames(meta) <- meta$sample_id
+
+# ------------------------------------------------------------
+# 2) Sicherstellen, dass Counts-Spalten und Metadata-Zeilen matchen
+#    DESeq2 verlangt:
+#      colnames(counts) == rownames(colData)
+#    Reihenfolge ist KRITISCH (sonst falsche Zuordnung)
+# ------------------------------------------------------------
+
+# Check: alle Count-Sample-IDs existieren in meta?
+stopifnot(all(colnames(txi_aortic$counts) %in% rownames(meta)))
+
+# Meta exakt in die Reihenfolge der Count-Spalten bringen
+meta <- meta[match(colnames(txi_aortic$counts), rownames(meta)), , drop = FALSE]
+
+# Check: jetzt exakt identisch und in gleicher Reihenfolge?
+stopifnot(all(colnames(txi_aortic$counts) == rownames(meta)))
+
+# ------------------------------------------------------------
+# 3) WICHTIG: tximport-Metainfo erhalten
+#    DESeqDataSetFromTximport() erwartet u.a. txi$countsFromAbundance
+#    Wenn txi_aortic "manuell" als Liste gebaut wurde, fehlt das oft.
+#    Wir kopieren deshalb den Wert aus dem originalen txi.
+# ------------------------------------------------------------
+txi_aortic$countsFromAbundance <- txi$countsFromAbundance
+
+# ------------------------------------------------------------
+# 4) DESeqDataSet erstellen
+#    Design: ~ pid + timepoint
+#    - pid modelliert patientenspezifische Baselines
+#    - timepoint testet die systematische Änderung über die Zeit
+# ------------------------------------------------------------
+dds <- DESeqDataSetFromTximport(
+  txi = txi_aortic,
+  colData = meta,
+  design = ~ pid + timepoint
+)
+
+# ------------------------------------------------------------
+# 5) (Optional aber empfohlen) Prefiltering:
+#    Entfernt Gene mit extrem niedrigen Counts in allen Samples,
+#    verbessert Laufzeit und reduziert Noise.
+# ------------------------------------------------------------
+dds <- dds[rowSums(counts(dds)) >= 10, ]
+
+# ------------------------------------------------------------
+# 6) Normalisierung: Size Factors schätzen
+#    DESeq2 nutzt "median-of-ratios" (robust gegen Outlier/Geneffekte)
+#    Hinweis: In der echten DE-Analyse macht DESeq() das automatisch.
+# ------------------------------------------------------------
+dds <- estimateSizeFactors(dds)
+
+# Size factors inspizieren (sollten grob um 1 liegen; Unterschiede = Library size etc.)
+sf <- sizeFactors(dds)
+print(sf)
+
+# ------------------------------------------------------------
+# 7) Normalisierte Counts extrahieren
+#    Diese Matrix ist sinnvoll für:
+#      - PCA / Heatmaps / Plots
+#    NICHT sinnvoll als Input für DESeq2-DE-Tests (die arbeiten mit Rohcounts + Modell)
+# ------------------------------------------------------------
+normalized_counts <- counts(dds, normalized = TRUE)
+
+# ------------------------------------------------------------
+# 8) Speichern
+# ------------------------------------------------------------
+write.table(
+  normalized_counts,
+  file = "../../res/normalized_counts_aortic_DESeq2.tsv",
+  sep = "\t",
+  quote = FALSE,
+  col.names = NA
+)
+```
+
+```{r}
+### ============================================================
+### Quality Control (QC) – DESeq2 RNA-seq
+### Hinweis: rlog() kann bei >=50 Samples lange dauern; vst() ist deutlich schneller.
+### Daher: nur vst() verwenden (auch für PC3/PC4), kein rlog().
+### ============================================================
+
+# ------------------------------------------------------------
+# 1) Varianz-stabilisierende Transformation (schnell für viele Samples)
+# ------------------------------------------------------------
+trans <- vst(dds, blind = TRUE)
+
+# ------------------------------------------------------------
+# 2) PCA – schnelle Übersicht (DESeq2-Default)
+# ------------------------------------------------------------
+plotPCA(trans, intgroup = "timepoint")
+
+# ------------------------------------------------------------
+# 3) PCA – angepasstes ggplot (PC1 vs PC2)
+# ------------------------------------------------------------
+pca_df <- plotPCA(trans, intgroup = "timepoint", returnData = TRUE)
+percentVar <- round(100 * attr(pca_df, "percentVar"))
+
+ggplot(pca_df, aes(x = PC1, y = PC2, color = timepoint)) +
+  geom_point(size = 3) +
+  xlab(paste0("PC1: ", percentVar[1], "% Varianz")) +
+  ylab(paste0("PC2: ", percentVar[2], "% Varianz")) +
+  theme_minimal()
+
+# ------------------------------------------------------------
+# 4) PCA – höhere Komponenten (PC3 vs PC4) mit vst-Matrix
+# ------------------------------------------------------------
+trans_mat <- assay(trans)        # Gene x Samples
+pca <- prcomp(t(trans_mat))      # PCA auf Samples
+
+df_pc <- cbind(
+  as.data.frame(colData(dds)),
+  as.data.frame(pca$x)
+)
+
+ggplot(df_pc, aes(x = PC3, y = PC4, color = timepoint)) +
+  geom_point(size = 3) +
+  theme_minimal()
+
+##Die PCAs clustern eher nicht nach Timepoint, weil der Patienteneffekt > Timepoint-Effekt. Die Expression eines Patienten über mehrere Zeitpunkte ist ähnlicher als die Expression verschiedener Patienten über einem Zeitpunkt.
+# ------------------------------------------------------------
+# 5) Hierarchisches Clustering – Sample-Sample-Korrelation + Heatmap
+# ------------------------------------------------------------
+sample_cor <- cor(trans_mat)     # Samples x Samples
+
+anno <- as.data.frame(colData(dds)[, "timepoint", drop = FALSE])
+anno$timepoint <- factor(anno$timepoint)
+
+anno <- anno[match(colnames(sample_cor), rownames(anno)), , drop = FALSE]
+stopifnot(all(rownames(anno) == colnames(sample_cor)))
+
+pheatmap(sample_cor,
+         annotation_col = anno,
+         show_colnames = FALSE,
+         show_rownames = FALSE,
+         breaks = seq(0.9, 1, length.out = 100) #damit werden feine Unterschiede                                                    etwas sichtbarer
+         )
+##Heatmap zeigt hohe Korrelationen, was für technisch saubere Daten spricht
+
+```
+
+```{r}
+# ============================================================
+# DESeq2 DE-Analyse "nur wenn nötig" (Caching via RDS-Dateien)
+# - Rechnet DESeq(dds) nur, wenn fitted dds noch nicht gespeichert ist
+# - Berechnet/ speichert Result- und Shrinkage-Tabellen nur, wenn nicht vorhanden
+# Voraussetzung: Objekt 'dds' (unfitted) existiert bereits in der Session
+# ============================================================
+
+# Speicherorte
+cache_dir <- "../../res/cache"
+if (!dir.exists(cache_dir)) dir.create(cache_dir, recursive = TRUE)
+
+dds_cache_file <- file.path(cache_dir, "dds_DESeq_fitted.rds")
+
+# 1) Fitted dds laden oder berechnen
+if (file.exists(dds_cache_file)) {
+
+  message("✅ Lade bereits berechnetes DESeq2-Objekt: ", dds_cache_file)
+  dds <- readRDS(dds_cache_file)
+
+} else {
+
+  message("⏳ Berechne DESeq2 (kann dauern)…")
+
+  # sicherstellen, dass timepoint korrekt als Faktor vorliegt
+  colData(dds)$timepoint <- factor(colData(dds)$timepoint, levels = c("A", "V1", "V2"))
+
+  # Design setzen
+  design(dds) <- ~ pid + timepoint
+
+  # Prefiltering
+  dds <- dds[rowSums(counts(dds)) >= 10, ]
+
+  # DESeq laufen lassen
+  dds <- DESeq(dds)
+
+  # speichern
+  saveRDS(dds, dds_cache_file)
+  message("💾 Gespeichert: ", dds_cache_file)
+}
+
+# 2) Ergebnisse berechnen + speichern (nur wenn Datei noch nicht existiert)
+run_or_load_csv <- function(path, compute_expr) {
+  if (file.exists(path)) {
+    message("✅ Lade: ", path)
+    return(read.csv(path, row.names = 1, check.names = FALSE))
+  } else {
+    message("⏳ Berechne & speichere: ", path)
+    out <- eval(compute_expr)
+    write.csv(as.data.frame(out), path)
+    return(as.data.frame(out))
+  }
+}
+
+# Raw Results (Wald-Tests)
+res_V1_vs_A_path  <- "../../res/DESeq2_results_V1_vs_A.csv"
+res_V2_vs_A_path  <- "../../res/DESeq2_results_V2_vs_A.csv"
+res_V2_vs_V1_path <- "../../res/DESeq2_results_V2_vs_V1.csv"
+
+res_V1_vs_A <- run_or_load_csv(res_V1_vs_A_path,
+  quote(results(dds, contrast = c("timepoint", "V1", "A")))
+)
+
+res_V2_vs_A <- run_or_load_csv(res_V2_vs_A_path,
+  quote(results(dds, contrast = c("timepoint", "V2", "A")))
+)
+
+res_V2_vs_V1 <- run_or_load_csv(res_V2_vs_V1_path,
+  quote(results(dds, contrast = c("timepoint", "V2", "V1")))
+)
+
+# 3) Shrinkage (nur wenn Datei noch nicht existiert)
+# V1 vs A & V2 vs A: apeglm via coef
+# V2 vs V1: ashr via contrast
+
+lfc_V1_vs_A_path  <- "../../res/DESeq2_LFCshrink_V1_vs_A.csv"
+lfc_V2_vs_A_path  <- "../../res/DESeq2_LFCshrink_V2_vs_A.csv"
+lfc_V2_vs_V1_path <- "../../res/DESeq2_LFCshrink_V2_vs_V1.csv"
+
+resLFC_V1_vs_A <- run_or_load_csv(lfc_V1_vs_A_path,
+  quote(lfcShrink(dds, coef = "timepoint_V1_vs_A", type = "apeglm"))
+)
+
+resLFC_V2_vs_A <- run_or_load_csv(lfc_V2_vs_A_path,
+  quote(lfcShrink(dds, coef = "timepoint_V2_vs_A", type = "apeglm"))
+)
+
+resLFC_V2_vs_V1 <- run_or_load_csv(lfc_V2_vs_V1_path,
+  quote(lfcShrink(dds, contrast = c("timepoint", "V2", "V1"), type = "ashr"))
+)
+
+# 4) Optional: kurze Summaries (laufen schnell)
+summary(res_V1_vs_A)
+summary(res_V2_vs_A)
+summary(res_V2_vs_V1)
+
+```
