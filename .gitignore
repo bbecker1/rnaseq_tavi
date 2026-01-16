@@ -1,8 +1,9 @@
-dat/
-res/
-*.fastq.gz
-*.bam
-*.sam
-*.rds
-.Rhistory
-.RData
+# RStudio
+.Rproj.user/
+*.Rproj
+
+# Quarto
+.quarto/
+_quarto/
+.quarto-cache/
+.quarto/project-cache/
