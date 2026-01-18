@@ -7,3 +7,4 @@
 _quarto/
 .quarto-cache/
 .quarto/project-cache/
+.Rhistory
