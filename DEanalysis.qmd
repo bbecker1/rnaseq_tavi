@@ -84,7 +84,7 @@ colnames(txi$counts)    <- str_remove(colnames(txi$counts), "_quant\\.sf$")
 colnames(txi$abundance) <- str_remove(colnames(txi$abundance), "_quant\\.sf$")
 colnames(txi$length)    <- str_remove(colnames(txi$length), "_quant\\.sf$")
 
-# ─── 6️⃣ Metadata einlesen ───
+# Metadata einlesen
 md <- read_excel(excel, sheet = "Metadata", skip = 1) %>%
   janitor::clean_names() %>%
   mutate(sample_id = str_remove(library_id, "-L[0-9]+$") %>% str_trim())
@@ -104,8 +104,7 @@ md <- left_join(md, input, by = "external_id")
 stopifnot(all(!is.na(md$valve_treated)))
 
 # ============================================================
-# ✅ DIAGNOSTIK: Counts-Samples vs. Metadata-Samples
-# (sehr häufige Fehlerquelle: IDs passen nicht 1:1)
+# Diagnostik: Counts-Samples vs. Metadata-Samples
 # ============================================================
 counts_samples <- colnames(txi$counts)
 
@@ -235,7 +234,7 @@ rownames(meta) <- meta$sample_id
 # 2) Sicherstellen, dass Counts-Spalten und Metadata-Zeilen matchen
 #    DESeq2 verlangt:
 #      colnames(counts) == rownames(colData)
-#    Reihenfolge ist KRITISCH (sonst falsche Zuordnung)
+#    Reihenfolge ist wichtig (sonst falsche Zuordnung)
 # ------------------------------------------------------------
 
 # Check: alle Count-Sample-IDs existieren in meta?
@@ -248,10 +247,9 @@ meta <- meta[match(colnames(txi_aortic$counts), rownames(meta)), , drop = FALSE]
 stopifnot(all(colnames(txi_aortic$counts) == rownames(meta)))
 
 # ------------------------------------------------------------
-# 3) WICHTIG: tximport-Metainfo erhalten
+# 3) tximport-Metainfo erhalten
 #    DESeqDataSetFromTximport() erwartet u.a. txi$countsFromAbundance
-#    Wenn txi_aortic "manuell" als Liste gebaut wurde, fehlt das oft.
-#    Wir kopieren deshalb den Wert aus dem originalen txi.
+#    Wenn txi_aortic manuell als Liste gebaut wurde, fehlt das
 # ------------------------------------------------------------
 txi_aortic$countsFromAbundance <- txi$countsFromAbundance
 
@@ -268,7 +266,7 @@ dds <- DESeqDataSetFromTximport(
 )
 
 # ------------------------------------------------------------
-# 5) (Optional aber empfohlen) Prefiltering:
+# 5) Prefiltering:
 #    Entfernt Gene mit extrem niedrigen Counts in allen Samples,
 #    verbessert Laufzeit und reduziert Noise.
 # ------------------------------------------------------------
@@ -277,7 +275,6 @@ dds <- dds[rowSums(counts(dds)) >= 10, ]
 # ------------------------------------------------------------
 # 6) Normalisierung: Size Factors schätzen
 #    DESeq2 nutzt "median-of-ratios" (robust gegen Outlier/Geneffekte)
-#    Hinweis: In der echten DE-Analyse macht DESeq() das automatisch.
 # ------------------------------------------------------------
 dds <- estimateSizeFactors(dds)
 
@@ -308,17 +305,15 @@ write.table(
 ```{r}
 ### ============================================================
 ### Quality Control (QC) – DESeq2 RNA-seq
-### Hinweis: rlog() kann bei >=50 Samples lange dauern; vst() ist deutlich schneller.
-### Daher: nur vst() verwenden (auch für PC3/PC4), kein rlog().
 ### ============================================================
 
 # ------------------------------------------------------------
-# 1) Varianz-stabilisierende Transformation (schnell für viele Samples)
+# 1) Varianz-stabilisierende Transformation
 # ------------------------------------------------------------
 trans <- vst(dds, blind = TRUE)
 
 # ------------------------------------------------------------
-# 2) PCA – schnelle Übersicht (DESeq2-Default)
+# 2) PCA – schnelle Übersicht
 # ------------------------------------------------------------
 plotPCA(trans, intgroup = "timepoint")
 
@@ -373,7 +368,7 @@ pheatmap(sample_cor,
 
 ```{r}
 # ============================================================
-# DESeq2 DE-Analyse "nur wenn nötig" (Caching via RDS-Dateien)
+# DESeq2 DE-Analyse nur wenn nötig (Caching via RDS-Dateien)
 # - Rechnet DESeq(dds) nur, wenn fitted dds noch nicht gespeichert ist
 # - Berechnet/ speichert Result- und Shrinkage-Tabellen nur, wenn nicht vorhanden
 # Voraussetzung: Objekt 'dds' (unfitted) existiert bereits in der Session
@@ -388,12 +383,12 @@ dds_cache_file <- file.path(cache_dir, "dds_DESeq_fitted.rds")
 # 1) Fitted dds laden oder berechnen
 if (file.exists(dds_cache_file)) {
 
-  message("✅ Lade bereits berechnetes DESeq2-Objekt: ", dds_cache_file)
+  message("Lade bereits berechnetes DESeq2-Objekt: ", dds_cache_file)
   dds <- readRDS(dds_cache_file)
 
 } else {
 
-  message("⏳ Berechne DESeq2 (kann dauern)…")
+  message("Berechne DESeq2 (kann dauern)…")
 
   # sicherstellen, dass timepoint korrekt als Faktor vorliegt
   colData(dds)$timepoint <- factor(colData(dds)$timepoint, levels = c("A", "V1", "V2"))
@@ -409,7 +404,7 @@ if (file.exists(dds_cache_file)) {
 
   # speichern
   saveRDS(dds, dds_cache_file)
-  message("💾 Gespeichert: ", dds_cache_file)
+  message("Gespeichert: ", dds_cache_file)
 }
 
 # ------------------------------------------------------------
@@ -417,11 +412,11 @@ if (file.exists(dds_cache_file)) {
 # ------------------------------------------------------------
 run_or_load_rds <- function(rds_path, compute_expr, csv_path = NULL) {
   if (file.exists(rds_path)) {
-    message("✅ Lade: ", rds_path)
+    message("Lade: ", rds_path)
     return(readRDS(rds_path))
   }
 
-  message("⏳ Berechne & speichere: ", rds_path)
+  message("Berechne & speichere: ", rds_path)
   out <- eval(compute_expr)
 
   saveRDS(out, rds_path)
@@ -429,7 +424,7 @@ run_or_load_rds <- function(rds_path, compute_expr, csv_path = NULL) {
   if (!is.null(csv_path)) {
     # Für Sharing/Excel etc. (Attributes gehen in CSV verloren – ist okay)
     write.csv(as.data.frame(out), csv_path)
-    message("🧾 Zusätzlich als CSV exportiert: ", csv_path)
+    message("Zusätzlich als CSV exportiert: ", csv_path)
   }
 
   out
@@ -491,7 +486,7 @@ lfc_V2_vs_V1_csv <- file.path(res_dir, "DESeq2_LFCshrink_V2_vs_V1.csv")
 
 # Safety checks für coef-Namen
 rn <- resultsNames(dds)
-message("ℹ️ resultsNames(dds): ", paste(rn, collapse = ", "))
+message("resultsNames(dds): ", paste(rn, collapse = ", "))
 
 stopifnot("timepoint_V1_vs_A" %in% rn)
 stopifnot("timepoint_V2_vs_A" %in% rn)
@@ -605,7 +600,7 @@ DESeq2::plotMA(
 
 ```{r}
 # ============================================================
-# 05c – Summarizing results from the Wald test (HBC)
+# Summarizing results from the Wald test
 # Ziel:
 #  1) Ergebnisse je Vergleich mit summary() zusammenfassen (alpha explizit)
 #  2) padj Cutoff setzen
@@ -615,8 +610,8 @@ DESeq2::plotMA(
 # ============================================================
 
 # ------------------------------------------------------------
-# Schritt 1 (HBC): Ergebnisse zusammenfassen mit summary()
-# Wichtig: alpha explizit setzen, sonst ist Default padj < 0.1
+# Schritt 1: Ergebnisse zusammenfassen mit summary()
+# alpha explizit setzen, sonst ist Default padj < 0.1
 # ------------------------------------------------------------
 alpha_level <- 0.05
 
@@ -625,13 +620,12 @@ summary(res_V2_vs_A,  alpha = alpha_level)
 summary(res_V2_vs_V1, alpha = alpha_level)
 
 # ------------------------------------------------------------
-# Schritt 2 (HBC): Schwellenwerte definieren
-# In 05c wird nur padj verwendet (keine LFC-Schwelle in dieser Lesson)
+# Schritt 2: Schwellenwerte definieren
 # ------------------------------------------------------------
 padj_cutoff <- 0.05
 
 # ------------------------------------------------------------
-# Schritt 3 (HBC): DESeqResults -> tibble konvertieren
+# Schritt 3: DESeqResults -> tibble konvertieren
 # (damit man bequem filtern/arrangieren kann)
 # ------------------------------------------------------------
 res_V1_vs_A_tb <- res_V1_vs_A |>
@@ -650,8 +644,8 @@ res_V2_vs_V1_tb <- res_V2_vs_V1 |>
   as_tibble()
 
 # ------------------------------------------------------------
-# Schritt 4 (HBC): signifikante Gene extrahieren (padj < cutoff)
-# Tipp: !is.na(padj) explizit, damit NAs nicht „durchrutschen“
+# Schritt 4: signifikante Gene extrahieren (padj < cutoff)
+# !is.na(padj) explizit, damit NAs nicht „durchrutschen“
 # ------------------------------------------------------------
 sig_V1_vs_A <- dplyr::filter(
   res_V1_vs_A_tb,
@@ -677,7 +671,7 @@ sig_V2_vs_A
 sig_V2_vs_V1
 
 # ------------------------------------------------------------
-# Schritt 5 (praktisch, passt zu HBC-Lernziel "Evaluate number of DE genes"):
+# Schritt 5:
 # Up/Down zählen und eine kleine Übersicht bauen
 # Up/Down bezieht sich auf das Vorzeichen von log2FoldChange
 # ------------------------------------------------------------
@@ -698,21 +692,550 @@ overview <- dplyr::bind_rows(
   dplyr::select(comparison, n_sig, n_up, n_down)
 
 # ------------------------------------------------------------
-# Schritt 6 (praktisch): Genlisten erzeugen (für Heatmaps/Enrichment etc.)
+# Schritt 6: Genlisten erzeugen (für Heatmaps/Enrichment etc.)
 # ------------------------------------------------------------
 genes_sig_V1_vs_A  <- sig_V1_vs_A$gene
 genes_sig_V2_vs_A  <- sig_V2_vs_A$gene
 genes_sig_V2_vs_V1 <- sig_V2_vs_V1$gene
 
-# Optional: Top-Gene-Listen (z.B. nach padj sortiert)
+#Top-Gene-Listen (z.B. nach padj sortiert)
 top20_V1_vs_A <- sig_V1_vs_A |> arrange(padj) |> slice_head(n = 20)
 top20_V2_vs_A <- sig_V2_vs_A |> arrange(padj) |> slice_head(n = 20)
 top20_V2_vs_V1 <- sig_V2_vs_V1 |> arrange(padj) |> slice_head(n = 20)
 
-# Optional: Export (falls gewünscht)
+# ggf: Export
 # write.csv(sig_V1_vs_A,  "../../res/sig_V1_vs_A_padj05.csv", row.names = FALSE)
 # write.csv(sig_V2_vs_A,  "../../res/sig_V2_vs_A_padj05.csv", row.names = FALSE)
 # write.csv(sig_V2_vs_V1, "../../res/sig_V2_vs_V1_padj05.csv", row.names = FALSE)
 # write.csv(overview,     "../../res/DE_summary_overview_padj05.csv", row.names = FALSE)
+
+```
+
+\# --- Meta vorbereiten ---
+
+sample_meta \<- meta \|\>
+
+rownames_to_column(var = "samplename") \|\>
+
+as_tibble()
+
+stopifnot(all(sample_meta\$samplename %in% colnames(normalized_counts)))
+
+sample_meta \<- sample_meta \|\>
+
+mutate(condition = droplevels(timepoint))
+
+\# --- Normalisierte Counts als Tibble ---
+
+norm_counts_tb \<- normalized_counts \|\>
+
+as.data.frame() \|\>
+
+rownames_to_column(var = "gene") \|\>
+
+as_tibble()
+
+\# --- Metadaten pro Kontrast filtern ---
+
+meta_v1_a \<- sample_meta \|\> dplyr::filter(condition %in% c("A", "V1"))
+
+meta_v2_a \<- sample_meta \|\> dplyr::filter(condition %in% c("A", "V2"))
+
+meta_v2_v1 \<- sample_meta \|\> dplyr::filter(condition %in% c("V1", "V2"))
+
+\# --- Plot-Funktion (mit +1 Pseudocount vor log10) ---
+
+plot_top20_expression \<- function(res_tb, norm_counts_tb, meta_tb,
+
+padj_cutoff = 0.05,
+
+n_top = 20,
+
+title = NULL) {
+
+top_genes \<- res_tb \|\>
+
+dplyr::filter(!is.na(padj), padj \< padj_cutoff) \|\>
+
+dplyr::arrange(padj) \|\>
+
+dplyr::slice_head(n = n_top) \|\>
+
+dplyr::pull(gene)
+
+plot_df \<- norm_counts_tb \|\>
+
+dplyr::filter(gene %in% top_genes) \|\>
+
+tidyr::pivot_longer(
+
+cols = -gene,
+
+names_to = "samplename",
+
+values_to = "norm_count"
+
+) \|\>
+
+dplyr::inner_join(meta_tb, by = "samplename")
+
+ggplot(plot_df, aes(x = gene, y = norm_count + 1, color = condition)) +
+
+geom_point(position = position_jitter(width = 0.15), alpha = 0.8) +
+
+scale_y_log10() +
+
+labs(
+
+title = title,
+
+x = NULL,
+
+y = "Normalized counts (log10, +1)",
+
+color = "timepoint"
+
+) +
+
+theme_bw() +
+
+theme(
+
+axis.text.x = element_text(angle = 45, hjust = 1),
+
+panel.grid.minor = element_blank()
+
+)
+
+}
+
+\# --- Plots erzeugen ---
+
+p_v1_a \<- plot_top20_expression(
+
+res_tb = res_V1_vs_A_tb,
+
+norm_counts_tb = norm_counts_tb,
+
+meta_tb = meta_v1_a,
+
+title = "Top 20 DE genes: V1 vs A"
+
+)
+
+p_v2_a \<- plot_top20_expression(
+
+res_tb = res_V2_vs_A_tb,
+
+norm_counts_tb = norm_counts_tb,
+
+meta_tb = meta_v2_a,
+
+title = "Top 20 DE genes: V2 vs A"
+
+)
+
+p_v2_v1 \<- plot_top20_expression(
+
+res_tb = res_V2_vs_V1_tb,
+
+norm_counts_tb = norm_counts_tb,
+
+meta_tb = meta_v2_v1,
+
+title = "Top 20 DE genes: V2 vs V1"
+
+)
+
+p_v1_a
+
+p_v2_a
+
+p_v2_v1
+
+```{r}
+# ============================================================
+# DESeq2-Visualisierungen + Genannotation
+#
+# Inhalte:
+#  1) Vorbereitung: Metadaten + normalisierte Counts
+#  2) Genannotation (Ensembl -> SYMBOL/GENENAME), Ensembl-Versionen entfernen
+#  3) Top-20-Expressionplots (Counts, nicht shrunken)
+#  4) Volcano Plots (padj aus unshrunken results)
+#  5) Heatmaps signifikanter Gene (pheatmap, Counts)
+# ============================================================
+# -----------------------------
+# 1) Vorbereitung: Metadaten + Checks
+# -----------------------------
+
+# Metadaten in ein Tibble überführen (Rownames = Sample-Namen sichern)
+sample_meta <- meta |>
+  tibble::rownames_to_column(var = "samplename") |>
+  tibble::as_tibble() |>
+  dplyr::mutate(
+    # Zeitpunkte A/V1/V2 als Plot-/Gruppierungsfaktor nutzen
+    condition = droplevels(timepoint)
+  )
+
+# Sicherstellen, dass Sample-Namen in meta auch in den Count-Spalten existieren
+stopifnot(all(sample_meta$samplename %in% colnames(normalized_counts)))
+
+# Normalisierte Counts als Tibble (praktisch für ggplot-Pipelines)
+norm_counts_tb <- normalized_counts |>
+  as.data.frame() |>
+  tibble::rownames_to_column(var = "gene") |>
+  tibble::as_tibble()
+
+# -----------------------------
+# 2) Genannotation: Ensembl-Version entfernen + SYMBOL/GENENAME ergänzen
+# -----------------------------
+
+# Ensembl-ID ohne Versionssuffix (ENSG... .16 -> ENSG...)
+strip_ensembl_version <- function(x) sub("\\..*$", "", x)
+
+# Mapping-Tabelle einmalig erzeugen (schneller als 3x select)
+# Wir sammeln alle Ensembl-IDs aus allen Result-Tabellen.
+all_ensembl <- unique(c(
+  strip_ensembl_version(res_V1_vs_A_tb$gene),
+  strip_ensembl_version(res_V2_vs_A_tb$gene),
+  strip_ensembl_version(res_V2_vs_V1_tb$gene)
+))
+
+# Annotation ziehen: ENSEMBL -> SYMBOL + GENENAME
+gene_anno <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = all_ensembl,
+  keytype = "ENSEMBL",
+  columns = c("SYMBOL", "GENENAME")
+) |>
+  dplyr::as_tibble() |>
+  dplyr::rename(ensembl_id = ENSEMBL) |>
+  # Doppelte Einträge können vorkommen (z.B. veraltete/mehrdeutige Mappings)
+  # Wir behalten pro ensembl_id den ersten nicht-NA SYMBOL, sonst irgendeinen.
+  dplyr::arrange(ensembl_id, dplyr::desc(!is.na(SYMBOL))) |>
+  dplyr::distinct(ensembl_id, .keep_all = TRUE)
+
+# Helper: Annotation an eine Results-Tabelle hängen (gene bleibt unverändert!)
+add_gene_symbols <- function(res_tb, gene_anno) {
+  res_tb |>
+    dplyr::mutate(ensembl_id = strip_ensembl_version(gene)) |>
+    dplyr::left_join(gene_anno, by = "ensembl_id")
+}
+
+# Annotierte Results (für Tabellen/Interpretation/Labels)
+res_V1_vs_A_annot  <- add_gene_symbols(res_V1_vs_A_tb, gene_anno)
+res_V2_vs_A_annot  <- add_gene_symbols(res_V2_vs_A_tb, gene_anno)
+res_V2_vs_V1_annot <- add_gene_symbols(res_V2_vs_V1_tb, gene_anno)
+
+# Optional: auch signifikante Tabellen annotieren (praktisch für Exporte)
+sig_V1_vs_A_annot  <- add_gene_symbols(sig_V1_vs_A, gene_anno)
+sig_V2_vs_A_annot  <- add_gene_symbols(sig_V2_vs_A, gene_anno)
+sig_V2_vs_V1_annot <- add_gene_symbols(sig_V2_vs_V1, gene_anno)
+
+# Kurzer Sanity-Check
+head(res_V1_vs_A_annot |> dplyr::select(gene, ensembl_id, SYMBOL, GENENAME), 10)
+mean(is.na(res_V1_vs_A_annot$SYMBOL))
+
+# -----------------------------
+# 3) Kontrast-Definitionen zentral
+# -----------------------------
+contrasts <- list(
+  v1_a = list(
+    label = "V1 vs A",
+    keep_levels = c("A", "V1"),
+    res_tb = res_V1_vs_A_tb,
+    res_annot = res_V1_vs_A_annot,
+    sig_tb = sig_V1_vs_A,
+    sig_annot = sig_V1_vs_A_annot
+  ),
+  v2_a = list(
+    label = "V2 vs A",
+    keep_levels = c("A", "V2"),
+    res_tb = res_V2_vs_A_tb,
+    res_annot = res_V2_vs_A_annot,
+    sig_tb = sig_V2_vs_A,
+    sig_annot = sig_V2_vs_A_annot
+  ),
+  v2_v1 = list(
+    label = "V2 vs V1",
+    keep_levels = c("V1", "V2"),
+    res_tb = res_V2_vs_V1_tb,
+    res_annot = res_V2_vs_V1_annot,
+    sig_tb = sig_V2_vs_V1,
+    sig_annot = sig_V2_vs_V1_annot
+  )
+)
+
+# Helper: Metadaten für einen Kontrast (nur die relevanten Gruppen)
+get_meta_for_contrast <- function(sample_meta, keep_levels) {
+  sample_meta |>
+    dplyr::filter(condition %in% keep_levels) |>
+    droplevels()
+}
+
+# -----------------------------
+# 4) Plot-Funktion: Top-20 Expression (Counts), mit +1 Pseudocount
+# -----------------------------
+plot_top20_expression <- function(res_tb, norm_counts_tb, meta_tb,
+                                  padj_cutoff = 0.05,
+                                  n_top = 20,
+                                  title = NULL) {
+  # Top-Gene nach padj (nur signifikante)
+  top_genes <- res_tb |>
+    dplyr::filter(!is.na(padj), padj < padj_cutoff) |>
+    dplyr::arrange(padj) |>
+    dplyr::slice_head(n = n_top) |>
+    dplyr::pull(gene)
+
+  plot_df <- norm_counts_tb |>
+    dplyr::filter(gene %in% top_genes) |>
+    tidyr::pivot_longer(
+      cols = -gene,
+      names_to = "samplename",
+      values_to = "norm_count"
+    ) |>
+    dplyr::inner_join(meta_tb, by = "samplename")
+
+  ggplot2::ggplot(plot_df, ggplot2::aes(x = gene, y = norm_count + 1, color = condition)) +
+    ggplot2::geom_point(position = ggplot2::position_jitter(width = 0.15), alpha = 0.8) +
+    ggplot2::scale_y_log10() +
+    ggplot2::labs(
+      title = title,
+      x = NULL,
+      y = "Normalisierte Counts (log10, +1)",
+      color = "Zeitpunkt"
+    ) +
+    ggplot2::theme_bw() +
+    ggplot2::theme(
+      axis.text.x = ggplot2::element_text(angle = 45, hjust = 1),
+      panel.grid.minor = ggplot2::element_blank()
+    )
+}
+
+# -----------------------------
+# 5) Plot-Funktion: Volcano Plot
+# -----------------------------
+plot_volcano <- function(res_tb, padj_cutoff = 0.05, title = NULL) {
+  plot_df <- res_tb |>
+    dplyr::filter(!is.na(padj)) |>
+    dplyr::mutate(
+      neg_log10_padj = -log10(padj),
+      sig = padj < padj_cutoff
+    )
+
+  ggplot2::ggplot(plot_df, ggplot2::aes(x = log2FoldChange, y = neg_log10_padj)) +
+    ggplot2::geom_point(ggplot2::aes(color = sig), alpha = 0.6, size = 1.2) +
+    ggplot2::scale_color_manual(values = c("FALSE" = "grey70", "TRUE" = "red")) +
+    ggplot2::geom_hline(
+      yintercept = -log10(padj_cutoff),
+      linetype = "dashed"
+    ) +
+    ggplot2::labs(
+      title = title,
+      x = "log2 Fold Change",
+      y = "-log10 adjustierter p-Wert",
+      color = paste0("padj < ", padj_cutoff)
+    ) +
+    ggplot2::theme_bw()
+}
+
+# -----------------------------
+# 6) Plot-Funktion: Heatmap signifikanter Gene (Counts, pheatmap)
+# -----------------------------
+plot_sig_heatmap <- function(normalized_counts, sample_meta, sig_genes, keep_levels,
+                             heat_colors = RColorBrewer::brewer.pal(6, "YlOrRd"),
+                             show_rownames = FALSE,
+                             scale = "row",
+                             main = NULL) {
+  # Samples für diesen Kontrast
+  samples_keep <- sample_meta |>
+    dplyr::filter(condition %in% keep_levels) |>
+    dplyr::pull(samplename)
+
+  # Matrixsubset: nur signifikante Gene & relevante Samples
+  mat <- normalized_counts[
+    rownames(normalized_counts) %in% sig_genes,
+    colnames(normalized_counts) %in% samples_keep,
+    drop = FALSE
+  ]
+
+  if (nrow(mat) == 0) {
+    stop("Keine signifikanten Gene für diesen Kontrast (nrow(mat) == 0).")
+  }
+
+  # Annotation für Spalten (Samples sind Spalten)
+  annotation_col <- sample_meta |>
+    dplyr::filter(samplename %in% colnames(mat)) |>
+    dplyr::select(condition) |>
+    as.data.frame()
+
+  rownames(annotation_col) <- sample_meta |>
+    dplyr::filter(samplename %in% colnames(mat)) |>
+    dplyr::pull(samplename)
+
+  pheatmap::pheatmap(
+    mat,
+    color = heat_colors,
+    cluster_rows = TRUE,
+    cluster_cols = TRUE,
+    show_rownames = show_rownames,
+    annotation_col = annotation_col,
+    border_color = NA,
+    fontsize = 10,
+    scale = scale,
+    main = main
+  )
+}
+
+# ============================================================
+# 7) Ausführen: Top-20, Volcano, Heatmaps für alle Kontraste
+# ============================================================
+
+padj_cutoff <- 0.05
+heat_colors <- RColorBrewer::brewer.pal(6, "YlOrRd")
+
+# --- Top-20 Expressionplots ---
+top20_plots <- lapply(contrasts, function(x) {
+  meta_sub <- get_meta_for_contrast(sample_meta, x$keep_levels)
+  plot_top20_expression(
+    res_tb = x$res_tb,
+    norm_counts_tb = norm_counts_tb,
+    meta_tb = meta_sub,
+    padj_cutoff = padj_cutoff,
+    n_top = 20,
+    title = paste0("Top 20 DE-Gene: ", x$label)
+  )
+})
+
+top20_plots$v1_a
+top20_plots$v2_a
+top20_plots$v2_v1
+
+# --- Volcano Plots ---
+volcano_plots <- lapply(contrasts, function(x) {
+  plot_volcano(
+    res_tb = x$res_tb,
+    padj_cutoff = padj_cutoff,
+    title = paste0("Volcano Plot: ", x$label)
+  )
+})
+
+volcano_plots$v1_a
+volcano_plots$v2_a
+volcano_plots$v2_v1
+
+# --- Heatmaps signifikanter Gene ---
+# Hinweis: pheatmap zeichnet direkt; die Liste ist nur der Vollständigkeit halber.
+heatmaps <- lapply(contrasts, function(x) {
+  plot_sig_heatmap(
+    normalized_counts = normalized_counts,
+    sample_meta = sample_meta,
+    sig_genes = x$sig_tb$gene,
+    keep_levels = x$keep_levels,
+    heat_colors = heat_colors,
+    show_rownames = FALSE,
+    scale = "row",
+    main = paste0("Heatmap signifikanter Gene: ", x$label)
+  )
+})
+
+# ============================================================
+# 8) Top-Tabellen mit Gene Symbols (für Export/Interpretation)
+# ============================================================
+
+# Top 20 signifikante Gene mit SYMBOL für V1 vs A
+top20_sig_v1_a <- sig_V1_vs_A_annot |>
+  dplyr::filter(!is.na(padj)) |>
+  dplyr::arrange(padj) |>
+  dplyr::slice_head(n = 20) |>
+  dplyr::select(gene, ensembl_id, SYMBOL, GENENAME, log2FoldChange, padj)
+
+top20_sig_v1_a
+
+# Top 20 signifikante Gene mit SYMBOL für V2 vs A
+top20_sig_v2_a <- sig_V2_vs_A_annot |>
+  dplyr::filter(!is.na(padj)) |>
+  dplyr::arrange(padj) |>
+  dplyr::slice_head(n = 20) |>
+  dplyr::select(gene, ensembl_id, SYMBOL, GENENAME, log2FoldChange, padj)
+
+top20_sig_v2_a
+
+
+# Top 20 signifikante Gene mit SYMBOL für V2 vs V1
+top20_sig_v2_v1 <- sig_V2_vs_V1_annot |>
+  dplyr::filter(!is.na(padj)) |>
+  dplyr::arrange(padj) |>
+  dplyr::slice_head(n = 20) |>
+  dplyr::select(gene, ensembl_id, SYMBOL, GENENAME, log2FoldChange, padj)
+
+top20_sig_v2_v1
+
+
+
+```
+
+```{r}
+# ============================================================
+# LRT-Analyse "nur wenn nötig" (Caching via RDS)
+# Full:    ~ pid + timepoint
+# Reduced: ~ pid
+# ============================================================
+
+library(DESeq2)
+
+cache_dir <- "../../res/cache"
+if (!dir.exists(cache_dir)) dir.create(cache_dir, recursive = TRUE)
+
+dds_lrt_cache_file <- file.path(cache_dir, "dds_DESeq_LRT_fitted.rds")
+res_lrt_rds        <- file.path(cache_dir, "DESeq2_results_LRT_timepoint.rds")
+res_lrt_csv        <- file.path("../../res", "DESeq2_results_LRT_timepoint.csv")
+
+# 1) LRT-fitted dds laden oder berechnen
+if (file.exists(dds_lrt_cache_file)) {
+  message("Lade bereits berechnetes LRT-DESeq2-Objekt: ", dds_lrt_cache_file)
+  dds_lrt <- readRDS(dds_lrt_cache_file)
+} else {
+  message("Berechne DESeq2 LRT…")
+
+  # Hier NICHT dein bereits gefittetes dds überschreiben,
+  # sondern mit einem frischen Objekt arbeiten
+  dds_lrt <- dds
+
+  colData(dds_lrt)$timepoint <- factor(colData(dds_lrt)$timepoint, levels = c("A", "V1", "V2"))
+  design(dds_lrt) <- ~ pid + timepoint
+
+  # gleiches Prefiltering wie bei Wald (optional, aber konsistent)
+  dds_lrt <- dds_lrt[rowSums(counts(dds_lrt)) >= 10, ]
+
+  dds_lrt <- DESeq(dds_lrt, test = "LRT", reduced = ~ pid)
+
+  saveRDS(dds_lrt, dds_lrt_cache_file)
+  message("Gespeichert: ", dds_lrt_cache_file)
+}
+
+# 2) LRT-Results laden oder berechnen (nur 1 Results-Objekt, kein contrast!)
+run_or_load_rds <- function(rds_path, compute_expr, csv_path = NULL) {
+  if (file.exists(rds_path)) {
+    message("Lade: ", rds_path)
+    return(readRDS(rds_path))
+  }
+  message("Berechne & speichere: ", rds_path)
+  out <- eval(compute_expr)
+  saveRDS(out, rds_path)
+  if (!is.null(csv_path)) {
+    write.csv(as.data.frame(out), csv_path)
+    message("Zusätzlich als CSV exportiert: ", csv_path)
+  }
+  out
+}
+
+res_lrt <- run_or_load_rds(
+  rds_path = res_lrt_rds,
+  csv_path = res_lrt_csv,
+  compute_expr = quote(results(dds_lrt, alpha = 0.05))
+)
+
+summary(res_lrt)
 
 ```
