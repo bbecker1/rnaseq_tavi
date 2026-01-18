@@ -5,7 +5,7 @@ title: "DEanalysis"
 <https://hbctraining.github.io/Intro-to-DGE/schedule/links-to-lessons.html>
 
 ```{r}
-#Pakete werden aus separatem Setup Skript geladen
+#Pakete werden aus Setup Skript geladen
 source("../../org/setup_packages.R")
 
 library(tidyverse)  
