@@ -1,4 +1,7 @@
-# RStudio
+# R / RStudio
+.Rhistory
+.RData
+.Ruserdata
 .Rproj.user/
 *.Rproj
 
@@ -7,4 +10,10 @@
 _quarto/
 .quarto-cache/
 .quarto/project-cache/
-.Rhistory
+
+# Data (RNA-seq)
+dat/
+
+# OS
+.DS_Store
+Thumbs.db
