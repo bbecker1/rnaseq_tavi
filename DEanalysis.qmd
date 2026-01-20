@@ -8,7 +8,8 @@ title: "DEanalysis"
 #Pakete werden aus Setup Skript geladen
 source("../../org/setup_packages.R")
 
-library(tidyverse)  
+suppressPackageStartupMessages(
+{library(tidyverse)  
 library(readxl)
 library(janitor)
 library(DESeq2)
@@ -26,7 +27,7 @@ library(AnnotationHub)
 library(ensembldb)
 library(apeglm)
 library(ashr)
-
+})
 sessionInfo()
 ```
 
@@ -1312,7 +1313,7 @@ mat_lrt <- normalized_counts[
 # einheitliche Rownames für stabiles Handling
 rownames(mat_lrt) <- strip_ensembl_version(rownames(mat_lrt))
 
-# Gene nach Signifikanz sortieren (optional, aber nice)
+# Gene nach Signifikanz sortieren (optional)
 gene_order <- sig_lrt$ensembl_id
 mat_lrt <- mat_lrt[intersect(gene_order, rownames(mat_lrt)), , drop = FALSE]
 
@@ -1649,5 +1650,430 @@ degPatterns(
 #
 # Ein großer Teil der LRT∩Wald-Gene zeigt ein transient erhöhtes Expressionsniveau bei V1 mit anschließender Rückkehr zu Baseline bei V2
 # ============================================================
+
+```
+
+```{r}
+
+# ============================================================
+# GO ORA (Over-Representation Analysis) – DESeq2 Wald + LRT
+# MIT CACHING (Summary-RDS) – Copy-paste Block ans Ende deines Skripts
+#
+# Erwartete Objekte:
+#   - res_V1_vs_A_tb, res_V2_vs_A_tb, res_V2_vs_V1_tb  (tibbles; gene, padj, log2FoldChange)
+#   - res_lrt_tb (tibble; gene, padj) ODER res_lrt (DESeqResults)
+#   - org.Hs.eg.db (Human)
+#
+# Output:
+#   - ../../res/functional/ora_go/        (CSV + RDS + Dotplots)
+#   - ../../res/cache/ora_go/             (Summary-Caches als RDS)
+# ============================================================
+
+# -----------------------------
+# Helpers
+# -----------------------------
+strip_ensembl_version <- function(x) sub("\\..*$", "", x)
+
+.ensure_tbl_results <- function(x) {
+  if (inherits(x, "DESeqResults")) {
+    x |>
+      as.data.frame() |>
+      tibble::rownames_to_column(var = "gene") |>
+      tibble::as_tibble()
+  } else {
+    tibble::as_tibble(x)
+  }
+}
+
+.build_lists_for_ora <- function(res_tb, padj_cutoff = 0.05, lfc_col = "log2FoldChange") {
+  res_tb <- .ensure_tbl_results(res_tb) |>
+    dplyr::filter(!is.na(padj)) |>
+    dplyr::mutate(ensembl_id = strip_ensembl_version(gene))
+
+  universe <- unique(res_tb$ensembl_id)
+
+  sig <- res_tb |>
+    dplyr::filter(padj < padj_cutoff)
+
+  sig_all <- unique(sig$ensembl_id)
+
+  if (lfc_col %in% names(sig)) {
+    sig_up <- unique(sig |> dplyr::filter(.data[[lfc_col]] > 0) |> dplyr::pull(ensembl_id))
+    sig_down <- unique(sig |> dplyr::filter(.data[[lfc_col]] < 0) |> dplyr::pull(ensembl_id))
+  } else {
+    # LRT hat kein log2FoldChange
+    sig_up <- character(0)
+    sig_down <- character(0)
+  }
+
+  list(
+    universe = universe,
+    sig_all = sig_all,
+    sig_up = sig_up,
+    sig_down = sig_down
+  )
+}
+
+.run_enrichgo <- function(sig_vec, universe_vec, ont = "BP",
+                          p_adjust_method = "BH", q_cutoff = 0.05) {
+  if (length(sig_vec) < 5) {
+    return(NULL)
+  }
+
+  clusterProfiler::enrichGO(
+    gene = sig_vec,
+    universe = universe_vec,
+    OrgDb = org.Hs.eg.db,
+    keyType = "ENSEMBL",
+    ont = ont,
+    pAdjustMethod = p_adjust_method,
+    qvalueCutoff = q_cutoff,
+    readable = TRUE
+  )
+}
+
+.save_enrichment <- function(enrich_obj, out_dir, stem,
+                             make_plots = TRUE, show_category = 25) {
+  if (is.null(enrich_obj)) {
+    return(invisible(NULL))
+  }
+
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+  tab <- as.data.frame(enrich_obj)
+  write.csv(tab, file.path(out_dir, paste0(stem, ".csv")), row.names = FALSE)
+  saveRDS(enrich_obj, file.path(out_dir, paste0(stem, ".rds")))
+
+  if (isTRUE(make_plots) && nrow(tab) > 0) {
+    p <- enrichplot::dotplot(enrich_obj, showCategory = show_category) +
+      ggplot2::ggtitle(stem) +
+      ggplot2::theme_bw()
+
+    ggplot2::ggsave(
+      filename = file.path(out_dir, paste0(stem, "_dotplot.png")),
+      plot = p,
+      width = 9,
+      height = 6,
+      dpi = 200
+    )
+  }
+
+  invisible(tab)
+}
+
+# -----------------------------
+# Main: GO ORA für ein Set (Kontrast oder LRT) – ohne Cache
+# -----------------------------
+run_go_ora_set <- function(res_obj,
+                           set_label,
+                           padj_cutoff = 0.05,
+                           ontologies = c("BP", "MF", "CC"),
+                           directions = c("all", "up", "down"),
+                           out_dir = "../../res/functional/ora_go",
+                           make_plots = TRUE) {
+  lists <- .build_lists_for_ora(res_obj, padj_cutoff = padj_cutoff)
+
+  summary_rows <- list()
+
+  for (ont in ontologies) {
+    for (dir in directions) {
+      sig_vec <- switch(
+        dir,
+        all  = lists$sig_all,
+        up   = lists$sig_up,
+        down = lists$sig_down
+      )
+
+      # LRT: up/down ggf. leer -> skip
+      if (length(sig_vec) == 0) next
+
+      ego <- .run_enrichgo(sig_vec, lists$universe, ont = ont)
+
+      stem <- paste0(
+        "GO_", ont, "_", set_label, "_", dir,
+        "_padj", format(padj_cutoff, nsmall = 2)
+      )
+
+      tab <- .save_enrichment(
+        enrich_obj = ego,
+        out_dir = out_dir,
+        stem = stem,
+        make_plots = make_plots,
+        show_category = 25
+      )
+
+      if (is.null(tab) || nrow(tab) == 0) {
+        summary_rows[[length(summary_rows) + 1]] <- tibble::tibble(
+          set = set_label,
+          ontology = ont,
+          direction = dir,
+          n_sig_genes = length(sig_vec),
+          n_terms = 0L,
+          top_term = NA_character_,
+          top_term_padj = NA_real_
+        )
+      } else {
+        summary_rows[[length(summary_rows) + 1]] <- tibble::tibble(
+          set = set_label,
+          ontology = ont,
+          direction = dir,
+          n_sig_genes = length(sig_vec),
+          n_terms = nrow(tab),
+          top_term = tab$Description[1],
+          top_term_padj = tab$p.adjust[1]
+        )
+      }
+    }
+  }
+
+  summary_tbl <- dplyr::bind_rows(summary_rows)
+
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  write.csv(
+    summary_tbl,
+    file.path(
+      out_dir,
+      paste0("GO_ORA_summary_", set_label, "_padj", format(padj_cutoff, nsmall = 2), ".csv")
+    ),
+    row.names = FALSE
+  )
+
+  summary_tbl
+}
+
+# -----------------------------
+# Caching Wrapper: lädt Summary-RDS, sonst rechnet + cach
+
+```
+
+```{r}
+# ============================================================
+# GO ORA Plots (wie HBC) für alle Kontraste – automatisch
+#   - dotplot (Top 50 by gene ratio)
+#   - emapplot (term similarity / enrichmap)
+#   - cnetplot (Top 5 terms; Genes colored by log2FC)
+#
+# Nutzt die bereits gespeicherten enrichGO-Objekte (*.rds) aus ora_out_dir
+#
+# Erwartete Objekte aus deinem Skript:
+#   - ora_out_dir (Pfad wie im ORA-Block), padj_cutoff
+#   - res_V1_vs_A_tb, res_V2_vs_A_tb, res_V2_vs_V1_tb (tibbles; gene, padj, log2FoldChange)
+#   - res_lrt_tb (tibble; gene, padj) ODER res_lrt (DESeqResults)
+#
+# Output:
+#   - ../../res/functional/ora_go/plots/
+#       GO_BP_Wald_V1_vs_A_all_padj0.05_dotplot.png
+#       GO_BP_Wald_V1_vs_A_all_padj0.05_emapplot.png
+#       GO_BP_Wald_V1_vs_A_all_padj0.05_cnetplot.png
+#       ...
+# ============================================================
+
+# -----------------------------
+# Settings
+# -----------------------------
+# Falls du im ORA-Block bereits ora_out_dir gesetzt hast, nimm das:
+if (!exists("ora_out_dir")) ora_out_dir <- "../../res/functional/ora_go"
+if (!exists("padj_cutoff")) padj_cutoff <- 0.05
+
+plots_dir <- file.path(ora_out_dir, "plots")
+dir.create(plots_dir, recursive = TRUE, showWarnings = FALSE)
+
+# HBC-Defaults
+show_dot <- 50
+show_emap <- 50
+show_cnet <- 5
+
+# Ontology: HBC zeigt BP (du kannst auch c("BP","MF","CC") setzen)
+ontologies <- c("BP")
+
+# -----------------------------
+# Helpers
+# -----------------------------
+strip_ensembl_version <- function(x) sub("\\..*$", "", x)
+
+.ensure_tbl_results <- function(x) {
+  if (inherits(x, "DESeqResults")) {
+    x |>
+      as.data.frame() |>
+      tibble::rownames_to_column(var = "gene") |>
+      tibble::as_tibble()
+  } else {
+    tibble::as_tibble(x)
+  }
+}
+
+# Erzeuge FoldChange-Vektor (names=Ensembl ohne Version) passend zu enrichGO(keyType="ENSEMBL")
+.make_foldchange_vec <- function(res_obj, padj_cutoff = 0.05, direction = c("all", "up", "down")) {
+  direction <- match.arg(direction)
+
+  res_tb <- .ensure_tbl_results(res_obj) |>
+    dplyr::filter(!is.na(padj)) |>
+    dplyr::mutate(ensembl_id = strip_ensembl_version(gene))
+
+  # LRT hat kein log2FoldChange -> NA zurück
+  if (!"log2FoldChange" %in% names(res_tb)) {
+    return(NULL)
+  }
+
+  sig <- res_tb |>
+    dplyr::filter(padj < padj_cutoff)
+
+  if (direction == "up") {
+    sig <- sig |> dplyr::filter(log2FoldChange > 0)
+  } else if (direction == "down") {
+    sig <- sig |> dplyr::filter(log2FoldChange < 0)
+  }
+
+  fc <- sig$log2FoldChange
+  names(fc) <- sig$ensembl_id
+
+  # Falls Duplikate existieren (selten, aber möglich): ersten behalten
+  fc <- fc[!duplicated(names(fc))]
+  fc
+}
+
+# Lade enrichGO-Objekt aus deinem ORA-Output anhand des gleichen stems wie im ORA-Block
+.load_ego <- function(out_dir, ont, set_label, direction, padj_cutoff) {
+  stem <- paste0(
+    "GO_", ont, "_", set_label, "_", direction,
+    "_padj", format(padj_cutoff, nsmall = 2)
+  )
+  rds_path <- file.path(out_dir, paste0(stem, ".rds"))
+
+  if (!file.exists(rds_path)) {
+    message("Skip (fehlendes RDS): ", rds_path)
+    return(NULL)
+  }
+
+  ego <- readRDS(rds_path)
+
+  # Leere Ergebnisse skippen
+  tab <- tryCatch(as.data.frame(ego), error = function(e) NULL)
+  if (is.null(tab) || nrow(tab) == 0) {
+    message("Skip (0 Terms): ", stem)
+    return(NULL)
+  }
+
+  list(ego = ego, stem = stem)
+}
+
+# Plot speichern (PNG)
+.save_plot <- function(p, filename, width = 10, height = 7, dpi = 200) {
+  ggplot2::ggsave(
+    filename = filename,
+    plot = p,
+    width = width,
+    height = height,
+    dpi = dpi
+  )
+}
+
+# Ein Set (Kontrast) plotten: dotplot + emapplot + cnetplot
+.plot_go_set <- function(res_obj, set_label,
+                         directions = c("all", "up", "down"),
+                         ontologies = c("BP"),
+                         out_dir = ora_out_dir,
+                         padj_cutoff = 0.05) {
+  for (ont in ontologies) {
+    for (dir in directions) {
+      loaded <- .load_ego(out_dir, ont, set_label, dir, padj_cutoff)
+      if (is.null(loaded)) next
+
+      ego <- loaded$ego
+      stem <- loaded$stem
+
+      # -----------------
+      # 1) Dotplot (HBC)
+      # -----------------
+      p_dot <- enrichplot::dotplot(ego, showCategory = show_dot) +
+        ggplot2::ggtitle(paste0(stem, " – dotplot")) +
+        ggplot2::theme_bw()
+
+      .save_plot(
+        p_dot,
+        file.path(plots_dir, paste0(stem, "_dotplot.png")),
+        width = 11, height = 7
+      )
+
+      # -----------------
+      # 2) Enrichment map (HBC: pairwise_termsim + emapplot)
+      # -----------------
+      # (optional cache: termsim-Objekt als RDS speichern, spart Zeit beim nächsten Lauf)
+      termsim_rds <- file.path(out_dir, paste0(stem, "_termsim.rds"))
+      if (file.exists(termsim_rds)) {
+        ego_ts <- readRDS(termsim_rds)
+      } else {
+        ego_ts <- enrichplot::pairwise_termsim(ego)
+        saveRDS(ego_ts, termsim_rds)
+      }
+
+      p_emap <- enrichplot::emapplot(ego_ts, showCategory = show_emap) +
+        ggplot2::ggtitle(paste0(stem, " – emapplot")) +
+        ggplot2::theme_void()
+
+      .save_plot(
+        p_emap,
+        file.path(plots_dir, paste0(stem, "_emapplot.png")),
+        width = 12, height = 9
+      )
+
+      # -----------------
+      # 3) Category netplot (HBC: cnetplot + FoldChange)
+      #     - nur wenn log2FC existiert (Wald), nicht beim LRT
+      # -----------------
+      fc <- .make_foldchange_vec(res_obj, padj_cutoff = padj_cutoff, direction = dir)
+
+      if (!is.null(fc) && length(fc) >= 5) {
+        # Hinweis aus HBC: ggf. ggnewscale installieren, falls nötig
+        # install.packages("ggnewscale")
+        p_cnet <- enrichplot::cnetplot(
+          ego_ts,
+          showCategory = show_cnet,
+          foldChange = fc
+        ) +
+          ggplot2::ggtitle(paste0(stem, " – cnetplot")) +
+          ggplot2::theme_void()
+
+        .save_plot(
+          p_cnet,
+          file.path(plots_dir, paste0(stem, "_cnetplot.png")),
+          width = 13, height = 9
+        )
+      } else {
+        message("Skip cnetplot (kein log2FC oder zu wenige FC-Werte): ", stem)
+      }
+    }
+  }
+}
+
+# ============================================================
+# RUN: Wald-Kontraste + LRT (wie in deinem ORA-Block)
+# ============================================================
+
+# Wald: all/up/down
+.plot_go_set(res_V1_vs_A_tb,  set_label = "Wald_V1_vs_A",
+             directions = c("all", "up", "down"),
+             ontologies = ontologies,
+             out_dir = ora_out_dir, padj_cutoff = padj_cutoff)
+
+.plot_go_set(res_V2_vs_A_tb,  set_label = "Wald_V2_vs_A",
+             directions = c("all", "up", "down"),
+             ontologies = ontologies,
+             out_dir = ora_out_dir, padj_cutoff = padj_cutoff)
+
+.plot_go_set(res_V2_vs_V1_tb, set_label = "Wald_V2_vs_V1",
+             directions = c("all", "up", "down"),
+             ontologies = ontologies,
+             out_dir = ora_out_dir, padj_cutoff = padj_cutoff)
+
+# LRT: nur all (kein log2FC -> kein cnetplot)
+lrt_input <- if (exists("res_lrt_tb")) res_lrt_tb else res_lrt
+
+.plot_go_set(lrt_input, set_label = "LRT_timepoint",
+             directions = c("all"),
+             ontologies = ontologies,
+             out_dir = ora_out_dir, padj_cutoff = padj_cutoff)
+
+message("Fertig. Plots liegen hier: ", normalizePath(plots_dir))
 
 ```
