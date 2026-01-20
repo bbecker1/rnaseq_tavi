@@ -1182,7 +1182,6 @@ top20_sig_v2_v1
 # Reduced: ~ pid
 # ============================================================
 
-library(DESeq2)
 
 cache_dir <- "../../res/cache"
 if (!dir.exists(cache_dir)) dir.create(cache_dir, recursive = TRUE)
@@ -1198,7 +1197,7 @@ if (file.exists(dds_lrt_cache_file)) {
 } else {
   message("Berechne DESeq2 LRT…")
 
-  # Hier NICHT dein bereits gefittetes dds überschreiben,
+  # Wichtig: hier NICHT dein bereits gefittetes dds überschreiben,
   # sondern mit einem frischen Objekt arbeiten
   dds_lrt <- dds
 
@@ -1237,5 +1236,418 @@ res_lrt <- run_or_load_rds(
 )
 
 summary(res_lrt)
+
+```
+
+```{r}
+# ============================================================
+# LRT Results weiterverarbeiten:
+#  - res_lrt -> tibble
+#  - Human Annotation (Ensembl -> SYMBOL/GENENAME)
+#  - signifikante LRT-Gene
+#  - Heatmap (alle Zeitpunkte)
+# Voraussetzungen:
+#  - res_lrt existiert (aus LRT-Caching-Chunk)
+#  - meta und normalized_counts existieren (wie in Wald-Pipeline)
+# ============================================================
+
+# --- Helper: Ensembl-Versionen entfernen (ENSG... .16 -> ENSG...) ---
+strip_ensembl_version <- function(x) sub("\\..*$", "", x)
+
+# --- Metadaten wie bisher (für Heatmap-Annotation) ---
+sample_meta <- meta |>
+  tibble::rownames_to_column(var = "samplename") |>
+  tibble::as_tibble() |>
+  dplyr::mutate(
+    condition = droplevels(timepoint),
+    pid = as.factor(pid)
+  )
+
+stopifnot(all(sample_meta$samplename %in% colnames(normalized_counts)))
+
+# --- 1) LRT-Results -> tibble ---
+res_lrt_tb <- res_lrt |>
+  as.data.frame() |>
+  tibble::rownames_to_column(var = "gene") |>
+  tibble::as_tibble() |>
+  dplyr::mutate(ensembl_id = strip_ensembl_version(gene))
+
+# --- 2) Human Annotation (SYMBOL/GENENAME) ---
+gene_anno <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = unique(res_lrt_tb$ensembl_id),
+  keytype = "ENSEMBL",
+  columns = c("SYMBOL", "GENENAME")
+) |>
+  tibble::as_tibble() |>
+  dplyr::rename(ensembl_id = ENSEMBL) |>
+  dplyr::arrange(ensembl_id, dplyr::desc(!is.na(SYMBOL))) |>
+  dplyr::distinct(ensembl_id, .keep_all = TRUE)
+
+res_lrt_annot <- res_lrt_tb |>
+  dplyr::left_join(gene_anno, by = "ensembl_id")
+
+# --- 3) Signifikante LRT-Gene (padj < 0.05), auf Top 200 begrenzen ---
+padj_cutoff <- 0.05
+n_heatmap <- 200
+
+sig_lrt <- res_lrt_annot |>
+  dplyr::filter(!is.na(padj), padj < padj_cutoff) |>
+  dplyr::arrange(padj) |>
+  dplyr::slice_head(n = n_heatmap)
+
+# Optional: kurzer Blick auf die Top-Treffer
+sig_lrt |>
+  dplyr::select(gene, ensembl_id, SYMBOL, GENENAME, pvalue, padj) |>
+  dplyr::slice_head(n = 20)
+
+# --- 4) Heatmap der LRT-signifikanten Gene über ALLE Zeitpunkte (A/V1/V2) ---
+# Matrix subset: Gene x Samples (pheatmap erwartet Matrix)
+mat_lrt <- normalized_counts[
+  strip_ensembl_version(rownames(normalized_counts)) %in% sig_lrt$ensembl_id,
+  ,
+  drop = FALSE
+]
+
+# einheitliche Rownames für stabiles Handling
+rownames(mat_lrt) <- strip_ensembl_version(rownames(mat_lrt))
+
+# Gene nach Signifikanz sortieren (optional, aber nice)
+gene_order <- sig_lrt$ensembl_id
+mat_lrt <- mat_lrt[intersect(gene_order, rownames(mat_lrt)), , drop = FALSE]
+
+# Spaltenannotation (Samples)
+annotation_col <- sample_meta |>
+  dplyr::select(samplename, condition) |>
+  as.data.frame()
+
+rownames(annotation_col) <- annotation_col$samplename
+annotation_col$samplename <- NULL
+
+# Farbpalette wie im HBC-Tutorial
+heat_colors <- RColorBrewer::brewer.pal(6, "YlOrRd")
+
+pheatmap::pheatmap(
+  mat_lrt,
+  color = heat_colors,
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  show_rownames = FALSE,
+  annotation_col = annotation_col,
+  border_color = NA,
+  fontsize = 10,
+  scale = "row",
+  main = paste0("LRT signifikante Gene (padj < ", padj_cutoff, ")")
+)
+
+```
+
+```{r}
+# ============================================================
+# Wald vs. LRT Overlap (DESeq2)
+# Ziel:
+#   - Welche Gene sind im LRT (global über A/V1/V2) signifikant
+#     UND gleichzeitig in den paarweisen Wald-Kontrasten signifikant?
+#
+# Erwartete Objekte (so wie bei dir):
+#   - sig_lrt        : tibble mit LRT-signifikanten Genen (mind. padj), ideal: Spalte `ensembl_id`
+#   - res_lrt_annot  : annotierte LRT-Result-Tabelle (enthält ensembl_id, SYMBOL, GENENAME, padj)
+#   - sig_V1_vs_A    : tibble, Spalte `gene` (ENSG... mit Version)
+#   - sig_V2_vs_A    : tibble, Spalte `gene`
+#   - sig_V2_vs_V1   : tibble, Spalte `gene`
+#
+# Output:
+#   - overlap_summary         : Tabelle mit Overlap-Zahlen
+#   - overlap_genes_*         : Vektoren mit Ensembl IDs (ohne Version)
+#   - overlap_annot_any_wald  : Top-Overlap-Gene annotiert (aus res_lrt_annot)
+# ============================================================
+
+
+# --- kleine Hilfsfunktion: ENSG0000... .16 -> ENSG0000... ---
+strip_ensembl_version <- function(x) sub("\\..*$", "", x)
+
+# ------------------------------------------------------------
+# 1) IDs vorbereiten: LRT und Wald auf das gleiche ID-Format bringen
+# ------------------------------------------------------------
+
+# LRT: idealerweise hast du `ensembl_id` schon drin
+# Falls nicht, bauen wir es aus `gene` nach
+if (!"ensembl_id" %in% names(sig_lrt)) {
+  stopifnot("gene" %in% names(sig_lrt))
+  sig_lrt <- sig_lrt |>
+    dplyr::mutate(ensembl_id = strip_ensembl_version(gene))
+}
+
+genes_lrt <- unique(sig_lrt$ensembl_id)
+
+# Wald: bei dir liegen die Gene typischerweise als "ENSG... .version" in `gene`
+stopifnot("gene" %in% names(sig_V1_vs_A))
+stopifnot("gene" %in% names(sig_V2_vs_A))
+stopifnot("gene" %in% names(sig_V2_vs_V1))
+
+genes_wald_V1_vs_A  <- unique(strip_ensembl_version(sig_V1_vs_A$gene))
+genes_wald_V2_vs_A  <- unique(strip_ensembl_version(sig_V2_vs_A$gene))
+genes_wald_V2_vs_V1 <- unique(strip_ensembl_version(sig_V2_vs_V1$gene))
+
+# einmal "alle Wald-Gene" zusammen (mind. ein Kontrast)
+genes_wald_any <- unique(c(genes_wald_V1_vs_A, genes_wald_V2_vs_A, genes_wald_V2_vs_V1))
+
+# ------------------------------------------------------------
+# 2) Overlap berechnen
+# ------------------------------------------------------------
+
+# Overlap je Kontrast
+overlap_genes_V1_vs_A  <- intersect(genes_lrt, genes_wald_V1_vs_A)
+overlap_genes_V2_vs_A  <- intersect(genes_lrt, genes_wald_V2_vs_A)
+overlap_genes_V2_vs_V1 <- intersect(genes_lrt, genes_wald_V2_vs_V1)
+
+# Overlap: LRT ∩ (irgendein Wald)
+overlap_genes_any_wald <- intersect(genes_lrt, genes_wald_any)
+
+# Auch ganz nett: was ist "nur LRT" vs. "nur Wald"?
+genes_lrt_only  <- setdiff(genes_lrt, genes_wald_any)
+genes_wald_only <- setdiff(genes_wald_any, genes_lrt)
+
+# ------------------------------------------------------------
+# 3) Kurz-Zusammenfassung als Tabelle (für Report/Thesis)
+# ------------------------------------------------------------
+
+overlap_summary <- tibble::tibble(
+  category = c(
+    "LRT signifikant (gesamt)",
+    "Wald signifikant (irgendein Kontrast)",
+    "Overlap: LRT ∩ V1 vs A",
+    "Overlap: LRT ∩ V2 vs A",
+    "Overlap: LRT ∩ V2 vs V1",
+    "Overlap: LRT ∩ irgendein Wald",
+    "Nur LRT (nicht in Wald)",
+    "Nur Wald (nicht im LRT)"
+  ),
+  n_genes = c(
+    length(genes_lrt),
+    length(genes_wald_any),
+    length(overlap_genes_V1_vs_A),
+    length(overlap_genes_V2_vs_A),
+    length(overlap_genes_V2_vs_V1),
+    length(overlap_genes_any_wald),
+    length(genes_lrt_only),
+    length(genes_wald_only)
+  )
+)
+
+overlap_summary
+
+# ------------------------------------------------------------
+# 4) Overlap-Gene annotiert anschauen (SYMBOL/GENENAME)
+#    (wir nutzen res_lrt_annot als "Master", weil es Annotation enthält)
+# ------------------------------------------------------------
+
+stopifnot(exists("res_lrt_annot"))
+stopifnot("ensembl_id" %in% names(res_lrt_annot))
+
+overlap_annot_any_wald <- res_lrt_annot |>
+  dplyr::filter(ensembl_id %in% overlap_genes_any_wald) |>
+  dplyr::select(ensembl_id, SYMBOL, GENENAME, pvalue, padj) |>
+  dplyr::arrange(padj)
+
+# Top 20 (optional)
+overlap_annot_any_wald |> dplyr::slice_head(n = 20)
+
+# ------------------------------------------------------------
+# 5) Optional: Listen exportieren (falls du sie später brauchst)
+# ------------------------------------------------------------
+
+# write.csv(overlap_summary, "../../res/overlap_Wald_LRT_summary.csv", row.names = FALSE)
+# write.csv(overlap_annot_any_wald, "../../res/overlap_Wald_LRT_annot.csv", row.names = FALSE)
+
+# Wenn du Genlisten als TXT brauchst:
+# writeLines(overlap_genes_any_wald, "../../res/overlap_LRT_anyWald_genes.txt")
+
+# ------------------------------------------------------------
+# 6) Optional: Overlap nach Kontrast als kleine Tabelle
+# ------------------------------------------------------------
+
+overlap_by_contrast <- tibble::tibble(
+  contrast = c("V1 vs A", "V2 vs A", "V2 vs V1"),
+  n_overlap = c(
+    length(overlap_genes_V1_vs_A),
+    length(overlap_genes_V2_vs_A),
+    length(overlap_genes_V2_vs_V1)
+  )
+)
+
+overlap_by_contrast
+
+```
+
+```{r}
+# ============================================================
+# Heatmap nur der Wald∩LRT-Overlap-Gene
+# Idee:
+#   - LRT: Gene ändern sich global über A/V1/V2
+#   - Wald: Gene sind in mind. einem paarweisen Kontrast signifikant
+#   - Overlap: "robuste" Kandidaten -> schöne Heatmap
+#
+# Voraussetzungen (wie bei dir):
+#   - overlap_genes_any_wald  : Vektor (Ensembl IDs ohne Version) aus dem Overlap-Code
+#   - normalized_counts       : Matrix (Gene x Samples), colnames = samplename
+#   - meta                    : data.frame, rownames = samplename, enthält timepoint
+# Optional:
+#   - res_lrt_annot            : für Gene-Labels (SYMBOL) – nur wenn du willst
+# ============================================================
+
+strip_ensembl_version <- function(x) sub("\\..*$", "", x)
+
+# --- Metadaten für Annotation (Spalten = Samples) ---
+sample_meta <- meta |>
+  tibble::rownames_to_column(var = "samplename") |>
+  tibble::as_tibble() |>
+  dplyr::mutate(
+    condition = droplevels(timepoint)
+  )
+
+stopifnot(all(sample_meta$samplename %in% colnames(normalized_counts)))
+
+annotation_col <- sample_meta |>
+  dplyr::select(samplename, condition) |>
+  as.data.frame()
+
+rownames(annotation_col) <- annotation_col$samplename
+annotation_col$samplename <- NULL
+
+# --- Matrix nur für Overlap-Gene (über alle Samples / Zeitpunkte) ---
+mat_overlap <- normalized_counts[
+  strip_ensembl_version(rownames(normalized_counts)) %in% overlap_genes_any_wald,
+  ,
+  drop = FALSE
+]
+
+# Rownames vereinheitlichen (ohne Version), damit es sauber matcht
+rownames(mat_overlap) <- strip_ensembl_version(rownames(mat_overlap))
+
+# Optional: Gene in der Reihenfolge der Vektorliste darstellen (macht's reproduzierbar)
+mat_overlap <- mat_overlap[intersect(overlap_genes_any_wald, rownames(mat_overlap)), , drop = FALSE]
+
+# --- Optional: Heatmap begrenzen (falls es zu viele sind) ---
+n_heatmap <- 200
+if (nrow(mat_overlap) > n_heatmap) {
+  set.seed(1)
+  mat_overlap <- mat_overlap[seq_len(n_heatmap), , drop = FALSE]
+}
+
+# --- Optional: schönere Rowlabels mit SYMBOL (wenn res_lrt_annot vorhanden) ---
+# Default: keine Rowlabels (wie im Tutorial oft)
+show_row_names <- FALSE
+
+if (exists("res_lrt_annot") && all(c("ensembl_id", "SYMBOL") %in% names(res_lrt_annot))) {
+  # Mapping ensembl_id -> SYMBOL
+  sym_map <- res_lrt_annot |>
+    dplyr::select(ensembl_id, SYMBOL) |>
+    dplyr::distinct() |>
+    dplyr::filter(!is.na(SYMBOL))
+
+  # Labels bauen: SYMBOL wenn vorhanden, sonst ENSG...
+  rn <- rownames(mat_overlap)
+  rn_sym <- sym_map$SYMBOL[match(rn, sym_map$ensembl_id)]
+  rn_sym[is.na(rn_sym)] <- rn[is.na(rn_sym)]
+  rownames(mat_overlap) <- rn_sym
+}
+
+# --- Farben wie HBC ---
+heat_colors <- RColorBrewer::brewer.pal(6, "YlOrRd")
+
+pheatmap::pheatmap(
+  mat_overlap,
+  color = heat_colors,
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  show_rownames = show_row_names,  # FALSE = lesbarer bei vielen Genen
+  annotation_col = annotation_col,
+  border_color = NA,
+  fontsize = 10,
+  scale = "row",
+  main = paste0(
+    "Overlap-Heatmap (LRT ∩ Wald), n = ",
+    nrow(mat_overlap),
+    if (exists("n_heatmap")) paste0(" (max ", n_heatmap, ")") else ""
+  )
+)
+```
+
+```{r}
+# ============================================================
+# Pattern-Clustering der Wald∩LRT-Overlap-Gene mit DEGreport
+# Ziel:
+#   - schöne, interpretierbare Zeitverlaufs-Plots
+#   - basierend auf robusten Genen (LRT ∩ Wald)
+#
+# Voraussetzungen:
+#   - overlap_genes_any_wald : Ensembl IDs (ohne Version)
+#   - normalized_counts     : Matrix (Gene x Samples)
+#   - meta                  : data.frame, rownames = samplename
+# ============================================================
+
+# ------------------------------------------------------------
+# Helper: Ensembl-Versionen entfernen (ENSG... .16 -> ENSG...)
+# ------------------------------------------------------------
+strip_ensembl_version <- function(x) sub("\\..*$", "", x)
+
+# ------------------------------------------------------------
+# 1) Metadaten für degPatterns vorbereiten
+#    WICHTIG:
+#    - metadata MUSS ein data.frame sein
+#    - rownames(metadata) = Sample-Namen
+# ------------------------------------------------------------
+meta_deg <- meta |>
+  tibble::rownames_to_column(var = "samplename") |>
+  dplyr::select(samplename, timepoint) |>
+  dplyr::mutate(condition = droplevels(timepoint)) |>
+  as.data.frame()
+
+rownames(meta_deg) <- meta_deg$samplename
+meta_deg$samplename <- NULL
+
+# Sanity-Check
+stopifnot(all(rownames(meta_deg) %in% colnames(normalized_counts)))
+
+# ------------------------------------------------------------
+# 2) Matrix für Overlap-Gene bauen (Gene x Samples)
+# ------------------------------------------------------------
+mat_overlap <- normalized_counts[
+  strip_ensembl_version(rownames(normalized_counts)) %in% overlap_genes_any_wald,
+  ,
+  drop = FALSE
+]
+
+# Rownames vereinheitlichen
+rownames(mat_overlap) <- strip_ensembl_version(rownames(mat_overlap))
+
+# Spaltenreihenfolge exakt an Metadaten anpassen
+mat_overlap <- mat_overlap[, rownames(meta_deg), drop = FALSE]
+
+# Optional: begrenzen, falls es zu viele Gene sind
+n_max <- 500
+if (nrow(mat_overlap) > n_max) {
+  mat_overlap <- mat_overlap[seq_len(n_max), , drop = FALSE]
+}
+
+# ------------------------------------------------------------
+# 3) degPatterns laufen lassen
+# ------------------------------------------------------------
+degPatterns(
+  mat_overlap,
+  metadata = meta_deg,
+  time = "condition",
+  minc = 30
+)
+
+# ============================================================
+# Interpretation:
+#   - Jeder Panel = ein Cluster / zeitliches Muster
+#   - Punkte = einzelne Gene
+#   - Linien = mittlerer Verlauf pro Cluster
+#
+# Ein großer Teil der LRT∩Wald-Gene zeigt ein transient erhöhtes Expressionsniveau bei V1 mit anschließender Rückkehr zu Baseline bei V2
+# ============================================================
 
 ```
