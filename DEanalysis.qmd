@@ -1,5 +1,6 @@
 ---
 title: "DEanalysis"
+----v
 ---
 
 <https://hbctraining.github.io/Intro-to-DGE/schedule/links-to-lessons.html>
@@ -1847,44 +1848,57 @@ run_go_ora_set <- function(res_obj,
 ```
 
 ```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
 # ============================================================
-# GO ORA Plots (wie HBC) für alle Kontraste – automatisch
-#   - dotplot (Top 50 by gene ratio)
-#   - emapplot (term similarity / enrichmap)
-#   - cnetplot (Top 5 terms; Genes colored by log2FC)
+# ORA mit optionalem Effektgrößen-Filter (lfc_min)
+# - GO: enrichGO mit ENSEMBL
+# - KEGG: enrichKEGG mit ENTREZ (ENSEMBL->ENTREZ Mapping)
 #
-# Nutzt die bereits gespeicherten enrichGO-Objekte (*.rds) aus ora_out_dir
+# Copy/Paste Block: ans Ende deines Skripts (nach deinen DE-Results)
 #
-# Erwartete Objekte aus deinem Skript:
-#   - ora_out_dir (Pfad wie im ORA-Block), padj_cutoff
-#   - res_V1_vs_A_tb, res_V2_vs_A_tb, res_V2_vs_V1_tb (tibbles; gene, padj, log2FoldChange)
+# Erwartete Objekte:
+#   - res_V1_vs_A_tb, res_V2_vs_A_tb, res_V2_vs_V1_tb (tibble; gene, padj, log2FoldChange)
 #   - res_lrt_tb (tibble; gene, padj) ODER res_lrt (DESeqResults)
+#   - org.Hs.eg.db installiert (Human)
 #
-# Output:
-#   - ../../res/functional/ora_go/plots/
-#       GO_BP_Wald_V1_vs_A_all_padj0.05_dotplot.png
-#       GO_BP_Wald_V1_vs_A_all_padj0.05_emapplot.png
-#       GO_BP_Wald_V1_vs_A_all_padj0.05_cnetplot.png
-#       ...
+# Wichtig:
+#   - lfc_min wird NUR angewandt, wenn log2FoldChange existiert (Wald).
+#   - Für LRT wird lfc_min ignoriert, directions = "all".
 # ============================================================
 
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(clusterProfiler)
+  library(enrichplot)
+  library(org.Hs.eg.db)
+  library(ggplot2)
+  library(stringr)
+})
+
 # -----------------------------
-# Settings
+# Settings (anpassbar)
 # -----------------------------
-# Falls du im ORA-Block bereits ora_out_dir gesetzt hast, nimm das:
-if (!exists("ora_out_dir")) ora_out_dir <- "../../res/functional/ora_go"
 if (!exists("padj_cutoff")) padj_cutoff <- 0.05
 
-plots_dir <- file.path(ora_out_dir, "plots")
-dir.create(plots_dir, recursive = TRUE, showWarnings = FALSE)
+# Effektfilter (du kannst hier 0 / 0.5 / 1 setzen)
+lfc_min_default <- 0.5
 
-# HBC-Defaults
-show_dot <- 50
-show_emap <- 50
-show_cnet <- 5
+# Output-Dirs
+go_out_dir   <- "../../res/functional/ora_go"
+kegg_out_dir <- "../../res/functional/ora_kegg"
+dir.create(go_out_dir,   recursive = TRUE, showWarnings = FALSE)
+dir.create(kegg_out_dir, recursive = TRUE, showWarnings = FALSE)
 
-# Ontology: HBC zeigt BP (du kannst auch c("BP","MF","CC") setzen)
-ontologies <- c("BP")
+# KEGG Organismus
+kegg_organism <- "hsa"
 
 # -----------------------------
 # Helpers
@@ -1902,178 +1916,722 @@ strip_ensembl_version <- function(x) sub("\\..*$", "", x)
   }
 }
 
-# Erzeuge FoldChange-Vektor (names=Ensembl ohne Version) passend zu enrichGO(keyType="ENSEMBL")
-.make_foldchange_vec <- function(res_obj, padj_cutoff = 0.05, direction = c("all", "up", "down")) {
+# zentrales Filterverhalten für Wald (mit lfc_min)
+.filter_sig_with_lfc <- function(res_tb,
+                                 padj_cutoff = 0.05,
+                                 direction = c("all", "up", "down"),
+                                 lfc_min = 0,
+                                 lfc_col = "log2FoldChange") {
   direction <- match.arg(direction)
 
+  # base filtering
+  sig <- res_tb |>
+    dplyr::filter(!is.na(padj), padj < padj_cutoff)
+
+  # wenn kein LFC vorhanden -> nur all sinnvoll (LRT)
+  if (!lfc_col %in% names(sig)) {
+    return(sig)
+  }
+
+  # apply effect-size filters
+  if (direction == "all") {
+    sig <- sig |>
+      dplyr::filter(abs(.data[[lfc_col]]) >= lfc_min)
+  } else if (direction == "up") {
+    sig <- sig |>
+      dplyr::filter(.data[[lfc_col]] >= lfc_min)
+  } else if (direction == "down") {
+    sig <- sig |>
+      dplyr::filter(.data[[lfc_col]] <= -lfc_min)
+  }
+
+  sig
+}
+
+# -----------------------------
+# GO ORA (ENSEMBL) with lfc_min
+# -----------------------------
+.build_go_lists <- function(res_obj, padj_cutoff = 0.05, direction = "all", lfc_min = 0) {
   res_tb <- .ensure_tbl_results(res_obj) |>
     dplyr::filter(!is.na(padj)) |>
     dplyr::mutate(ensembl_id = strip_ensembl_version(gene))
 
-  # LRT hat kein log2FoldChange -> NA zurück
-  if (!"log2FoldChange" %in% names(res_tb)) {
-    return(NULL)
+  universe <- unique(res_tb$ensembl_id)
+
+  sig_tb <- .filter_sig_with_lfc(
+    res_tb = res_tb,
+    padj_cutoff = padj_cutoff,
+    direction = direction,
+    lfc_min = lfc_min
+  )
+
+  sig <- unique(sig_tb$ensembl_id)
+
+  list(universe = universe, sig = sig, has_lfc = "log2FoldChange" %in% names(res_tb))
+}
+
+.run_enrichGO <- function(sig_vec, universe_vec, ont = "BP",
+                          p_adjust_method = "BH", q_cutoff = 0.05) {
+  if (length(sig_vec) < 5) return(NULL)
+
+  clusterProfiler::enrichGO(
+    gene          = sig_vec,
+    universe      = universe_vec,
+    OrgDb         = org.Hs.eg.db,
+    keyType       = "ENSEMBL",
+    ont           = ont,
+    pAdjustMethod = p_adjust_method,
+    qvalueCutoff  = q_cutoff,
+    readable      = TRUE
+  )
+}
+
+run_go_ora_set_lfc <- function(res_obj,
+                               set_label,
+                               padj_cutoff = 0.05,
+                               lfc_min = 0,
+                               ontologies = c("BP", "MF", "CC"),
+                               directions = c("all", "up", "down"),
+                               out_dir = go_out_dir) {
+  res_tb <- .ensure_tbl_results(res_obj)
+  has_lfc <- "log2FoldChange" %in% names(res_tb)
+
+  # LRT: nur "all"
+  if (!has_lfc) directions <- intersect(directions, "all")
+
+  summary_rows <- list()
+
+  for (ont in ontologies) {
+    for (dir in directions) {
+      lists <- .build_go_lists(
+        res_obj = res_obj,
+        padj_cutoff = padj_cutoff,
+        direction = dir,
+        lfc_min = lfc_min
+      )
+
+      ego <- .run_enrichGO(lists$sig, lists$universe, ont = ont)
+
+      stem <- paste0(
+        "GO_", ont, "_", set_label, "_", dir,
+        "_padj", format(padj_cutoff, nsmall = 2),
+        if (has_lfc) paste0("_lfc", format(lfc_min, nsmall = 2)) else ""
+      )
+
+      # save
+      if (!is.null(ego)) {
+        tab <- as.data.frame(ego)
+        write.csv(tab, file.path(out_dir, paste0(stem, ".csv")), row.names = FALSE)
+        saveRDS(ego, file.path(out_dir, paste0(stem, ".rds")))
+        n_terms <- nrow(tab)
+        top_term <- if (n_terms > 0) tab$Description[1] else NA_character_
+        top_padj <- if (n_terms > 0) tab$p.adjust[1] else NA_real_
+      } else {
+        n_terms <- 0L
+        top_term <- NA_character_
+        top_padj <- NA_real_
+      }
+
+      summary_rows[[length(summary_rows) + 1]] <- tibble::tibble(
+        set = set_label,
+        ontology = ont,
+        direction = dir,
+        padj_cutoff = padj_cutoff,
+        lfc_min = if (has_lfc) lfc_min else NA_real_,
+        n_sig_genes = length(lists$sig),
+        n_terms = n_terms,
+        top_term = top_term,
+        top_term_padj = top_padj
+      )
+    }
   }
+
+  summary_tbl <- dplyr::bind_rows(summary_rows)
+
+  write.csv(
+    summary_tbl,
+    file.path(out_dir, paste0(
+      "GO_ORA_summary_", set_label,
+      "_padj", format(padj_cutoff, nsmall = 2),
+      if (has_lfc) paste0("_lfc", format(lfc_min, nsmall = 2)) else "",
+      ".csv"
+    )),
+    row.names = FALSE
+  )
+
+  summary_tbl
+}
+
+# -----------------------------
+# KEGG ORA (ENTREZ) with lfc_min
+# -----------------------------
+.map_ens_to_entrez <- function(ens_vec) {
+  ens_vec <- unique(ens_vec[!is.na(ens_vec)])
+  if (length(ens_vec) == 0) return(tibble::tibble(ENSEMBL = character(), ENTREZID = character()))
+
+  suppressMessages(
+    clusterProfiler::bitr(
+      ens_vec,
+      fromType = "ENSEMBL",
+      toType   = "ENTREZID",
+      OrgDb    = org.Hs.eg.db
+    )
+  ) |>
+    tibble::as_tibble()
+}
+
+.build_kegg_lists <- function(res_obj, padj_cutoff = 0.05, direction = "all", lfc_min = 0) {
+  res_tb <- .ensure_tbl_results(res_obj) |>
+    dplyr::filter(!is.na(padj)) |>
+    dplyr::mutate(ensembl_id = strip_ensembl_version(gene))
+
+  # Universe ENSEMBL -> ENTREZ
+  universe_ens <- unique(res_tb$ensembl_id)
+  map_univ <- .map_ens_to_entrez(universe_ens)
+  universe_entrez <- unique(map_univ$ENTREZID)
+
+  # Sig genes with lfc_min
+  sig_tb <- .filter_sig_with_lfc(
+    res_tb = res_tb,
+    padj_cutoff = padj_cutoff,
+    direction = direction,
+    lfc_min = lfc_min
+  )
+
+  sig_ens <- unique(sig_tb$ensembl_id)
+  map_sig <- .map_ens_to_entrez(sig_ens)
+  sig_entrez <- unique(map_sig$ENTREZID)
+
+  list(universe = universe_entrez, sig = sig_entrez, has_lfc = "log2FoldChange" %in% names(res_tb))
+}
+
+.run_enrichKEGG <- function(sig_entrez, universe_entrez, organism = "hsa",
+                            p_adjust_method = "BH",
+                            pvalue_cutoff = 0.05,
+                            qvalue_cutoff = 0.05) {
+  if (length(sig_entrez) < 5) return(NULL)
+
+  suppressMessages(
+    clusterProfiler::enrichKEGG(
+      gene          = sig_entrez,
+      universe      = universe_entrez,
+      organism      = organism,
+      pAdjustMethod = p_adjust_method,
+      pvalueCutoff  = pvalue_cutoff,
+      qvalueCutoff  = qvalue_cutoff
+    )
+  )
+}
+
+run_kegg_ora_set_lfc <- function(res_obj,
+                                 set_label,
+                                 padj_cutoff = 0.05,
+                                 lfc_min = 0,
+                                 directions = c("all", "up", "down"),
+                                 out_dir = kegg_out_dir,
+                                 organism = kegg_organism) {
+  res_tb <- .ensure_tbl_results(res_obj)
+  has_lfc <- "log2FoldChange" %in% names(res_tb)
+
+  # LRT: nur "all"
+  if (!has_lfc) directions <- intersect(directions, "all")
+
+  summary_rows <- list()
+
+  for (dir in directions) {
+    lists <- .build_kegg_lists(
+      res_obj = res_obj,
+      padj_cutoff = padj_cutoff,
+      direction = dir,
+      lfc_min = lfc_min
+    )
+
+    ek <- .run_enrichKEGG(lists$sig, lists$universe, organism = organism)
+
+    stem <- paste0(
+      "KEGG_", set_label, "_", dir,
+      "_padj", format(padj_cutoff, nsmall = 2),
+      if (has_lfc) paste0("_lfc", format(lfc_min, nsmall = 2)) else ""
+    )
+
+    if (!is.null(ek)) {
+      tab <- as.data.frame(ek)
+      write.csv(tab, file.path(out_dir, paste0(stem, ".csv")), row.names = FALSE)
+      saveRDS(ek, file.path(out_dir, paste0(stem, ".rds")))
+      n_terms <- nrow(tab)
+      top_path <- if (n_terms > 0) tab$Description[1] else NA_character_
+      top_padj <- if (n_terms > 0) tab$p.adjust[1] else NA_real_
+    } else {
+      n_terms <- 0L
+      top_path <- NA_character_
+      top_padj <- NA_real_
+    }
+
+    summary_rows[[length(summary_rows) + 1]] <- tibble::tibble(
+      set = set_label,
+      direction = dir,
+      padj_cutoff = padj_cutoff,
+      lfc_min = if (has_lfc) lfc_min else NA_real_,
+      n_sig_genes_entrez = length(lists$sig),
+      n_terms = n_terms,
+      top_pathway = top_path,
+      top_padj = top_padj
+    )
+  }
+
+  summary_tbl <- dplyr::bind_rows(summary_rows)
+
+  write.csv(
+    summary_tbl,
+    file.path(out_dir, paste0(
+      "KEGG_ORA_summary_", set_label,
+      "_padj", format(padj_cutoff, nsmall = 2),
+      if (has_lfc) paste0("_lfc", format(lfc_min, nsmall = 2)) else "",
+      ".csv"
+    )),
+    row.names = FALSE
+  )
+
+  summary_tbl
+}
+
+# ============================================================
+# RUN EXAMPLE: lfc_min = 0.5 (empfohlen)
+# ============================================================
+
+lfc_min <- lfc_min_default  # z.B. 0, 0.5, 1
+
+# --- GO ---
+go_v1_a  <- run_go_ora_set_lfc(res_V1_vs_A_tb,  "Wald_V1_vs_A",  padj_cutoff, lfc_min)
+go_v2_a  <- run_go_ora_set_lfc(res_V2_vs_A_tb,  "Wald_V2_vs_A",  padj_cutoff, lfc_min)
+go_v2_v1 <- run_go_ora_set_lfc(res_V2_vs_V1_tb, "Wald_V2_vs_V1", padj_cutoff, lfc_min)
+
+lrt_input <- if (exists("res_lrt_tb")) res_lrt_tb else res_lrt
+go_lrt <- run_go_ora_set_lfc(lrt_input, "LRT_timepoint", padj_cutoff, lfc_min = 0, directions = "all")
+
+go_all <- dplyr::bind_rows(go_v1_a, go_v2_a, go_v2_v1, go_lrt)
+write.csv(
+  go_all,
+  file.path(go_out_dir, paste0("GO_ORA_summary_ALL_padj", format(padj_cutoff, nsmall = 2),
+                               "_lfc", format(lfc_min, nsmall = 2), ".csv")),
+  row.names = FALSE
+)
+
+# --- KEGG ---
+kegg_v1_a  <- run_kegg_ora_set_lfc(res_V1_vs_A_tb,  "Wald_V1_vs_A",  padj_cutoff, lfc_min)
+kegg_v2_a  <- run_kegg_ora_set_lfc(res_V2_vs_A_tb,  "Wald_V2_vs_A",  padj_cutoff, lfc_min)
+kegg_v2_v1 <- run_kegg_ora_set_lfc(res_V2_vs_V1_tb, "Wald_V2_vs_V1", padj_cutoff, lfc_min)
+
+kegg_lrt <- run_kegg_ora_set_lfc(lrt_input, "LRT_timepoint", padj_cutoff, lfc_min = 0, directions = "all")
+
+kegg_all <- dplyr::bind_rows(kegg_v1_a, kegg_v2_a, kegg_v2_v1, kegg_lrt)
+write.csv(
+  kegg_all,
+  file.path(kegg_out_dir, paste0("KEGG_ORA_summary_ALL_padj", format(padj_cutoff, nsmall = 2),
+                                 "_lfc", format(lfc_min, nsmall = 2), ".csv")),
+  row.names = FALSE
+)
+
+go_all
+kegg_all
+
+```
+
+```{r}
+# ============================================================
+# GO + KEGG ORA PLOTS (RDS-first, kein Neuberechnen der ORA!)
+#   - dotplot (lesbar: wrap + dynamische Höhe)
+#   - emapplot (pairwise_termsim wird als *_termsim.rds gecached)
+#   - cnetplot (nur wenn log2FC existiert UND foldChange geliefert wird)
+#
+# WICHTIG:
+#   - Dieser Block rechnet KEINE enrichGO/enrichKEGG neu.
+#   - Er lädt nur vorhandene *.rds aus go_out_dir / kegg_out_dir.
+#
+# Erwartete Objekte aus deinem Skript:
+#   - go_out_dir, kegg_out_dir (wie im ORA-Block)
+#   - padj_cutoff
+#   - lfc_min (wenn du mit lfc_min gerechnet hast; sonst 0 setzen)
+#   - res_V1_vs_A_tb, res_V2_vs_A_tb, res_V2_vs_V1_tb (für foldChange-Vektor)
+#   - res_lrt_tb ODER res_lrt (nur fürs "has_lfc" Erkennen; FC bleibt NULL)
+#
+# Output:
+#   - <go_out_dir>/plots/
+#   - <kegg_out_dir>/plots/
+# ============================================================
+# -----------------------------
+# Defaults falls nicht gesetzt
+# -----------------------------
+if (!exists("padj_cutoff")) padj_cutoff <- 0.05
+if (!exists("lfc_min")) lfc_min <- 0.5   # WICHTIG: auf denselben Wert wie beim ORA-Lauf setzen!
+if (!exists("go_out_dir")) go_out_dir <- "../../res/functional/ora_go"
+if (!exists("kegg_out_dir")) kegg_out_dir <- "../../res/functional/ora_kegg"
+
+go_plots_dir <- file.path(go_out_dir, "plots")
+kegg_plots_dir <- file.path(kegg_out_dir, "plots")
+dir.create(go_plots_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(kegg_plots_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Plot-Defaults (anpassen)
+show_dot  <- 30
+show_emap <- 30
+show_cnet <- 5
+
+# GO Ontologies (meist BP im Main, MF/CC optional)
+go_ontologies <- c("BP")  # z.B. c("BP","MF","CC")
+
+# -----------------------------
+# Helpers
+# -----------------------------
+strip_ensembl_version <- function(x) sub("\\..*$", "", x)
+
+.ensure_tbl_results <- function(x) {
+  if (inherits(x, "DESeqResults")) {
+    x |>
+      as.data.frame() |>
+      tibble::rownames_to_column(var = "gene") |>
+      tibble::as_tibble()
+  } else {
+    tibble::as_tibble(x)
+  }
+}
+
+# FoldChange Vektor für GO (names=ENSEMBL ohne Version)
+.make_fc_go <- function(res_obj, padj_cutoff, direction, lfc_min = 0) {
+  res_tb <- .ensure_tbl_results(res_obj) |>
+    dplyr::filter(!is.na(padj)) |>
+    dplyr::mutate(ensembl_id = strip_ensembl_version(gene))
+
+  if (!"log2FoldChange" %in% names(res_tb)) return(NULL)
 
   sig <- res_tb |>
     dplyr::filter(padj < padj_cutoff)
 
-  if (direction == "up") {
-    sig <- sig |> dplyr::filter(log2FoldChange > 0)
+  if (direction == "all") {
+    sig <- sig |> dplyr::filter(abs(log2FoldChange) >= lfc_min)
+  } else if (direction == "up") {
+    sig <- sig |> dplyr::filter(log2FoldChange >= lfc_min)
   } else if (direction == "down") {
-    sig <- sig |> dplyr::filter(log2FoldChange < 0)
+    sig <- sig |> dplyr::filter(log2FoldChange <= -lfc_min)
   }
 
   fc <- sig$log2FoldChange
   names(fc) <- sig$ensembl_id
-
-  # Falls Duplikate existieren (selten, aber möglich): ersten behalten
   fc <- fc[!duplicated(names(fc))]
   fc
 }
 
-# Lade enrichGO-Objekt aus deinem ORA-Output anhand des gleichen stems wie im ORA-Block
-.load_ego <- function(out_dir, ont, set_label, direction, padj_cutoff) {
-  stem <- paste0(
-    "GO_", ont, "_", set_label, "_", direction,
-    "_padj", format(padj_cutoff, nsmall = 2)
-  )
-  rds_path <- file.path(out_dir, paste0(stem, ".rds"))
+# FoldChange Vektor für KEGG (names=ENTREZID)
+.make_fc_kegg <- function(res_obj, padj_cutoff, direction, lfc_min = 0) {
+  res_tb <- .ensure_tbl_results(res_obj) |>
+    dplyr::filter(!is.na(padj)) |>
+    dplyr::mutate(ensembl_id = strip_ensembl_version(gene))
 
-  if (!file.exists(rds_path)) {
-    message("Skip (fehlendes RDS): ", rds_path)
-    return(NULL)
+  if (!"log2FoldChange" %in% names(res_tb)) return(NULL)
+
+  sig <- res_tb |>
+    dplyr::filter(padj < padj_cutoff)
+
+  if (direction == "all") {
+    sig <- sig |> dplyr::filter(abs(log2FoldChange) >= lfc_min)
+  } else if (direction == "up") {
+    sig <- sig |> dplyr::filter(log2FoldChange >= lfc_min)
+  } else if (direction == "down") {
+    sig <- sig |> dplyr::filter(log2FoldChange <= -lfc_min)
   }
 
-  ego <- readRDS(rds_path)
-
-  # Leere Ergebnisse skippen
-  tab <- tryCatch(as.data.frame(ego), error = function(e) NULL)
-  if (is.null(tab) || nrow(tab) == 0) {
-    message("Skip (0 Terms): ", stem)
-    return(NULL)
-  }
-
-  list(ego = ego, stem = stem)
-}
-
-# Plot speichern (PNG)
-.save_plot <- function(p, filename, width = 10, height = 7, dpi = 200) {
-  ggplot2::ggsave(
-    filename = filename,
-    plot = p,
-    width = width,
-    height = height,
-    dpi = dpi
+  # Map ENS -> ENTREZ (für cnetplot bei KEGG)
+  map_sig <- suppressMessages(
+    clusterProfiler::bitr(
+      unique(sig$ensembl_id),
+      fromType = "ENSEMBL",
+      toType   = "ENTREZID",
+      OrgDb    = org.Hs.eg.db
+    )
   )
+
+  sig2 <- sig |>
+    dplyr::left_join(map_sig, by = c("ensembl_id" = "ENSEMBL")) |>
+    dplyr::filter(!is.na(ENTREZID))
+
+  fc <- sig2$log2FoldChange
+  names(fc) <- sig2$ENTREZID
+  fc <- fc[!duplicated(names(fc))]
+  fc
 }
 
-# Ein Set (Kontrast) plotten: dotplot + emapplot + cnetplot
-.plot_go_set <- function(res_obj, set_label,
-                         directions = c("all", "up", "down"),
-                         ontologies = c("BP"),
-                         out_dir = ora_out_dir,
-                         padj_cutoff = 0.05) {
+# RDS loader (Enrichment Objekt)
+.load_rds_enrich <- function(rds_path) {
+  if (!file.exists(rds_path)) return(NULL)
+  obj <- readRDS(rds_path)
+  tab <- tryCatch(as.data.frame(obj), error = function(e) NULL)
+  if (is.null(tab) || nrow(tab) == 0) return(NULL)
+  obj
+}
+
+# pairwise_termsim cache
+.get_termsim_cached <- function(enrich_obj, cache_path) {
+  if (file.exists(cache_path)) {
+    return(readRDS(cache_path))
+  }
+  ts <- tryCatch(enrichplot::pairwise_termsim(enrich_obj), error = function(e) NULL)
+  if (!is.null(ts)) saveRDS(ts, cache_path)
+  ts
+}
+
+# dotplot helper (lesbar, dynamische Höhe)
+.make_dotplot <- function(enrich_obj, title, show_dot = 30) {
+  tab <- as.data.frame(enrich_obj)
+  show_dot_local <- min(show_dot, nrow(tab))
+  height <- max(7, min(18, 0.28 * show_dot_local))
+
+  p <- suppressWarnings(
+    enrichplot::dotplot(enrich_obj, showCategory = show_dot_local) +
+      ggplot2::ggtitle(title) +
+      ggplot2::scale_y_discrete(labels = \(x) stringr::str_wrap(x, width = 38)) +
+      ggplot2::theme_bw() +
+      ggplot2::theme(axis.text.y = ggplot2::element_text(size = 9))
+  )
+
+  list(plot = p, height = height)
+}
+
+# safe ggsave
+.save_plot <- function(p, filename, width = 11, height = 7, dpi = 200) {
+  ggplot2::ggsave(filename = filename, plot = p, width = width, height = height, dpi = dpi)
+}
+
+# -----------------------------
+# GO Plot Runner (RDS-first)
+# -----------------------------
+plot_go_from_rds <- function(set_label,
+                             res_obj_for_fc = NULL,
+                             directions = c("all", "up", "down"),
+                             ontologies = c("BP"),
+                             out_dir = go_out_dir,
+                             plots_dir = go_plots_dir,
+                             padj_cutoff = 0.05,
+                             lfc_min = 0) {
+  has_lfc <- !is.null(res_obj_for_fc) && ("log2FoldChange" %in% names(.ensure_tbl_results(res_obj_for_fc)))
+  if (!has_lfc) directions <- intersect(directions, "all")
+
   for (ont in ontologies) {
     for (dir in directions) {
-      loaded <- .load_ego(out_dir, ont, set_label, dir, padj_cutoff)
-      if (is.null(loaded)) next
-
-      ego <- loaded$ego
-      stem <- loaded$stem
-
-      # -----------------
-      # 1) Dotplot (HBC)
-      # -----------------
-      p_dot <- enrichplot::dotplot(ego, showCategory = show_dot) +
-        ggplot2::ggtitle(paste0(stem, " – dotplot")) +
-        ggplot2::theme_bw()
-
-      .save_plot(
-        p_dot,
-        file.path(plots_dir, paste0(stem, "_dotplot.png")),
-        width = 11, height = 7
+      stem <- paste0(
+        "GO_", ont, "_", set_label, "_", dir,
+        "_padj", format(padj_cutoff, nsmall = 2),
+        if (has_lfc) paste0("_lfc", format(lfc_min, nsmall = 2)) else ""
       )
-
-      # -----------------
-      # 2) Enrichment map (HBC: pairwise_termsim + emapplot)
-      # -----------------
-      # (optional cache: termsim-Objekt als RDS speichern, spart Zeit beim nächsten Lauf)
-      termsim_rds <- file.path(out_dir, paste0(stem, "_termsim.rds"))
-      if (file.exists(termsim_rds)) {
-        ego_ts <- readRDS(termsim_rds)
-      } else {
-        ego_ts <- enrichplot::pairwise_termsim(ego)
-        saveRDS(ego_ts, termsim_rds)
+      rds_path <- file.path(out_dir, paste0(stem, ".rds"))
+      ego <- .load_rds_enrich(rds_path)
+      if (is.null(ego)) {
+        message("GO skip (kein RDS/0 Terms): ", stem)
+        next
       }
 
-      p_emap <- enrichplot::emapplot(ego_ts, showCategory = show_emap) +
-        ggplot2::ggtitle(paste0(stem, " – emapplot")) +
-        ggplot2::theme_void()
+      # 1) dotplot
+      dp <- .make_dotplot(ego, title = paste0(stem, " – dotplot"), show_dot = show_dot)
+      .save_plot(dp$plot, file.path(plots_dir, paste0(stem, "_dotplot.png")),
+                 width = 11, height = dp$height)
 
-      .save_plot(
-        p_emap,
-        file.path(plots_dir, paste0(stem, "_emapplot.png")),
-        width = 12, height = 9
-      )
-
-      # -----------------
-      # 3) Category netplot (HBC: cnetplot + FoldChange)
-      #     - nur wenn log2FC existiert (Wald), nicht beim LRT
-      # -----------------
-      fc <- .make_foldchange_vec(res_obj, padj_cutoff = padj_cutoff, direction = dir)
-
-      if (!is.null(fc) && length(fc) >= 5) {
-        # Hinweis aus HBC: ggf. ggnewscale installieren, falls nötig
-        # install.packages("ggnewscale")
-        p_cnet <- enrichplot::cnetplot(
-          ego_ts,
-          showCategory = show_cnet,
-          foldChange = fc
-        ) +
-          ggplot2::ggtitle(paste0(stem, " – cnetplot")) +
-          ggplot2::theme_void()
-
-        .save_plot(
-          p_cnet,
-          file.path(plots_dir, paste0(stem, "_cnetplot.png")),
-          width = 13, height = 9
+      # 2) emapplot (cached termsim)
+      ts_path <- file.path(out_dir, paste0(stem, "_termsim.rds"))
+      ego_ts <- .get_termsim_cached(ego, ts_path)
+      if (!is.null(ego_ts)) {
+        p_emap <- tryCatch(
+          enrichplot::emapplot(ego_ts, showCategory = show_emap) +
+            ggplot2::ggtitle(paste0(stem, " – emapplot")) +
+            ggplot2::theme_void(),
+          error = function(e) NULL
         )
-      } else {
-        message("Skip cnetplot (kein log2FC oder zu wenige FC-Werte): ", stem)
+        if (!is.null(p_emap)) {
+          .save_plot(p_emap, file.path(plots_dir, paste0(stem, "_emapplot.png")),
+                     width = 12, height = 9)
+        }
+      }
+
+      # 3) cnetplot (nur Wald; foldChange)
+      if (has_lfc) {
+        fc <- .make_fc_go(res_obj_for_fc, padj_cutoff = padj_cutoff, direction = dir, lfc_min = lfc_min)
+        if (!is.null(fc) && length(fc) >= 5 && !is.null(ego_ts)) {
+          p_cnet <- tryCatch(
+            enrichplot::cnetplot(
+              ego_ts,
+              showCategory = show_cnet,
+              foldChange = fc,
+              node_label = "category"
+            ) +
+              ggplot2::ggtitle(paste0(stem, " – cnetplot")) +
+              ggplot2::theme_void(),
+            error = function(e) NULL
+          )
+          if (!is.null(p_cnet)) {
+            .save_plot(p_cnet, file.path(plots_dir, paste0(stem, "_cnetplot.png")),
+                       width = 13, height = 9)
+          }
+        } else {
+          message("GO cnet skip (kein FC/termsim): ", stem)
+        }
       }
     }
   }
+
+  invisible(TRUE)
+}
+
+# -----------------------------
+# KEGG Plot Runner (RDS-first)
+# -----------------------------
+plot_kegg_from_rds <- function(set_label,
+                               res_obj_for_fc = NULL,
+                               directions = c("all", "up", "down"),
+                               out_dir = kegg_out_dir,
+                               plots_dir = kegg_plots_dir,
+                               padj_cutoff = 0.05,
+                               lfc_min = 0) {
+  has_lfc <- !is.null(res_obj_for_fc) && ("log2FoldChange" %in% names(.ensure_tbl_results(res_obj_for_fc)))
+  if (!has_lfc) directions <- intersect(directions, "all")
+
+  for (dir in directions) {
+    stem <- paste0(
+      "KEGG_", set_label, "_", dir,
+      "_padj", format(padj_cutoff, nsmall = 2),
+      if (has_lfc) paste0("_lfc", format(lfc_min, nsmall = 2)) else ""
+    )
+    rds_path <- file.path(out_dir, paste0(stem, ".rds"))
+    ek <- .load_rds_enrich(rds_path)
+    if (is.null(ek)) {
+      message("KEGG skip (kein RDS/0 Terms): ", stem)
+      next
+    }
+
+    # 1) dotplot
+    dp <- .make_dotplot(ek, title = paste0(stem, " – dotplot"), show_dot = show_dot)
+    .save_plot(dp$plot, file.path(plots_dir, paste0(stem, "_dotplot.png")),
+               width = 11, height = dp$height)
+
+# --- helper: check if emapplot is safe ---------------------------------
+.is_emap_safe <- function(x, min_terms = 3) {
+  if (is.null(x)) return(FALSE)
+
+  df <- tryCatch(as.data.frame(x), error = function(e) NULL)
+  if (is.null(df) || nrow(df) < min_terms) return(FALSE)
+
+  # pairwise_termsim() stores similarity in @termsim for enrichResult objects
+  ts <- tryCatch(x@termsim, error = function(e) NULL)
+  if (is.null(ts)) return(FALSE)
+
+  # needs at least some finite similarity off-diagonal to make edges
+  ts2 <- as.matrix(ts)
+  if (nrow(ts2) < min_terms || ncol(ts2) < min_terms) return(FALSE)
+
+  # remove diagonal, check for any finite > 0 similarities
+  diag(ts2) <- NA_real_
+  ok <- any(is.finite(ts2) & ts2 > 0, na.rm = TRUE)
+  ok
+}
+
+# 2) emapplot (cached termsim) – ROBUST
+ts_path <- file.path(out_dir, paste0(stem, "_termsim.rds"))
+ek_ts <- .get_termsim_cached(ek, ts_path)
+
+if (.is_emap_safe(ek_ts, min_terms = 3)) {
+  p_emap <- tryCatch(
+    enrichplot::emapplot(
+      ek_ts,
+      showCategory = min(show_emap, nrow(as.data.frame(ek_ts))),
+      layout = "nicely"
+    ) +
+      ggplot2::ggtitle(paste0(stem, " – emapplot")) +
+      ggplot2::theme_void(),
+    error = function(e) {
+      message("Skip KEGG emapplot (", stem, "): ", conditionMessage(e))
+      NULL
+    }
+  )
+
+  if (!is.null(p_emap)) {
+    .save_plot(
+      p_emap,
+      file.path(plots_dir, paste0(stem, "_emapplot.png")),
+      width = 12,
+      height = 9
+    )
+  }
+} else {
+  message("Skip KEGG emapplot (zu wenige/keine Kanten): ", stem)
+}
+
+
+    # 3) cnetplot (nur Wald; foldChange)
+    if (has_lfc) {
+      fc <- .make_fc_kegg(res_obj_for_fc, padj_cutoff = padj_cutoff, direction = dir, lfc_min = lfc_min)
+      if (!is.null(fc) && length(fc) >= 5 && !is.null(ek_ts)) {
+        p_cnet <- tryCatch(
+          enrichplot::cnetplot(
+            ek_ts,
+            showCategory = show_cnet,
+            foldChange = fc,
+            node_label = "category"
+          ) +
+            ggplot2::ggtitle(paste0(stem, " – cnetplot")) +
+            ggplot2::theme_void(),
+          error = function(e) NULL
+        )
+        if (!is.null(p_cnet)) {
+          .save_plot(p_cnet, file.path(plots_dir, paste0(stem, "_cnetplot.png")),
+                     width = 13, height = 9)
+        }
+      } else {
+        message("KEGG cnet skip (kein FC/termsim): ", stem)
+      }
+    }
+  }
+
+  invisible(TRUE)
 }
 
 # ============================================================
-# RUN: Wald-Kontraste + LRT (wie in deinem ORA-Block)
+# RUN: alle Kontraste (GO + KEGG) aus RDS plotten
 # ============================================================
 
-# Wald: all/up/down
-.plot_go_set(res_V1_vs_A_tb,  set_label = "Wald_V1_vs_A",
-             directions = c("all", "up", "down"),
-             ontologies = ontologies,
-             out_dir = ora_out_dir, padj_cutoff = padj_cutoff)
+# Wald
+plot_go_from_rds("Wald_V1_vs_A",  res_obj_for_fc = res_V1_vs_A_tb,
+                 directions = c("all","up","down"), ontologies = go_ontologies,
+                 padj_cutoff = padj_cutoff, lfc_min = lfc_min)
 
-.plot_go_set(res_V2_vs_A_tb,  set_label = "Wald_V2_vs_A",
-             directions = c("all", "up", "down"),
-             ontologies = ontologies,
-             out_dir = ora_out_dir, padj_cutoff = padj_cutoff)
+plot_go_from_rds("Wald_V2_vs_A",  res_obj_for_fc = res_V2_vs_A_tb,
+                 directions = c("all","up","down"), ontologies = go_ontologies,
+                 padj_cutoff = padj_cutoff, lfc_min = lfc_min)
 
-.plot_go_set(res_V2_vs_V1_tb, set_label = "Wald_V2_vs_V1",
-             directions = c("all", "up", "down"),
-             ontologies = ontologies,
-             out_dir = ora_out_dir, padj_cutoff = padj_cutoff)
+plot_go_from_rds("Wald_V2_vs_V1", res_obj_for_fc = res_V2_vs_V1_tb,
+                 directions = c("all","up","down"), ontologies = go_ontologies,
+                 padj_cutoff = padj_cutoff, lfc_min = lfc_min)
 
-# LRT: nur all (kein log2FC -> kein cnetplot)
+# LRT (nur all; kein FC)
 lrt_input <- if (exists("res_lrt_tb")) res_lrt_tb else res_lrt
+plot_go_from_rds("LRT_timepoint", res_obj_for_fc = NULL,
+                 directions = c("all"), ontologies = go_ontologies,
+                 padj_cutoff = padj_cutoff, lfc_min = 0)
 
-.plot_go_set(lrt_input, set_label = "LRT_timepoint",
-             directions = c("all"),
-             ontologies = ontologies,
-             out_dir = ora_out_dir, padj_cutoff = padj_cutoff)
+# KEGG
+plot_kegg_from_rds("Wald_V1_vs_A",  res_obj_for_fc = res_V1_vs_A_tb,
+                   directions = c("all","up","down"),
+                   padj_cutoff = padj_cutoff, lfc_min = lfc_min)
 
-message("Fertig. Plots liegen hier: ", normalizePath(plots_dir))
+plot_kegg_from_rds("Wald_V2_vs_A",  res_obj_for_fc = res_V2_vs_A_tb,
+                   directions = c("all","up","down"),
+                   padj_cutoff = padj_cutoff, lfc_min = lfc_min)
+
+plot_kegg_from_rds("Wald_V2_vs_V1", res_obj_for_fc = res_V2_vs_V1_tb,
+                   directions = c("all","up","down"),
+                   padj_cutoff = padj_cutoff, lfc_min = lfc_min)
+
+plot_kegg_from_rds("LRT_timepoint", res_obj_for_fc = NULL,
+                   directions = c("all"),
+                   padj_cutoff = padj_cutoff, lfc_min = 0)
+
+message("Fertig. GO Plots:   ", normalizePath(go_plots_dir))
+message("Fertig. KEGG Plots: ", normalizePath(kegg_plots_dir))
 
 ```
