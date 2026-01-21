@@ -1848,14 +1848,6 @@ run_go_ora_set <- function(res_obj,
 ```
 
 ```{r}
-
-```
-
-```{r}
-
-```
-
-```{r}
 # ============================================================
 # ORA mit optionalem Effektgrößen-Filter (lfc_min)
 # - GO: enrichGO mit ENSEMBL
@@ -2633,5 +2625,787 @@ plot_kegg_from_rds("LRT_timepoint", res_obj_for_fc = NULL,
 
 message("Fertig. GO Plots:   ", normalizePath(go_plots_dir))
 message("Fertig. KEGG Plots: ", normalizePath(kegg_plots_dir))
+
+```
+
+```{r}
+#| label: fig-publication-go-kegg
+#| fig-width: 20
+#| fig-height: 14
+# ============================================================
+# PUBLIKATIONSREIFE MULTI-PANEL FIGURE: GO + KEGG + Heatmap
+#
+# Verbesserungen gegenüber vorheriger Version:
+#   - Einheitliche Vergleiche: V1 vs A und V2 vs V1 für GO UND KEGG
+#   - Einheitliche p.adjust Farbskala über alle Panels
+#   - Bessere Panel-Labels (A-F groß und fett)
+#   - Optimiertes Breitenverhältnis (Dotplots : Heatmap)
+#   - Weniger Kategorien (8) für bessere Lesbarkeit
+#   - Heatmap mit Pathway-Annotation (row_annotation)
+#   - Verbesserte Term-Label-Formatierung (str_wrap)
+#   - Visuelle Trennung GO / KEGG durch Spacing
+# ============================================================
+
+suppressPackageStartupMessages({
+
+  library(ggplot2)
+  library(patchwork)
+  library(enrichplot)
+  library(pheatmap)
+  library(RColorBrewer)
+  library(stringr)
+  library(dplyr)
+  library(tibble)
+  library(grid)
+})
+
+# -----------------------------
+# 0) Settings
+# -----------------------------
+padj_cutoff <- if (exists("padj_cutoff")) padj_cutoff else 0.05
+lfc_min     <- if (exists("lfc_min")) lfc_min else 0.5
+
+go_out_dir   <- if (exists("go_out_dir")) go_out_dir else "../../res/functional/ora_go"
+kegg_out_dir <- if (exists("kegg_out_dir")) kegg_out_dir else "../../res/functional/ora_kegg"
+
+fig_out_dir  <- "../../res/figures"
+dir.create(fig_out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Plot-Parameter
+n_category    <- 8        # Anzahl GO/KEGG Terms pro Panel
+padj_limits   <- c(1e-12, 0.05)  # Einheitliche Farbskala
+dot_size_range <- c(2, 8)        # Punktgrößen
+term_wrap_width <- 35            # Zeilenumbruch für Term-Labels
+
+# Titel
+title_main    <- "TAVI-associated immune trajectory (A → V1 → V2)"
+subtitle_main <- paste0("GO/KEGG ORA (padj < ", padj_cutoff, ", |log2FC| ≥ ", lfc_min, ")")
+
+# -----------------------------
+# 1) Helper-Funktionen
+# -----------------------------
+fmt2 <- function(x) format(x, nsmall = 2)
+
+stem_go <- function(ont, set_label, dir, padj_cutoff, lfc_min) {
+
+  paste0("GO_", ont, "_", set_label, "_", dir, "_padj", fmt2(padj_cutoff), "_lfc", fmt2(lfc_min))
+}
+
+stem_kegg <- function(set_label, dir, padj_cutoff, lfc_min) {
+  paste0("KEGG_", set_label, "_", dir, "_padj", fmt2(padj_cutoff), "_lfc", fmt2(lfc_min))
+}
+
+safe_read_rds <- function(path) {
+  if (!file.exists(path)) return(NULL)
+  obj <- tryCatch(readRDS(path), error = function(e) NULL)
+  df  <- tryCatch(as.data.frame(obj), error = function(e) NULL)
+  if (is.null(df) || nrow(df) == 0) return(NULL)
+  obj
+}
+
+# Verbesserter Dotplot mit einheitlicher Skala und besserem Wrapping
+pub_dotplot <- function(enrich_obj, title, n_cat = n_category,
+                        padj_lim = padj_limits, wrap_width = term_wrap_width) {
+
+  # Fallback für leere/fehlende Daten
+
+  if (is.null(enrich_obj)) {
+    return(
+      ggplot() +
+        annotate("text", x = 0.5, y = 0.5, label = "No enriched terms",
+                 size = 4, color = "grey50") +
+        theme_void() +
+        ggtitle(title) +
+        theme(plot.title = element_text(size = 11, face = "bold", hjust = 0.5))
+    )
+  }
+
+  df <- as.data.frame(enrich_obj)
+  if (nrow(df) == 0) {
+    return(
+      ggplot() +
+        annotate("text", x = 0.5, y = 0.5, label = "No enriched terms",
+                 size = 4, color = "grey50") +
+        theme_void() +
+        ggtitle(title) +
+        theme(plot.title = element_text(size = 11, face = "bold", hjust = 0.5))
+    )
+  }
+
+  # Top n_cat Terms
+
+  df_top <- df %>%
+    slice_head(n = n_cat) %>%
+    mutate(
+      Description = str_wrap(Description, width = wrap_width),
+      Description = factor(Description, levels = rev(Description)),
+      GeneRatio_num = sapply(strsplit(GeneRatio, "/"), function(x) as.numeric(x[1]) / as.numeric(x[2]))
+    )
+
+  ggplot(df_top, aes(x = GeneRatio_num, y = Description)) +
+    geom_point(aes(size = Count, color = p.adjust)) +
+    scale_color_gradient(
+      low = "#d73027", high = "#4575b4",
+      trans = "log10",
+      limits = padj_lim,
+      oob = scales::squish,
+      name = "p.adjust"
+    ) +
+    scale_size_continuous(range = dot_size_range, name = "Count") +
+    labs(x = "Gene Ratio", y = NULL, title = title) +
+    theme_bw(base_size = 10) +
+    theme(
+      plot.title = element_text(size = 11, face = "bold"),
+      axis.text.y = element_text(size = 9),
+      axis.text.x = element_text(size = 8),
+      legend.position = "right",
+      legend.key.size = unit(0.4, "cm"),
+      legend.title = element_text(size = 8),
+      legend.text = element_text(size = 7),
+      panel.grid.minor = element_blank()
+    )
+}
+
+# Gene aus ORA-Ergebnissen extrahieren
+get_top_genes_from_enrich <- function(enrich_obj, n_terms = 3) {
+  if (is.null(enrich_obj)) return(list(genes = character(), terms = character()))
+  df <- tryCatch(as.data.frame(enrich_obj), error = function(e) NULL)
+  if (is.null(df) || nrow(df) == 0) return(list(genes = character(), terms = character()))
+
+  df_top <- df %>% slice_head(n = min(n_terms, nrow(df)))
+
+  genes <- unlist(strsplit(df_top$geneID, "/", fixed = TRUE), use.names = FALSE)
+  genes <- unique(genes[!is.na(genes) & genes != ""])
+  terms <- df_top$Description
+
+  list(genes = genes, terms = terms)
+}
+
+# -----------------------------
+# 2) ORA RDS laden - EINHEITLICHE Vergleiche: V1 vs A + V2 vs V1
+# -----------------------------
+# GO BP
+go_v1a_up    <- safe_read_rds(file.path(go_out_dir, paste0(stem_go("BP", "Wald_V1_vs_A", "up", padj_cutoff, lfc_min), ".rds")))
+go_v1a_down  <- safe_read_rds(file.path(go_out_dir, paste0(stem_go("BP", "Wald_V1_vs_A", "down", padj_cutoff, lfc_min), ".rds")))
+go_v2v1_up   <- safe_read_rds(file.path(go_out_dir, paste0(stem_go("BP", "Wald_V2_vs_V1", "up", padj_cutoff, lfc_min), ".rds")))
+go_v2v1_down <- safe_read_rds(file.path(go_out_dir, paste0(stem_go("BP", "Wald_V2_vs_V1", "down", padj_cutoff, lfc_min), ".rds")))
+
+# KEGG - GLEICHE Vergleiche wie GO
+kegg_v1a_up    <- safe_read_rds(file.path(kegg_out_dir, paste0(stem_kegg("Wald_V1_vs_A", "up", padj_cutoff, lfc_min), ".rds")))
+kegg_v1a_down  <- safe_read_rds(file.path(kegg_out_dir, paste0(stem_kegg("Wald_V1_vs_A", "down", padj_cutoff, lfc_min), ".rds")))
+kegg_v2v1_up   <- safe_read_rds(file.path(kegg_out_dir, paste0(stem_kegg("Wald_V2_vs_V1", "up", padj_cutoff, lfc_min), ".rds")))
+kegg_v2v1_down <- safe_read_rds(file.path(kegg_out_dir, paste0(stem_kegg("Wald_V2_vs_V1", "down", padj_cutoff, lfc_min), ".rds")))
+
+# -----------------------------
+# 3) Dotplots erstellen
+# -----------------------------
+p_go_v1a_up    <- pub_dotplot(go_v1a_up,    "GO BP: V1 vs A (UP)")
+p_go_v1a_down  <- pub_dotplot(go_v1a_down,  "GO BP: V1 vs A (DOWN)")
+p_go_v2v1_up   <- pub_dotplot(go_v2v1_up,   "GO BP: V2 vs V1 (UP)")
+p_go_v2v1_down <- pub_dotplot(go_v2v1_down, "GO BP: V2 vs V1 (DOWN)")
+
+p_kegg_v1a_up    <- pub_dotplot(kegg_v1a_up,    "KEGG: V1 vs A (UP)")
+p_kegg_v1a_down  <- pub_dotplot(kegg_v1a_down,  "KEGG: V1 vs A (DOWN)")
+p_kegg_v2v1_up   <- pub_dotplot(kegg_v2v1_up,   "KEGG: V2 vs V1 (UP)")
+p_kegg_v2v1_down <- pub_dotplot(kegg_v2v1_down, "KEGG: V2 vs V1 (DOWN)")
+
+# -----------------------------
+# 4) Heatmap mit Pathway-Annotation
+# -----------------------------
+heat_panel <- NULL
+
+if (!exists("trans") || !exists("meta")) {
+  warning("Heatmap: 'trans' oder 'meta' nicht gefunden.")
+} else {
+  trans_mat <- SummarizedExperiment::assay(trans)
+
+  # Rownames der Matrix: ENSEMBL IDs (ggf. mit Version)
+  # Wir strippen die Version für konsistentes Matching
+  trans_rownames_clean <- sub("\\..*$", "", rownames(trans_mat))
+
+  # Gene aus verschiedenen ORA-Quellen mit Pathway-Zuordnung
+  # Mehr Terms extrahieren für robustere Genauswahl
+  genes_go_v1a_up    <- get_top_genes_from_enrich(go_v1a_up, n_terms = 3)
+  genes_go_v1a_down  <- get_top_genes_from_enrich(go_v1a_down, n_terms = 3)
+  genes_go_v2v1_up   <- get_top_genes_from_enrich(go_v2v1_up, n_terms = 3)
+  genes_go_v2v1_down <- get_top_genes_from_enrich(go_v2v1_down, n_terms = 3)
+  genes_kegg_v1a_up  <- get_top_genes_from_enrich(kegg_v1a_up, n_terms = 2)
+  genes_kegg_v1a_down<- get_top_genes_from_enrich(kegg_v1a_down, n_terms = 2)
+  genes_kegg_v2v1_up <- get_top_genes_from_enrich(kegg_v2v1_up, n_terms = 2)
+  genes_kegg_v2v1_down <- get_top_genes_from_enrich(kegg_v2v1_down, n_terms = 2)
+
+  # Pathway-Annotation aufbauen
+  pathway_anno <- dplyr::bind_rows(
+    tibble(gene = genes_go_v1a_up$genes, pathway = "GO: V1/A UP"),
+    tibble(gene = genes_go_v1a_down$genes, pathway = "GO: V1/A DOWN"),
+    tibble(gene = genes_go_v2v1_up$genes, pathway = "GO: V2/V1 UP"),
+    tibble(gene = genes_go_v2v1_down$genes, pathway = "GO: V2/V1 DOWN"),
+    tibble(gene = genes_kegg_v1a_up$genes, pathway = "KEGG: V1/A UP"),
+    tibble(gene = genes_kegg_v1a_down$genes, pathway = "KEGG: V1/A DOWN"),
+    tibble(gene = genes_kegg_v2v1_up$genes, pathway = "KEGG: V2/V1 UP"),
+    tibble(gene = genes_kegg_v2v1_down$genes, pathway = "KEGG: V2/V1 DOWN")
+  ) %>%
+    dplyr::filter(gene != "") %>%
+    dplyr::distinct(gene, .keep_all = TRUE)
+
+  genes_raw <- unique(pathway_anno$gene)
+  message("Heatmap: ", length(genes_raw), " unique genes from ORA")
+
+  # Alle Gene als SYMBOL behandeln (readable=TRUE in enrichGO) und zu ENSEMBL mappen
+  sym_to_ens_map <- NULL
+  if (length(genes_raw) > 0) {
+    sym_to_ens_map <- suppressMessages(AnnotationDbi::select(
+      org.Hs.eg.db,
+      keys = unique(genes_raw),
+      columns = c("ENSEMBL"),
+      keytype = "SYMBOL"
+    )) %>%
+      dplyr::filter(!is.na(ENSEMBL)) %>%
+      dplyr::distinct(SYMBOL, .keep_all = TRUE)
+
+    message("Heatmap: ", nrow(sym_to_ens_map), " genes mapped to ENSEMBL")
+  }
+
+  # Finde welche gemappten ENSEMBL IDs in der Matrix vorkommen
+  if (!is.null(sym_to_ens_map) && nrow(sym_to_ens_map) > 0) {
+    # Match gegen clean rownames (ohne Version)
+    genes_in_matrix <- sym_to_ens_map %>%
+      dplyr::filter(ENSEMBL %in% trans_rownames_clean)
+
+    message("Heatmap: ", nrow(genes_in_matrix), " genes found in expression matrix")
+
+    if (nrow(genes_in_matrix) >= 5) {
+      # Finde die originalen Rownames (mit Version) für diese Gene
+      idx_match <- match(genes_in_matrix$ENSEMBL, trans_rownames_clean)
+      genes_present <- rownames(trans_mat)[idx_match]
+
+      # Sample-Sortierung: A -> V1 -> V2
+      meta2 <- meta
+      meta2$timepoint <- factor(as.character(meta2$timepoint), levels = c("A", "V1", "V2"))
+      ord <- order(meta2$timepoint, meta2$pid)
+
+      trans_mat_ord <- trans_mat[, ord, drop = FALSE]
+
+      # Spalten-Annotation
+      anno_col <- data.frame(
+        timepoint = meta2$timepoint[ord],
+        row.names = colnames(trans_mat_ord)
+      )
+
+      # Zeilen-Annotation (Pathway) - über SYMBOL joinen
+      anno_row_df <- genes_in_matrix %>%
+        dplyr::left_join(pathway_anno, by = c("SYMBOL" = "gene")) %>%
+        dplyr::mutate(pathway = ifelse(is.na(pathway), "Other", pathway))
+
+      anno_row <- data.frame(
+        Pathway = anno_row_df$pathway,
+        row.names = genes_present
+      )
+
+      # Matrix subset
+      mat_sub <- trans_mat_ord[genes_present, , drop = FALSE]
+
+      # Rownames auf SYMBOL ändern (besser lesbar)
+      rownames(mat_sub) <- genes_in_matrix$SYMBOL
+      rownames(anno_row) <- genes_in_matrix$SYMBOL
+
+      # Farben für Pathways
+      all_pathways <- unique(anno_row$Pathway)
+      pathway_colors <- c(
+        "GO: V1/A UP" = "#e41a1c",
+        "GO: V1/A DOWN" = "#377eb8",
+        "GO: V2/V1 UP" = "#ff7f00",
+        "GO: V2/V1 DOWN" = "#984ea3",
+        "KEGG: V1/A UP" = "#4daf4a",
+        "KEGG: V1/A DOWN" = "#f781bf",
+        "KEGG: V2/V1 UP" = "#a65628",
+        "KEGG: V2/V1 DOWN" = "#999999",
+        "Other" = "grey70"
+      )
+
+      timepoint_colors <- c("A" = "#66c2a5", "V1" = "#fc8d62", "V2" = "#8da0cb")
+
+      anno_colors <- list(
+        timepoint = timepoint_colors,
+        Pathway = pathway_colors[all_pathways]
+      )
+
+      # pheatmap erstellen
+      ph <- pheatmap::pheatmap(
+        mat_sub,
+        scale = "row",
+        annotation_col = anno_col,
+        annotation_row = anno_row,
+        annotation_colors = anno_colors,
+        cluster_cols = FALSE,
+        cluster_rows = TRUE,
+        show_colnames = FALSE,
+        fontsize_row = 7,
+        fontsize = 9,
+        color = colorRampPalette(c("#4575b4", "white", "#d73027"))(100),
+        border_color = NA,
+        main = paste0("Top ORA genes (n=", nrow(mat_sub), ", row-scaled VST)"),
+        silent = TRUE
+      )
+
+      heat_panel <- patchwork::wrap_elements(grid::grid.grabExpr(print(ph)))
+      message("Heatmap: Successfully created with ", nrow(mat_sub), " genes")
+    } else {
+      warning("Heatmap: Only ", nrow(genes_in_matrix), " genes found in matrix (need >= 5)")
+    }
+  } else {
+    warning("Heatmap: No genes could be mapped to ENSEMBL")
+  }
+}
+
+# Fallback Heatmap
+if (is.null(heat_panel)) {
+  heat_panel <- ggplot() +
+    annotate("text", x = 0.5, y = 0.5, label = "Heatmap\n(insufficient data)",
+             size = 5, color = "grey50") +
+    theme_void() +
+    ggtitle("Gene Expression Heatmap") +
+    theme(plot.title = element_text(size = 11, face = "bold", hjust = 0.5))
+}
+
+# -----------------------------
+# 5) Layout zusammenbauen
+# -----------------------------
+# GO Block (2x2)
+go_row1 <- p_go_v1a_up + p_go_v1a_down
+go_row2 <- p_go_v2v1_up + p_go_v2v1_down
+
+# KEGG Block (2x2)
+kegg_row1 <- p_kegg_v1a_up + p_kegg_v1a_down
+kegg_row2 <- p_kegg_v2v1_up + p_kegg_v2v1_down
+
+# Linke Spalte: GO (2 Zeilen) + KEGG (2 Zeilen) = 4 Zeilen
+left_col <- (go_row1 / go_row2 / kegg_row1 / kegg_row2) +
+  plot_layout(heights = c(1, 1, 1, 1), guides = "collect") &
+  theme(legend.position = "right")
+
+# Gesamtfigur: Links (4 Zeilen Dotplots) | Rechts (Heatmap)
+fig <- (left_col | heat_panel) +
+  plot_layout(widths = c(2.5, 1)) +
+  plot_annotation(
+    title = title_main,
+    subtitle = subtitle_main,
+    tag_levels = "A",
+    theme = theme(
+      plot.title = element_text(size = 16, face = "bold"),
+      plot.subtitle = element_text(size = 11, color = "grey30"),
+      plot.tag = element_text(size = 14, face = "bold")
+    )
+  )
+
+print(fig)
+
+# -----------------------------
+# 6) Export
+# -----------------------------
+out_stem <- paste0("FIG_TAVI_GO_KEGG_HEAT_padj", fmt2(padj_cutoff), "_lfc", fmt2(lfc_min), "_pub")
+out_base <- file.path(fig_out_dir, out_stem)
+
+ggsave(paste0(out_base, "_v2.pdf"), fig, width = 20, height = 14, device = cairo_pdf)
+ggsave(paste0(out_base, "_v2.png"), fig, width = 20, height = 14, dpi = 300)
+
+message("Saved: ", out_base, "_v2.pdf / _v2.png")
+
+```
+
+```{r}
+#| label: fig-tavi-story
+#| fig-width: 18
+#| fig-height: 16
+# ============================================================
+# STORY FIGURE: TAVI Immune Trajectory
+#
+# Die biologische Story:
+#   Phase 1 (V1 vs A): Akute Entzündung ↑, Adaptive Immunität ↓
+#   Phase 2 (V2 vs V1): Entzündung ↓, Immunität erholt sich ↑
+#   Phase 3 (V2 vs A): Weitgehend normalisiert
+#
+# Layout:
+#   A) Timeline-Schematic
+#   B) V1 vs A UP - Akute Entzündung
+#   C) V1 vs A DOWN - Adaptive Immunität supprimiert
+#   D) V2 vs V1 DOWN - Entzündung löst sich auf
+#   E) V2 vs V1 UP - Immunität erholt sich
+#   F) Heatmap - Schlüsselgene über alle Zeitpunkte
+# ============================================================
+
+# -----------------------------
+# 0) Settings
+# -----------------------------
+padj_cutoff <- 0.05
+lfc_min <- 0.5
+
+go_out_dir <- "../../res/functional/ora_go"
+fig_out_dir <- "../../res/figures"
+dir.create(fig_out_dir, recursive = TRUE, showWarnings = FALSE)
+
+fmt2 <- function(x) format(x, nsmall = 2)
+
+# -----------------------------
+# 1) Timeline Schematic Panel
+# -----------------------------
+create_timeline <- function() {
+  # Daten für Timeline
+  timeline_df <- data.frame(
+    x = c(1, 2, 3),
+    y = c(0, 0, 0),
+    label = c("A\n(Baseline)", "V1\n(Post-TAVI)", "V2\n(3 Monate)"),
+    phase = c("Baseline", "Acute", "Recovery")
+  )
+
+
+  # Pfeile zwischen Zeitpunkten
+  arrows_df <- data.frame(
+    x = c(1.15, 2.15),
+    xend = c(1.85, 2.85),
+    y = c(0, 0),
+    yend = c(0, 0),
+    label = c("Akute Phase", "Erholungsphase")
+  )
+
+  # Biologische Annotationen
+  annot_df <- data.frame(
+    x = c(1.5, 2.5),
+    y = c(0.4, 0.4),
+    label = c("Inflammation ↑\nAdaptive Immunity ↓",
+              "Inflammation ↓\nImmunity Recovery ↑"),
+    color = c("#e41a1c", "#4daf4a")
+  )
+
+  ggplot() +
+    # Zeitlinie
+    geom_segment(aes(x = 0.5, xend = 3.5, y = 0, yend = 0),
+                 linewidth = 1.5, color = "grey40") +
+    # Zeitpunkte
+    geom_point(data = timeline_df, aes(x = x, y = y),
+               size = 12, color = c("#66c2a5", "#fc8d62", "#8da0cb")) +
+    geom_text(data = timeline_df, aes(x = x, y = y - 0.25, label = label),
+              size = 4, fontface = "bold") +
+    # Pfeile
+    geom_segment(data = arrows_df,
+                 aes(x = x, xend = xend, y = y + 0.12, yend = yend + 0.12),
+                 arrow = arrow(length = unit(0.3, "cm"), type = "closed"),
+                 linewidth = 1.2, color = "grey50") +
+    # Biologische Annotationen
+    geom_label(data = annot_df, aes(x = x, y = y, label = label),
+               fill = c("#fee0d2", "#d9f0d3"), color = "grey20",
+               size = 3.2, fontface = "italic", label.padding = unit(0.4, "lines")) +
+    # Styling
+    coord_cartesian(xlim = c(0.3, 3.7), ylim = c(-0.5, 0.7)) +
+    theme_void() +
+    labs(title = "TAVI Immune Trajectory: A → V1 → V2") +
+    theme(
+      plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+      plot.margin = margin(10, 10, 10, 10)
+    )
+}
+
+timeline_panel <- create_timeline()
+
+# -----------------------------
+# 2) Helper: Dotplot aus RDS
+# -----------------------------
+stem_go <- function(set_label, dir) {
+  paste0("GO_BP_", set_label, "_", dir, "_padj", fmt2(padj_cutoff), "_lfc", fmt2(lfc_min))
+}
+
+safe_read_rds <- function(path) {
+  if (!file.exists(path)) return(NULL)
+  obj <- tryCatch(readRDS(path), error = function(e) NULL)
+  df <- tryCatch(as.data.frame(obj), error = function(e) NULL)
+  if (is.null(df) || nrow(df) == 0) return(NULL)
+  obj
+}
+
+# Einheitliche Farben für die Story
+color_inflammation <- "#d73027"  # Rot für Entzündung
+color_immunity_down <- "#4575b4" # Blau für Immunität runter
+color_resolution <- "#1a9850"    # Grün für Auflösung
+color_recovery <- "#ff7f00"      # Orange für Erholung
+
+story_dotplot <- function(enrich_obj, title, subtitle = NULL,
+                          accent_color = "grey30", n_cat = 8) {
+
+  if (is.null(enrich_obj)) {
+    return(
+      ggplot() +
+        annotate("text", x = 0.5, y = 0.5, label = "No enriched terms",
+                 size = 4, color = "grey50") +
+        theme_void() +
+        ggtitle(title) +
+        theme(plot.title = element_text(size = 11, face = "bold", hjust = 0.5))
+    )
+  }
+
+  df <- as.data.frame(enrich_obj)
+  if (nrow(df) == 0) {
+    return(
+      ggplot() +
+        annotate("text", x = 0.5, y = 0.5, label = "No enriched terms",
+                 size = 4, color = "grey50") +
+        theme_void() +
+        ggtitle(title) +
+        theme(plot.title = element_text(size = 11, face = "bold", hjust = 0.5))
+    )
+  }
+
+  df_top <- df %>%
+    dplyr::slice_head(n = n_cat) %>%
+    dplyr::mutate(
+      Description = str_wrap(Description, width = 40),
+      Description = factor(Description, levels = rev(Description)),
+      GeneRatio_num = sapply(strsplit(GeneRatio, "/"),
+                             function(x) as.numeric(x[1]) / as.numeric(x[2]))
+    )
+
+  p <- ggplot(df_top, aes(x = GeneRatio_num, y = Description)) +
+    geom_segment(aes(x = 0, xend = GeneRatio_num, y = Description, yend = Description),
+                 color = "grey80", linewidth = 0.5) +
+    geom_point(aes(size = Count), color = accent_color, alpha = 0.8) +
+    scale_size_continuous(range = c(3, 10), name = "Gene\nCount") +
+    labs(x = "Gene Ratio", y = NULL, title = title, subtitle = subtitle) +
+    theme_minimal(base_size = 10) +
+    theme(
+      plot.title = element_text(size = 12, face = "bold", color = accent_color),
+      plot.subtitle = element_text(size = 9, color = "grey40", face = "italic"),
+      axis.text.y = element_text(size = 9),
+      axis.text.x = element_text(size = 8),
+      legend.position = "right",
+      legend.key.size = unit(0.4, "cm"),
+      panel.grid.major.y = element_blank(),
+      panel.grid.minor = element_blank()
+    )
+
+  p
+}
+
+# -----------------------------
+# 3) Lade die 4 Schlüssel-Vergleiche
+# -----------------------------
+# V1 vs A UP - Akute Entzündung
+go_v1a_up <- safe_read_rds(file.path(go_out_dir, paste0(stem_go("Wald_V1_vs_A", "up"), ".rds")))
+
+# V1 vs A DOWN - Adaptive Immunität supprimiert
+go_v1a_down <- safe_read_rds(file.path(go_out_dir, paste0(stem_go("Wald_V1_vs_A", "down"), ".rds")))
+
+# V2 vs V1 DOWN - Entzündung löst sich auf
+go_v2v1_down <- safe_read_rds(file.path(go_out_dir, paste0(stem_go("Wald_V2_vs_V1", "down"), ".rds")))
+
+# V2 vs V1 UP - Immunität erholt sich
+go_v2v1_up <- safe_read_rds(file.path(go_out_dir, paste0(stem_go("Wald_V2_vs_V1", "up"), ".rds")))
+
+# Dotplots erstellen
+p_v1a_up <- story_dotplot(go_v1a_up,
+                          title = "V1 vs A: Upregulated",
+                          subtitle = "Acute inflammatory response",
+                          accent_color = color_inflammation)
+
+p_v1a_down <- story_dotplot(go_v1a_down,
+                            title = "V1 vs A: Downregulated",
+                            subtitle = "Adaptive immunity suppressed",
+                            accent_color = color_immunity_down)
+
+p_v2v1_down <- story_dotplot(go_v2v1_down,
+                             title = "V2 vs V1: Downregulated",
+                             subtitle = "Inflammation resolving",
+                             accent_color = color_resolution)
+
+p_v2v1_up <- story_dotplot(go_v2v1_up,
+                           title = "V2 vs V1: Upregulated",
+                           subtitle = "Immune recovery",
+                           accent_color = color_recovery)
+
+# -----------------------------
+# 4) Heatmap: Schlüsselgene über alle Zeitpunkte
+# -----------------------------
+heat_panel <- NULL
+
+if (exists("trans") && exists("meta")) {
+  trans_mat <- SummarizedExperiment::assay(trans)
+  trans_rownames_clean <- sub("\\..*$", "", rownames(trans_mat))
+
+  # Gene aus ORA-Ergebnissen extrahieren
+  get_genes <- function(enrich_obj, n_terms = 2) {
+    if (is.null(enrich_obj)) return(character())
+    df <- tryCatch(as.data.frame(enrich_obj), error = function(e) NULL)
+    if (is.null(df) || nrow(df) == 0) return(character())
+    df_top <- df %>% dplyr::slice_head(n = min(n_terms, nrow(df)))
+    genes <- unlist(strsplit(df_top$geneID, "/", fixed = TRUE))
+    unique(genes[!is.na(genes) & genes != ""])
+  }
+
+  # Gene aus allen 4 Vergleichen
+  genes_inflam <- get_genes(go_v1a_up, 2)
+  genes_immun_down <- get_genes(go_v1a_down, 2)
+  genes_resolve <- get_genes(go_v2v1_down, 2)
+  genes_recovery <- get_genes(go_v2v1_up, 2)
+
+  # Pathway-Annotation
+  pathway_anno <- dplyr::bind_rows(
+    tibble(gene = genes_inflam, pathway = "Inflammation (V1↑)"),
+    tibble(gene = genes_immun_down, pathway = "Immunity (V1↓)"),
+    tibble(gene = genes_resolve, pathway = "Resolution (V2↓)"),
+    tibble(gene = genes_recovery, pathway = "Recovery (V2↑)")
+  ) %>%
+    dplyr::filter(gene != "") %>%
+    dplyr::distinct(gene, .keep_all = TRUE)
+
+  genes_raw <- unique(pathway_anno$gene)
+
+  # SYMBOL -> ENSEMBL Mapping
+  if (length(genes_raw) > 0) {
+    sym_to_ens <- suppressMessages(AnnotationDbi::select(
+      org.Hs.eg.db,
+      keys = unique(genes_raw),
+      columns = c("ENSEMBL"),
+      keytype = "SYMBOL"
+    )) %>%
+      dplyr::filter(!is.na(ENSEMBL)) %>%
+      dplyr::distinct(SYMBOL, .keep_all = TRUE)
+
+    genes_in_matrix <- sym_to_ens %>%
+      dplyr::filter(ENSEMBL %in% trans_rownames_clean)
+
+    if (nrow(genes_in_matrix) >= 10) {
+      idx_match <- match(genes_in_matrix$ENSEMBL, trans_rownames_clean)
+      genes_present <- rownames(trans_mat)[idx_match]
+
+      # Sample-Sortierung
+      meta2 <- meta
+      meta2$timepoint <- factor(as.character(meta2$timepoint), levels = c("A", "V1", "V2"))
+      ord <- order(meta2$timepoint, meta2$pid)
+
+      trans_mat_ord <- trans_mat[, ord, drop = FALSE]
+
+      # Annotations
+      anno_col <- data.frame(
+        Timepoint = meta2$timepoint[ord],
+        row.names = colnames(trans_mat_ord)
+      )
+
+      anno_row_df <- genes_in_matrix %>%
+        dplyr::left_join(pathway_anno, by = c("SYMBOL" = "gene")) %>%
+        dplyr::mutate(pathway = ifelse(is.na(pathway), "Other", pathway))
+
+      anno_row <- data.frame(
+        Phase = anno_row_df$pathway,
+        row.names = genes_present
+      )
+
+      mat_sub <- trans_mat_ord[genes_present, , drop = FALSE]
+      rownames(mat_sub) <- genes_in_matrix$SYMBOL
+      rownames(anno_row) <- genes_in_matrix$SYMBOL
+
+      # Farben
+      phase_colors <- c(
+        "Inflammation (V1↑)" = color_inflammation,
+        "Immunity (V1↓)" = color_immunity_down,
+        "Resolution (V2↓)" = color_resolution,
+        "Recovery (V2↑)" = color_recovery,
+        "Other" = "grey70"
+      )
+
+      timepoint_colors <- c("A" = "#66c2a5", "V1" = "#fc8d62", "V2" = "#8da0cb")
+
+      anno_colors <- list(
+        Timepoint = timepoint_colors,
+        Phase = phase_colors[unique(anno_row$Phase)]
+      )
+
+      # Heatmap
+      ph <- pheatmap::pheatmap(
+        mat_sub,
+        scale = "row",
+        annotation_col = anno_col,
+        annotation_row = anno_row,
+        annotation_colors = anno_colors,
+        cluster_cols = FALSE,
+        cluster_rows = TRUE,
+        show_colnames = FALSE,
+        fontsize_row = 7,
+        fontsize = 9,
+        color = colorRampPalette(c("#2166ac", "#f7f7f7", "#b2182b"))(100),
+        border_color = NA,
+        main = paste0("Key genes across timepoints (n=", nrow(mat_sub), ")"),
+        silent = TRUE
+      )
+
+      heat_panel <- patchwork::wrap_elements(grid::grid.grabExpr(print(ph)))
+    }
+  }
+}
+
+# Fallback
+if (is.null(heat_panel)) {
+  heat_panel <- ggplot() +
+    annotate("text", x = 0.5, y = 0.5, label = "Heatmap\n(insufficient data)",
+             size = 5, color = "grey50") +
+    theme_void()
+}
+
+# -----------------------------
+# 5) Layout zusammenbauen
+# -----------------------------
+# Obere Reihe: Timeline
+# Mittlere Reihe: Phase 1 (V1 vs A)
+# Untere Reihe: Phase 2 (V2 vs V1)
+# Rechts: Heatmap
+
+# Phase 1 Block
+phase1_label <- ggplot() +
+
+  annotate("text", x = 0.5, y = 0.5,
+           label = "PHASE 1: Acute Response",
+           size = 5, fontface = "bold", color = "grey30") +
+  theme_void()
+
+phase1_block <- (p_v1a_up | p_v1a_down) +
+  plot_layout(guides = "collect")
+
+# Phase 2 Block
+phase2_label <- ggplot() +
+  annotate("text", x = 0.5, y = 0.5,
+           label = "PHASE 2: Recovery (3 months)",
+           size = 5, fontface = "bold", color = "grey30") +
+  theme_void()
+
+phase2_block <- (p_v2v1_down | p_v2v1_up) +
+  plot_layout(guides = "collect")
+
+# Linke Spalte
+left_col <- (timeline_panel / phase1_label / phase1_block / phase2_label / phase2_block) +
+  plot_layout(heights = c(1.2, 0.2, 2, 0.2, 2))
+
+# Gesamtfigur
+fig_story <- (left_col | heat_panel) +
+  plot_layout(widths = c(2.5, 1)) +
+  plot_annotation(
+    title = "Transcriptomic Response to TAVI: Biphasic Immune Modulation",
+    subtitle = paste0("GO Biological Process enrichment (padj < ", padj_cutoff,
+                      ", |log2FC| ≥ ", lfc_min, ") | RNA-seq from peripheral blood"),
+    tag_levels = "A",
+    theme = theme(
+      plot.title = element_text(size = 16, face = "bold"),
+      plot.subtitle = element_text(size = 11, color = "grey40"),
+      plot.tag = element_text(size = 14, face = "bold")
+    )
+  )
+
+print(fig_story)
+
+# -----------------------------
+# 6) Export
+# -----------------------------
+out_base <- file.path(fig_out_dir, "FIG_TAVI_immune_trajectory_story")
+
+ggsave(paste0(out_base, ".pdf"), fig_story, width = 18, height = 16, device = cairo_pdf)
+ggsave(paste0(out_base, ".png"), fig_story, width = 18, height = 16, dpi = 300)
+
+message("Saved: ", out_base, ".pdf / .png")
 
 ```
