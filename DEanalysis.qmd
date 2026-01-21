@@ -32,6 +32,10 @@ library(ashr)
 sessionInfo()
 ```
 
+## Datenimport und Vorbereitung
+
+Dieser Chunk importiert die Salmon-Quantifizierungen mittels `tximport`, liest die Metadata aus Excel ein, führt Quality Checks durch und erstellt ein Subset nur für Aortenklappen-Samples.
+
 ```{r}
 #| echo: false
 #| warning: false
@@ -138,9 +142,10 @@ stopifnot(length(keep_aortic) > 1)
 stopifnot(!anyDuplicated(keep_aortic))
 
 txi_aortic <- list(
-  counts    = txi$counts[, keep_aortic, drop = FALSE],
-  abundance = txi$abundance[, keep_aortic, drop = FALSE],
-  length    = txi$length[, keep_aortic, drop = FALSE]
+  counts             = txi$counts[, keep_aortic, drop = FALSE],
+  abundance          = txi$abundance[, keep_aortic, drop = FALSE],
+  length             = txi$length[, keep_aortic, drop = FALSE],
+  countsFromAbundance = txi$countsFromAbundance
 )
 
 
@@ -152,13 +157,16 @@ head(md_aortic)
 
 ```
 
+## Explorative Datenanalyse (EDA)
+
+Dieser Chunk visualisiert die Count-Verteilung und die Mean-Variance-Beziehung der RNA-seq Daten. Der Mean-Variance Plot zeigt Overdispersion (Varianz \>\> Mittelwert), was die Verwendung von Negativ-Binomial-Modellen (DESeq2) rechtfertigt.
+
 ```{r}
+#| label: eda-counts
 #| echo: false
 #| warning: false
 
-### Exploring RNA-seq count data
-
-#Die Count-Verteilung einer einzelnen Probe ansehen
+# Die Count-Verteilung einer einzelnen Probe ansehen
 counts_aortic <- as.data.frame(txi_aortic$counts)
 
 sample <- colnames(counts_aortic)[1]
@@ -190,8 +198,8 @@ df_mv <- dplyr::filter(
 # 4) Plot: log10-mean vs log10-variance, rote Linie = x=y
 ggplot(df_mv) +
   geom_point(aes(x = mean_counts, y = variance_counts), alpha = 0.4) +
-  scale_x_log10(limits = c(1, 1e9)) +
-  scale_y_log10(limits = c(1, 1e9)) +
+  scale_x_log10() +
+  scale_y_log10() +
   geom_abline(intercept = 0, slope = 1, color = "red") +
   labs(
     title = "Mean–Variance Relationship (Aortic valve RNA-seq counts)",
@@ -199,22 +207,16 @@ ggplot(df_mv) +
     y = "Variance of counts per gene (log10)"
   )
 # Daten passen nicht zur Poission-Verteilung, weil die Varianz >> Mittelwert (Overdispersion). Besonders bei höher exprimierten Genene ist die Varianz viel größer. Das rechtfertigt die Verwendung der Negativ-Binomial-Modelle von DESeq2
+```
 
-# ============================================================
-# DESeq2: Normalisierung (Size-Factor / "median-of-ratios")
-# Kontext: Salmon -> tximport -> DESeq2
-# Ziel: Normalisierte Counts erzeugen (nur für Visualisierung/QC),
-#       NICHT als Input für DE-Tests verwenden.
-# ============================================================
+## DESeq2 Normalisierung
 
-# ------------------------------------------------------------
-# VORAUSSETZUNGEN (existieren bereits im Workspace)
-#   txi        : komplettes tximport-Objekt (aus tximport())
-#   txi_aortic : gefiltertes tximport-Objekt für Aorten-Samples
-#               (list mit counts/abundance/length)
-#   md_aortic  : Metadata passend zu Aorten-Samples
-#               (mind. sample_id, pid, timepoint)
-# ------------------------------------------------------------
+Dieser Chunk erstellt das DESeqDataSet-Objekt, führt Prefiltering durch (rowSums \>= 10), schätzt Size Factors mittels median-of-ratios Methode und exportiert normalisierte Counts. Die normalisierten Counts dienen nur der Visualisierung/QC, nicht als Input für DE-Tests.
+
+```{r}
+#| label: deseq2-normalization
+#| echo: false
+#| warning: false
 
 # ------------------------------------------------------------
 # 1) Metadata für DESeq2 vorbereiten
