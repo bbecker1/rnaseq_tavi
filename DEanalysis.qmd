@@ -2648,19 +2648,6 @@ message("Fertig. KEGG Plots: ", normalizePath(kegg_plots_dir))
 #   - Visuelle Trennung GO / KEGG durch Spacing
 # ============================================================
 
-suppressPackageStartupMessages({
-
-  library(ggplot2)
-  library(patchwork)
-  library(enrichplot)
-  library(pheatmap)
-  library(RColorBrewer)
-  library(stringr)
-  library(dplyr)
-  library(tibble)
-  library(grid)
-})
-
 # -----------------------------
 # 0) Settings
 # -----------------------------
@@ -2983,7 +2970,7 @@ kegg_row2 <- p_kegg_v2v1_up + p_kegg_v2v1_down
 
 # Linke Spalte: GO (2 Zeilen) + KEGG (2 Zeilen) = 4 Zeilen
 left_col <- (go_row1 / go_row2 / kegg_row1 / kegg_row2) +
-  plot_layout(heights = c(1, 1, 1, 1), guides = "collect") &
+  ggplot2::plot_layout(heights = c(1, 1, 1, 1), guides = "collect") &
   theme(legend.position = "right")
 
 # Gesamtfigur: Links (4 Zeilen Dotplots) | Rechts (Heatmap)
@@ -3367,7 +3354,7 @@ phase1_label <- ggplot() +
   theme_void()
 
 phase1_block <- (p_v1a_up | p_v1a_down) +
-  plot_layout(guides = "collect")
+  patchwork::plot_layout(guides = "collect")
 
 # Phase 2 Block
 phase2_label <- ggplot() +
@@ -3377,16 +3364,16 @@ phase2_label <- ggplot() +
   theme_void()
 
 phase2_block <- (p_v2v1_down | p_v2v1_up) +
-  plot_layout(guides = "collect")
+  patchwork::plot_layout(guides = "collect")
 
 # Linke Spalte
 left_col <- (timeline_panel / phase1_label / phase1_block / phase2_label / phase2_block) +
-  plot_layout(heights = c(1.2, 0.2, 2, 0.2, 2))
+  patchwork::plot_layout(heights = c(1.2, 0.2, 2, 0.2, 2))
 
 # Gesamtfigur
 fig_story <- (left_col | heat_panel) +
-  plot_layout(widths = c(2.5, 1)) +
-  plot_annotation(
+  patchwork::plot_layout(widths = c(2.5, 1)) +
+  patchwork::plot_annotation(
     title = "Transcriptomic Response to TAVI: Biphasic Immune Modulation",
     subtitle = paste0("GO Biological Process enrichment (padj < ", padj_cutoff,
                       ", |log2FC| ≥ ", lfc_min, ") | RNA-seq from peripheral blood"),
@@ -3409,5 +3396,299 @@ ggsave(paste0(out_base, ".pdf"), fig_story, width = 18, height = 16, device = ca
 ggsave(paste0(out_base, ".png"), fig_story, width = 18, height = 16, dpi = 300)
 
 message("Saved: ", out_base, ".pdf / .png")
+
+```
+
+## Transkriptomische Entzündungs-, Effektoren- und Ribosomen-Scores nach TAVI
+
+Dieser Codeblock berechnet **RNA-basierte Scores**, die zentrale immunologische und zelluläre Prozesse nach Transkatheter-Aortenklappenimplantation (TAVI) quantifizieren. Ziel ist es, die **Stärke und Dynamik der systemischen Entzündungsantwort** sowie der nachfolgenden **immunologischen Reprogrammierung** auf Patientenebene abzubilden.
+
+Basierend auf variance-stabilisierter Expression (VST) werden drei biologisch motivierte Signaturen definiert:\
+(1) ein **akuter inflammatorischer Score**, der die frühe angeborene Immunantwort (z. B. neutrophile Aktivierung und Zytokinproduktion) widerspiegelt,\
+(2) ein **immunologischer Effektorscore**, der zytotoxische T-/NK-Zell-Programme erfasst, sowie\
+(3) ein **ribosomaler Aktivitätsscore**, der globale Veränderungen der Proteinbiosynthese als Marker zellulären Stresses und funktioneller Reprogrammierung abbildet.
+
+Die Scores werden für jedes Sample berechnet, entlang der Zeitpunkte (A → V1 → V2) visualisiert und erlauben eine **quantitative Beschreibung interindividueller Unterschiede** in der inflammatorischen Antwort auf TAVI. Sie bilden damit die Grundlage für weiterführende Analysen, einschließlich Korrelationen mit klinischen Parametern und der Identifikation potenzieller Biomarker.
+
+```{r}
+# ============================================================
+# Trajectory-Scores aus ORA-Genen (row-scaled VST) + Plot
+#   - verwendet genes_present (ENSG) und trans (VST)
+#   - erzeugt pro Sample 3 Scores:
+#       * Acute inflammatory score
+#       * Immune effector score
+#       * Ribosomal activity score
+#   - sortiert A -> V1 -> V2
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+})
+
+# -----------------------------
+# 0) Preconditions
+# -----------------------------
+stopifnot(exists("trans"), exists("meta"), exists("genes_present"))
+stopifnot(length(genes_present) >= 5)
+
+# trans: DESeq2::vst Objekt
+mat <- assay(trans)
+
+# Ensembl-Versionen entfernen (sicher)
+rownames(mat) <- sub("\\..*$", "", rownames(mat))
+
+# nur Gene, die wirklich da sind
+genes_present2 <- intersect(genes_present, rownames(mat))
+stopifnot(length(genes_present2) >= 5)
+
+# sicherstellen, dass meta zu mat passt
+stopifnot(all(colnames(mat) == rownames(meta)))
+
+meta2 <- meta
+
+# -----------------------------
+# 1) Row-scale (z-score pro Gen über Samples)
+# -----------------------------
+mat_sub <- mat[genes_present2, , drop = FALSE]
+
+# robuste Z-Transformation (keine NA durch SD=0)
+row_z <- function(x) {
+  s <- stats::sd(x)
+  if (is.na(s) || s == 0) return(rep(0, length(x)))
+  (x - mean(x)) / s
+}
+mat_z <- t(apply(mat_sub, 1, row_z))
+
+# ============================================================
+# Gene-Sets für Scores aus ORA-RDS rekonstruieren
+#  - Effector:     GO BP Wald_V2_vs_V1 UP (top Terms)
+#  - Ribosome:     KEGG Wald_V2_vs_V1 DOWN (top Terms)
+#  - Inflammation: KEGG Wald_V2_vs_A  UP (top Terms)
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(clusterProfiler)
+  library(org.Hs.eg.db)
+  library(AnnotationDbi)
+})
+
+# ---- Settings müssen zu deinem ORA-Run passen
+padj_cutoff <- if (exists("padj_cutoff")) padj_cutoff else 0.05
+lfc_min     <- if (exists("lfc_min")) lfc_min else 0.5
+
+go_out_dir   <- if (exists("go_out_dir")) go_out_dir else "../../res/functional/ora_go"
+kegg_out_dir <- if (exists("kegg_out_dir")) kegg_out_dir else "../../res/functional/ora_kegg"
+
+fmt2 <- function(x) format(x, nsmall = 2)
+
+stem_go <- function(ont, set_label, dir, padj_cutoff, lfc_min) {
+  paste0("GO_", ont, "_", set_label, "_", dir,
+         "_padj", fmt2(padj_cutoff), "_lfc", fmt2(lfc_min))
+}
+stem_kegg <- function(set_label, dir, padj_cutoff, lfc_min) {
+  paste0("KEGG_", set_label, "_", dir,
+         "_padj", fmt2(padj_cutoff), "_lfc", fmt2(lfc_min))
+}
+
+safe_read_enrich <- function(path) {
+  if (!file.exists(path)) return(NULL)
+  obj <- tryCatch(readRDS(path), error = function(e) NULL)
+  if (is.null(obj)) return(NULL)
+  df <- tryCatch(as.data.frame(obj), error = function(e) NULL)
+  if (is.null(df) || nrow(df) == 0) return(NULL)
+  obj
+}
+
+# ---- RDS laden
+go_eff_obj <- safe_read_enrich(file.path(go_out_dir,
+  paste0(stem_go("BP","Wald_V2_vs_V1","up", padj_cutoff, lfc_min), ".rds")
+))
+kegg_ribo_obj <- safe_read_enrich(file.path(kegg_out_dir,
+  paste0(stem_kegg("Wald_V2_vs_V1","down", padj_cutoff, lfc_min), ".rds")
+))
+kegg_infl_obj <- safe_read_enrich(file.path(kegg_out_dir,
+  paste0(stem_kegg("Wald_V2_vs_A","up", padj_cutoff, lfc_min), ".rds")
+))
+
+# ---- helper: geneID-Spalte aus enrich-Result ziehen
+# clusterProfiler speichert geneID meist als "ID1/ID2/..."
+get_top_geneIDs <- function(enrich_obj, n_terms = 2) {
+  if (is.null(enrich_obj)) return(character())
+  df <- as.data.frame(enrich_obj)
+  if (!"geneID" %in% names(df)) return(character())
+  top <- df |> slice_head(n = min(n_terms, nrow(df))) |> pull(geneID)
+  unique(unlist(strsplit(top, "/", fixed = TRUE), use.names = FALSE))
+}
+
+# ---- helper: geneIDs -> ENSEMBL mappen (robust: ENSG / ENTREZ / SYMBOL)
+to_ens <- function(ids) {
+  ids <- unique(ids[!is.na(ids) & ids != ""])
+  if (length(ids) == 0) return(character())
+
+  # ENSEMBL?
+  if (all(grepl("^ENSG", ids))) return(sub("\\..*$", "", ids))
+
+  # reine Zahlen -> ENTREZ?
+  if (all(grepl("^[0-9]+$", ids))) {
+    m <- AnnotationDbi::select(org.Hs.eg.db,
+      keys = ids, keytype = "ENTREZID", columns = "ENSEMBL"
+    )
+    return(unique(m$ENSEMBL[!is.na(m$ENSEMBL)]))
+  }
+
+  # sonst als SYMBOL versuchen
+  m <- AnnotationDbi::select(org.Hs.eg.db,
+    keys = ids, keytype = "SYMBOL", columns = "ENSEMBL"
+  )
+  unique(m$ENSEMBL[!is.na(m$ENSEMBL)])
+}
+
+# ---- Gene-Sets bauen (als ENSEMBL)
+genes_go_eff   <- get_top_geneIDs(go_eff_obj, n_terms = 2)
+genes_kegg_ribo<- get_top_geneIDs(kegg_ribo_obj, n_terms = 2)
+genes_kegg_sig <- get_top_geneIDs(kegg_infl_obj, n_terms = 2)
+
+genes_go_eff    <- to_ens(genes_go_eff)
+genes_kegg_ribo <- to_ens(genes_kegg_ribo)
+genes_kegg_sig  <- to_ens(genes_kegg_sig)
+
+# Mini-Diagnostik
+message("Effector ENS: ", length(genes_go_eff))
+message("Ribosome ENS: ", length(genes_kegg_ribo))
+message("Inflammation ENS: ", length(genes_kegg_sig))
+
+# optional anschauen:
+# head(genes_go_eff); head(genes_kegg_ribo); head(genes_kegg_sig)
+
+
+# -----------------------------
+# 2) Drei Score-Gruppen definieren
+#    (Fallback: wenn du keine saubere Zuordnung hast, nimm 1 Score aus allen Genen,
+#     und zwei weitere aus zufälligen Dritteln – ABER das wollen wir nicht.
+#    -> Besser: wir nehmen die ORA-Quelle erneut:
+#       - In deinem Workflow kommen die Gene aus:
+#           GO V2vsV1 UP   (Effector)
+#           KEGG V2vsV1 DOWN (Ribosome)
+#           KEGG V2vsA UP  (Signaling/Inflammation)
+#    Falls du die getrennten Listen noch hast: nutze sie.
+# -----------------------------
+
+# Wenn du diese Objekte noch hast (aus dem ORA-rebuild):
+#   genes_go_eff, genes_kegg_ribo, genes_kegg_sig
+# dann benutzen wir sie, sonst definieren wir clean Fallbacks.
+
+have_split_lists <- all(sapply(
+  c("genes_go_eff", "genes_kegg_ribo", "genes_kegg_sig"),
+  exists
+))
+
+if (!have_split_lists) {
+  message("Hinweis: genes_go_eff / genes_kegg_ribo / genes_kegg_sig nicht gefunden -> nutze Fallback (alle Gene für alle Scores).")
+  eff_genes  <- genes_present2
+  ribo_genes <- genes_present2
+  infl_genes <- genes_present2
+} else {
+  # mappe ggf. SYMBOL/ENTREZ zu ENSEMBL wurde bei dir schon indirekt gemacht,
+  # aber die Split-Listen sind typischerweise SYMBOL/ENTREZ.
+  # Deshalb: wir bauen Sets über die bereits gemappte ENS-Liste genes_present2
+  # indem wir schlicht die präsentierten Gene verwenden, die aus den jeweiligen Quellen stammen:
+  # -> am robustesten: wir remappen die Split-Listen wieder nach ENS, falls nötig.
+  suppressPackageStartupMessages({
+    library(AnnotationDbi)
+    library(org.Hs.eg.db)
+  })
+
+  to_ens <- function(x) {
+    x <- unique(x[!is.na(x) & x != ""])
+    if (length(x) == 0) return(character())
+
+    # wenn schon ENSG:
+    if (all(grepl("^ENSG", x))) return(sub("\\..*$", "", x))
+
+    # sonst als SYMBOL versuchen
+    map <- AnnotationDbi::select(
+      org.Hs.eg.db,
+      keys = x,
+      keytype = "SYMBOL",
+      columns = "ENSEMBL"
+    )
+    unique(map$ENSEMBL[!is.na(map$ENSEMBL)])
+  }
+
+  eff_genes  <- intersect(to_ens(genes_go_eff),     genes_present2)
+  ribo_genes <- intersect(to_ens(genes_kegg_ribo),  genes_present2)
+  infl_genes <- intersect(to_ens(genes_kegg_sig),   genes_present2)
+
+  # Safety: falls ein Set zu klein ist -> fallback auf alle
+  if (length(eff_genes)  < 5) eff_genes  <- genes_present2
+  if (length(ribo_genes) < 5) ribo_genes <- genes_present2
+  if (length(infl_genes) < 5) infl_genes <- genes_present2
+}
+
+# -----------------------------
+# 3) Scores berechnen (mean z über Gene)
+# -----------------------------
+score_from_set <- function(mat_z, gene_set) {
+  gene_set <- intersect(gene_set, rownames(mat_z))
+  if (length(gene_set) == 0) return(rep(NA_real_, ncol(mat_z)))
+  colMeans(mat_z[gene_set, , drop = FALSE], na.rm = TRUE)
+}
+
+meta2$score_inflammation <- score_from_set(mat_z, infl_genes)
+meta2$score_effector     <- score_from_set(mat_z, eff_genes)
+meta2$score_ribosome     <- score_from_set(mat_z, ribo_genes)
+
+# Check gegen NA-Flatline
+stopifnot(any(!is.na(meta2$score_inflammation)))
+stopifnot(any(!is.na(meta2$score_effector)))
+stopifnot(any(!is.na(meta2$score_ribosome)))
+
+# -----------------------------
+# 4) Plot vorbereiten (A -> V1 -> V2)
+# -----------------------------
+meta2$timepoint <- factor(as.character(meta2$timepoint), levels = c("A","V1","V2"))
+
+scores_long <- meta2 |>
+  dplyr::select(pid, timepoint, score_inflammation, score_effector, score_ribosome) |>
+  tidyr::pivot_longer(
+    cols = starts_with("score_"),
+    names_to = "score",
+    values_to = "value"
+  ) |>
+  dplyr::mutate(
+    score = dplyr::recode(score,
+      score_inflammation = "Acute inflammatory score",
+      score_effector     = "Immune effector score",
+      score_ribosome     = "Ribosomal activity score"
+    )
+  )
+
+p_scores <- ggplot(scores_long, aes(x = timepoint, y = value, group = pid)) +
+  geom_line(alpha = 0.25) +
+  geom_point(size = 1.2, alpha = 0.6) +
+  stat_summary(aes(group = 1), fun = mean, geom = "line", linewidth = 1.0) +
+  stat_summary(aes(group = 1), fun = mean, geom = "point", size = 2.0) +
+  facet_wrap(~ score, nrow = 1, scales = "free_y") +
+  theme_bw(base_size = 11) +
+  labs(
+    title = "Transcriptomic immune response after TAVI",
+    x = NULL,
+    y = "Mean row-scaled VST (z-score)"
+  ) +
+  theme(
+    strip.background = element_rect(fill = "grey95"),
+    panel.grid.minor = element_blank()
+  )
+
+print(p_scores)
+
+# Optional: speichern
+# ggsave("../../res/figures/FIG_TAVI_scores_trajectory.png", p_scores, width = 9, height = 3, dpi = 300)
+# ggsave("../../res/figures/FIG_TAVI_scores_trajectory.pdf", p_scores, width = 9, height = 3)
+
 
 ```
