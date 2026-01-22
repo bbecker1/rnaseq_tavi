@@ -940,1535 +940,639 @@ Führt GO und KEGG Over-Representation Analysis durch für alle Kontraste (Wald 
 #| echo: false
 #| warning: false
 
-# -----------------------------
-# Settings (anpassbar)
-# -----------------------------
+# --- Settings ---
 if (!exists("padj_cutoff")) padj_cutoff <- 0.05
+lfc_min <- 0.5
 
-# Effektfilter (du kannst hier 0 / 0.5 / 1 setzen)
-lfc_min_default <- 0.5
-
-# Output-Dirs
 go_out_dir   <- "../../res/functional/ora_go"
 kegg_out_dir <- "../../res/functional/ora_kegg"
 dir.create(go_out_dir,   recursive = TRUE, showWarnings = FALSE)
 dir.create(kegg_out_dir, recursive = TRUE, showWarnings = FALSE)
 
-# KEGG Organismus
 kegg_organism <- "hsa"
 
-# -----------------------------
-# Helpers
-# -----------------------------
-strip_ensembl_version <- function(x) sub("\\..*$", "", x)
+# --- Helpers (kompakt) ---
+fmt2 <- function(x) format(x, nsmall = 2)
 
-.ensure_tbl_results <- function(x) {
-  if (inherits(x, "DESeqResults")) {
-    x |>
-      as.data.frame() |>
-      tibble::rownames_to_column(var = "gene") |>
-      tibble::as_tibble()
-  } else {
-    tibble::as_tibble(x)
-  }
+.make_stem <- function(prefix, set_label, dir, padj_cutoff, lfc_min, has_lfc) {
+
+  paste0(prefix, "_", set_label, "_", dir, "_padj", fmt2(padj_cutoff),
+         if (has_lfc) paste0("_lfc", fmt2(lfc_min)) else "")
 }
 
-# zentrales Filterverhalten für Wald (mit lfc_min)
-.filter_sig_with_lfc <- function(res_tb,
-                                 padj_cutoff = 0.05,
-                                 direction = c("all", "up", "down"),
-                                 lfc_min = 0,
-                                 lfc_col = "log2FoldChange") {
-  direction <- match.arg(direction)
+.filter_sig <- function(res_tb, padj_cutoff, direction, lfc_min) {
+  sig <- dplyr::filter(res_tb, !is.na(padj), padj < padj_cutoff)
+  lfc_col <- "log2FoldChange"
+  if (!lfc_col %in% names(sig)) return(sig)
 
-  # base filtering
-  sig <- res_tb |>
-    dplyr::filter(!is.na(padj), padj < padj_cutoff)
-
-  # wenn kein LFC vorhanden -> nur all sinnvoll (LRT)
-  if (!lfc_col %in% names(sig)) {
-    return(sig)
-  }
-
-  # apply effect-size filters
-  if (direction == "all") {
-    sig <- sig |>
-      dplyr::filter(abs(.data[[lfc_col]]) >= lfc_min)
-  } else if (direction == "up") {
-    sig <- sig |>
-      dplyr::filter(.data[[lfc_col]] >= lfc_min)
-  } else if (direction == "down") {
-    sig <- sig |>
-      dplyr::filter(.data[[lfc_col]] <= -lfc_min)
-  }
-
-  sig
+ switch(direction,
+    all  = dplyr::filter(sig, abs(.data[[lfc_col]]) >= lfc_min),
+    up   = dplyr::filter(sig, .data[[lfc_col]] >= lfc_min),
+    down = dplyr::filter(sig, .data[[lfc_col]] <= -lfc_min),
+    sig
+  )
 }
 
-# -----------------------------
-# GO ORA (ENSEMBL) with lfc_min
-# -----------------------------
-.build_go_lists <- function(res_obj, padj_cutoff = 0.05, direction = "all", lfc_min = 0) {
-  res_tb <- .ensure_tbl_results(res_obj) |>
+.prep_results <- function(res_obj) {
+ res_tb <- if (inherits(res_obj, "DESeqResults")) {
+    res_obj |> as.data.frame() |> tibble::rownames_to_column("gene") |> tibble::as_tibble()
+  } else tibble::as_tibble(res_obj)
+
+  res_tb |>
     dplyr::filter(!is.na(padj)) |>
     dplyr::mutate(ensembl_id = strip_ensembl_version(gene))
-
-  universe <- unique(res_tb$ensembl_id)
-
-  sig_tb <- .filter_sig_with_lfc(
-    res_tb = res_tb,
-    padj_cutoff = padj_cutoff,
-    direction = direction,
-    lfc_min = lfc_min
-  )
-
-  sig <- unique(sig_tb$ensembl_id)
-
-  list(universe = universe, sig = sig, has_lfc = "log2FoldChange" %in% names(res_tb))
 }
 
-.run_enrichGO <- function(sig_vec, universe_vec, ont = "BP",
-                          p_adjust_method = "BH", q_cutoff = 0.05) {
-  if (length(sig_vec) < 5) return(NULL)
-
-  clusterProfiler::enrichGO(
-    gene          = sig_vec,
-    universe      = universe_vec,
-    OrgDb         = org.Hs.eg.db,
-    keyType       = "ENSEMBL",
-    ont           = ont,
-    pAdjustMethod = p_adjust_method,
-    qvalueCutoff  = q_cutoff,
-    readable      = TRUE
-  )
+.map_to_entrez <- function(ens_vec) {
+  ens_vec <- unique(ens_vec[!is.na(ens_vec)])
+  if (length(ens_vec) == 0) return(character())
+  suppressMessages(
+    clusterProfiler::bitr(ens_vec, "ENSEMBL", "ENTREZID", org.Hs.eg.db)
+  )$ENTREZID |> unique()
 }
 
-run_go_ora_set_lfc <- function(res_obj,
-                               set_label,
-                               padj_cutoff = 0.05,
-                               lfc_min = 0,
-                               ontologies = c("BP", "MF", "CC"),
-                               directions = c("all", "up", "down"),
-                               out_dir = go_out_dir,
-                               force_recompute = FALSE) {
-  res_tb <- .ensure_tbl_results(res_obj)
+# --- Generische ORA-Engine ---
+.run_ora_set <- function(res_obj, set_label, padj_cutoff, lfc_min,
+                         out_dir, type = c("GO", "KEGG"),
+                         ontologies = "BP", directions = c("all", "up", "down"),
+                         organism = "hsa", force = FALSE) {
+  type <- match.arg(type)
+  res_tb <- .prep_results(res_obj)
   has_lfc <- "log2FoldChange" %in% names(res_tb)
+  if (!has_lfc) directions <- "all"
 
-  # LRT: nur "all"
-  if (!has_lfc) directions <- intersect(directions, "all")
+  universe_ens <- unique(res_tb$ensembl_id)
+  universe <- if (type == "KEGG") .map_to_entrez(universe_ens) else universe_ens
 
-  summary_rows <- list()
+  summary_rows <- vector("list", length(ontologies) * length(directions))
+  idx <- 0
 
   for (ont in ontologies) {
     for (dir in directions) {
-      stem <- paste0(
-        "GO_", ont, "_", set_label, "_", dir,
-        "_padj", format(padj_cutoff, nsmall = 2),
-        if (has_lfc) paste0("_lfc", format(lfc_min, nsmall = 2)) else ""
-      )
-
+      idx <- idx + 1
+      prefix <- if (type == "GO") paste0("GO_", ont) else "KEGG"
+      stem <- .make_stem(prefix, set_label, dir, padj_cutoff, lfc_min, has_lfc)
       rds_path <- file.path(out_dir, paste0(stem, ".rds"))
-      n_sig_genes <- NA_integer_
 
-      # CACHING: Prüfen ob RDS existiert
-      if (file.exists(rds_path) && !force_recompute) {
-        message("Lade GO Cache: ", stem)
-        ego <- readRDS(rds_path)
-        tab <- tryCatch(as.data.frame(ego), error = function(e) NULL)
+      # Cache check
+      if (file.exists(rds_path) && !force) {
+        enrich_obj <- readRDS(rds_path)
+        tab <- tryCatch(as.data.frame(enrich_obj), error = function(e) NULL)
+        n_sig <- NA_integer_
       } else {
-        message("Berechne GO: ", stem)
-        lists <- .build_go_lists(
-          res_obj = res_obj,
-          padj_cutoff = padj_cutoff,
-          direction = dir,
-          lfc_min = lfc_min
-        )
-        n_sig_genes <- length(lists$sig)
+        sig_tb <- .filter_sig(res_tb, padj_cutoff, dir, lfc_min)
+        sig_ens <- unique(sig_tb$ensembl_id)
+        sig <- if (type == "KEGG") .map_to_entrez(sig_ens) else sig_ens
+        n_sig <- length(sig)
 
-        ego <- .run_enrichGO(lists$sig, lists$universe, ont = ont)
-
-        # save
-        if (!is.null(ego)) {
-          tab <- as.data.frame(ego)
-          write.csv(tab, file.path(out_dir, paste0(stem, ".csv")), row.names = FALSE)
-          saveRDS(ego, rds_path)
-        } else {
-          tab <- NULL
+        enrich_obj <- if (length(sig) < 5) NULL else {
+          if (type == "GO") {
+            clusterProfiler::enrichGO(gene = sig, universe = universe, OrgDb = org.Hs.eg.db,
+                                      keyType = "ENSEMBL", ont = ont, pAdjustMethod = "BH",
+                                      qvalueCutoff = 0.05, readable = TRUE)
+          } else {
+            suppressMessages(clusterProfiler::enrichKEGG(gene = sig, universe = universe,
+                                      organism = organism, pAdjustMethod = "BH",
+                                      pvalueCutoff = 0.05, qvalueCutoff = 0.05))
+          }
         }
+
+        if (!is.null(enrich_obj)) {
+          tab <- as.data.frame(enrich_obj)
+          write.csv(tab, file.path(out_dir, paste0(stem, ".csv")), row.names = FALSE)
+          saveRDS(enrich_obj, rds_path)
+        } else tab <- NULL
       }
 
-      # Summary erstellen
-      if (!is.null(ego) && !is.null(tab) && nrow(tab) > 0) {
-        n_terms <- nrow(tab)
-        top_term <- tab$Description[1]
-        top_padj <- tab$p.adjust[1]
-      } else {
-        n_terms <- 0L
-        top_term <- NA_character_
-        top_padj <- NA_real_
-      }
-
-      summary_rows[[length(summary_rows) + 1]] <- tibble::tibble(
-        set = set_label,
-        ontology = ont,
-        direction = dir,
-        padj_cutoff = padj_cutoff,
+      summary_rows[[idx]] <- tibble::tibble(
+        set = set_label, ontology = if (type == "GO") ont else NA_character_,
+        direction = dir, padj_cutoff = padj_cutoff,
         lfc_min = if (has_lfc) lfc_min else NA_real_,
-        n_sig_genes = n_sig_genes,
-        n_terms = n_terms,
-        top_term = top_term,
-        top_term_padj = top_padj
+        n_sig = n_sig %||% NA_integer_,
+        n_terms = if (!is.null(tab) && nrow(tab) > 0) nrow(tab) else 0L,
+        top_term = if (!is.null(tab) && nrow(tab) > 0) tab$Description[1] else NA_character_,
+        top_padj = if (!is.null(tab) && nrow(tab) > 0) tab$p.adjust[1] else NA_real_
       )
     }
   }
 
   summary_tbl <- dplyr::bind_rows(summary_rows)
-
-  write.csv(
-    summary_tbl,
-    file.path(out_dir, paste0(
-      "GO_ORA_summary_", set_label,
-      "_padj", format(padj_cutoff, nsmall = 2),
-      if (has_lfc) paste0("_lfc", format(lfc_min, nsmall = 2)) else "",
-      ".csv"
-    )),
-    row.names = FALSE
-  )
-
+  write.csv(summary_tbl, file.path(out_dir, paste0(type, "_ORA_summary_", set_label,
+            "_padj", fmt2(padj_cutoff), if (has_lfc) paste0("_lfc", fmt2(lfc_min)) else "", ".csv")),
+            row.names = FALSE)
   summary_tbl
 }
 
-# -----------------------------
-# KEGG ORA (ENTREZ) with lfc_min
-# -----------------------------
-.map_ens_to_entrez <- function(ens_vec) {
-  ens_vec <- unique(ens_vec[!is.na(ens_vec)])
-  if (length(ens_vec) == 0) return(tibble::tibble(ENSEMBL = character(), ENTREZID = character()))
+# --- Wrapper ---
+run_go_ora  <- function(res, label, ...) .run_ora_set(res, label, padj_cutoff, lfc_min, go_out_dir, "GO", c("BP","MF","CC"), ...)
+run_kegg_ora <- function(res, label, ...) .run_ora_set(res, label, padj_cutoff, lfc_min, kegg_out_dir, "KEGG", "KEGG", organism = kegg_organism, ...)
 
-  suppressMessages(
-    clusterProfiler::bitr(
-      ens_vec,
-      fromType = "ENSEMBL",
-      toType   = "ENTREZID",
-      OrgDb    = org.Hs.eg.db
-    )
-  ) |>
-    tibble::as_tibble()
-}
+# --- Execute ---
+contrasts <- list(
+  list(res = res_V1_vs_A_tb,  label = "Wald_V1_vs_A"),
+  list(res = res_V2_vs_A_tb,  label = "Wald_V2_vs_A"),
+  list(res = res_V2_vs_V1_tb, label = "Wald_V2_vs_V1")
+)
 
-.build_kegg_lists <- function(res_obj, padj_cutoff = 0.05, direction = "all", lfc_min = 0) {
-  res_tb <- .ensure_tbl_results(res_obj) |>
-    dplyr::filter(!is.na(padj)) |>
-    dplyr::mutate(ensembl_id = strip_ensembl_version(gene))
+go_results   <- purrr::map_dfr(contrasts, ~run_go_ora(.x$res, .x$label))
+kegg_results <- purrr::map_dfr(contrasts, ~run_kegg_ora(.x$res, .x$label))
 
-  # Universe ENSEMBL -> ENTREZ
-  universe_ens <- unique(res_tb$ensembl_id)
-  map_univ <- .map_ens_to_entrez(universe_ens)
-  universe_entrez <- unique(map_univ$ENTREZID)
-
-  # Sig genes with lfc_min
-  sig_tb <- .filter_sig_with_lfc(
-    res_tb = res_tb,
-    padj_cutoff = padj_cutoff,
-    direction = direction,
-    lfc_min = lfc_min
-  )
-
-  sig_ens <- unique(sig_tb$ensembl_id)
-  map_sig <- .map_ens_to_entrez(sig_ens)
-  sig_entrez <- unique(map_sig$ENTREZID)
-
-  list(universe = universe_entrez, sig = sig_entrez, has_lfc = "log2FoldChange" %in% names(res_tb))
-}
-
-.run_enrichKEGG <- function(sig_entrez, universe_entrez, organism = "hsa",
-                            p_adjust_method = "BH",
-                            pvalue_cutoff = 0.05,
-                            qvalue_cutoff = 0.05) {
-  if (length(sig_entrez) < 5) return(NULL)
-
-  suppressMessages(
-    clusterProfiler::enrichKEGG(
-      gene          = sig_entrez,
-      universe      = universe_entrez,
-      organism      = organism,
-      pAdjustMethod = p_adjust_method,
-      pvalueCutoff  = pvalue_cutoff,
-      qvalueCutoff  = qvalue_cutoff
-    )
-  )
-}
-
-run_kegg_ora_set_lfc <- function(res_obj,
-                                 set_label,
-                                 padj_cutoff = 0.05,
-                                 lfc_min = 0,
-                                 directions = c("all", "up", "down"),
-                                 out_dir = kegg_out_dir,
-                                 organism = kegg_organism,
-                                 force_recompute = FALSE) {
-  res_tb <- .ensure_tbl_results(res_obj)
-  has_lfc <- "log2FoldChange" %in% names(res_tb)
-
-  # LRT: nur "all"
-  if (!has_lfc) directions <- intersect(directions, "all")
-
-  summary_rows <- list()
-
-  for (dir in directions) {
-    stem <- paste0(
-      "KEGG_", set_label, "_", dir,
-      "_padj", format(padj_cutoff, nsmall = 2),
-      if (has_lfc) paste0("_lfc", format(lfc_min, nsmall = 2)) else ""
-    )
-
-    rds_path <- file.path(out_dir, paste0(stem, ".rds"))
-    n_sig_genes_entrez <- NA_integer_
-
-    # CACHING: Prüfen ob RDS existiert
-    if (file.exists(rds_path) && !force_recompute) {
-      message("Lade KEGG Cache: ", stem)
-      ek <- readRDS(rds_path)
-      tab <- tryCatch(as.data.frame(ek), error = function(e) NULL)
-    } else {
-      message("Berechne KEGG: ", stem)
-      lists <- .build_kegg_lists(
-        res_obj = res_obj,
-        padj_cutoff = padj_cutoff,
-        direction = dir,
-        lfc_min = lfc_min
-      )
-      n_sig_genes_entrez <- length(lists$sig)
-
-      ek <- .run_enrichKEGG(lists$sig, lists$universe, organism = organism)
-
-      if (!is.null(ek)) {
-        tab <- as.data.frame(ek)
-        write.csv(tab, file.path(out_dir, paste0(stem, ".csv")), row.names = FALSE)
-        saveRDS(ek, rds_path)
-      } else {
-        tab <- NULL
-      }
-    }
-
-    # Summary erstellen
-    if (!is.null(ek) && !is.null(tab) && nrow(tab) > 0) {
-      n_terms <- nrow(tab)
-      top_path <- tab$Description[1]
-      top_padj <- tab$p.adjust[1]
-    } else {
-      n_terms <- 0L
-      top_path <- NA_character_
-      top_padj <- NA_real_
-    }
-
-    summary_rows[[length(summary_rows) + 1]] <- tibble::tibble(
-      set = set_label,
-      direction = dir,
-      padj_cutoff = padj_cutoff,
-      lfc_min = if (has_lfc) lfc_min else NA_real_,
-      n_sig_genes_entrez = n_sig_genes_entrez,
-      n_terms = n_terms,
-      top_pathway = top_path,
-      top_padj = top_padj
-    )
-  }
-
-  summary_tbl <- dplyr::bind_rows(summary_rows)
-
-  write.csv(
-    summary_tbl,
-    file.path(out_dir, paste0(
-      "KEGG_ORA_summary_", set_label,
-      "_padj", format(padj_cutoff, nsmall = 2),
-      if (has_lfc) paste0("_lfc", format(lfc_min, nsmall = 2)) else "",
-      ".csv"
-    )),
-    row.names = FALSE
-  )
-
-  summary_tbl
-}
-
-# ============================================================
-# RUN EXAMPLE: lfc_min = 0.5 (empfohlen)
-# ============================================================
-
-lfc_min <- lfc_min_default  # z.B. 0, 0.5, 1
-
-# --- GO ---
-go_v1_a  <- run_go_ora_set_lfc(res_V1_vs_A_tb,  "Wald_V1_vs_A",  padj_cutoff, lfc_min)
-go_v2_a  <- run_go_ora_set_lfc(res_V2_vs_A_tb,  "Wald_V2_vs_A",  padj_cutoff, lfc_min)
-go_v2_v1 <- run_go_ora_set_lfc(res_V2_vs_V1_tb, "Wald_V2_vs_V1", padj_cutoff, lfc_min)
-
+# LRT (kein LFC-Filter)
 lrt_input <- if (exists("res_lrt_tb")) res_lrt_tb else res_lrt
-go_lrt <- run_go_ora_set_lfc(lrt_input, "LRT_timepoint", padj_cutoff, lfc_min = 0, directions = "all")
+go_lrt   <- .run_ora_set(lrt_input, "LRT_timepoint", padj_cutoff, 0, go_out_dir, "GO", c("BP","MF","CC"), "all")
+kegg_lrt <- .run_ora_set(lrt_input, "LRT_timepoint", padj_cutoff, 0, kegg_out_dir, "KEGG", "KEGG", "all", kegg_organism)
 
-go_all <- dplyr::bind_rows(go_v1_a, go_v2_a, go_v2_v1, go_lrt)
-write.csv(
-  go_all,
-  file.path(go_out_dir, paste0("GO_ORA_summary_ALL_padj", format(padj_cutoff, nsmall = 2),
-                               "_lfc", format(lfc_min, nsmall = 2), ".csv")),
-  row.names = FALSE
-)
+go_all   <- dplyr::bind_rows(go_results, go_lrt)
+kegg_all <- dplyr::bind_rows(kegg_results, kegg_lrt)
 
-# --- KEGG ---
-kegg_v1_a  <- run_kegg_ora_set_lfc(res_V1_vs_A_tb,  "Wald_V1_vs_A",  padj_cutoff, lfc_min)
-kegg_v2_a  <- run_kegg_ora_set_lfc(res_V2_vs_A_tb,  "Wald_V2_vs_A",  padj_cutoff, lfc_min)
-kegg_v2_v1 <- run_kegg_ora_set_lfc(res_V2_vs_V1_tb, "Wald_V2_vs_V1", padj_cutoff, lfc_min)
-
-kegg_lrt <- run_kegg_ora_set_lfc(lrt_input, "LRT_timepoint", padj_cutoff, lfc_min = 0, directions = "all")
-
-kegg_all <- dplyr::bind_rows(kegg_v1_a, kegg_v2_a, kegg_v2_v1, kegg_lrt)
-write.csv(
-  kegg_all,
-  file.path(kegg_out_dir, paste0("KEGG_ORA_summary_ALL_padj", format(padj_cutoff, nsmall = 2),
-                                 "_lfc", format(lfc_min, nsmall = 2), ".csv")),
-  row.names = FALSE
-)
+write.csv(go_all, file.path(go_out_dir, paste0("GO_ORA_summary_ALL_padj", fmt2(padj_cutoff), "_lfc", fmt2(lfc_min), ".csv")), row.names = FALSE)
+write.csv(kegg_all, file.path(kegg_out_dir, paste0("KEGG_ORA_summary_ALL_padj", fmt2(padj_cutoff), "_lfc", fmt2(lfc_min), ".csv")), row.names = FALSE)
 
 go_all
 kegg_all
+```
 
+## GSEA Analyse (Gene Set Enrichment Analysis)
+
+Threshold-freie Validierung der ORA-Ergebnisse. GSEA nutzt das vollständige Ranking aller Gene (Wald-Statistik), um koordinierte Pathway-Änderungen zu detektieren - ohne arbiträre Signifikanz-Cutoffs.
+
+```{r}
+#| label: gsea-go
+#| echo: false
+#| warning: false
+#| fig-width: 11
+#| fig-height: 7
+
+# =============================================================================
+# SETTINGS
+# =============================================================================
+gsea_out_dir <- "../../res/functional/gsea_go"
+dir.create(gsea_out_dir, recursive = TRUE, showWarnings = FALSE)
+
+gsea_pval   <- 0.05
+gsea_minGS  <- 15
+gsea_maxGS  <- 500
+gsea_ont    <- "BP"    # Biological Process (konsistent mit ORA)
+n_plot      <- 20      # Top-Pathways für Visualisierung
+
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+
+#' Erstellt ranked gene list aus DESeq2-Ergebnissen
+#' @param res DESeqResults oder tibble mit gene/stat Spalten
+#' @return Named numeric vector (ensembl_id → stat), absteigend sortiert
+make_ranked_list <- function(res) {
+  tb <- if (inherits(res, "DESeqResults")) {
+    as.data.frame(res) |> tibble::rownames_to_column("gene") |> tibble::as_tibble()
+  } else res
+
+  tb |>
+    dplyr::filter(!is.na(stat)) |>
+    dplyr::mutate(ens = sub("\\..*$", "", gene)) |>
+    dplyr::select(ens, stat) |>
+    dplyr::arrange(desc(stat)) |>
+    tibble::deframe()
+}
+
+#' Führt gseGO mit Caching aus
+#' @param ranked Named vector aus make_ranked_list()
+#' @param label Kontrast-Name für Dateinamen
+#' @return gseaResult oder NULL
+run_gsea <- function(ranked, label) {
+  rds <- file.path(gsea_out_dir, paste0("GSEA_GO_", gsea_ont, "_", label, ".rds"))
+
+  if (file.exists(rds)) {
+    message("↻ Cache: ", label)
+    return(readRDS(rds))
+  }
+
+  message("⏳ GSEA: ", label, " (", length(ranked), " Gene)")
+
+  res <- tryCatch(
+    clusterProfiler::gseGO(
+      geneList     = ranked,
+      OrgDb        = org.Hs.eg.db,
+      keyType      = "ENSEMBL",
+      ont          = gsea_ont,
+      minGSSize    = gsea_minGS,
+      maxGSSize    = gsea_maxGS,
+      pvalueCutoff = gsea_pval,
+      pAdjustMethod = "BH",
+      verbose      = FALSE
+    ),
+    error = function(e) { message("  ⚠ ", e$message); NULL }
+  )
+
+  if (!is.null(res) && nrow(as.data.frame(res)) > 0) {
+    saveRDS(res, rds)
+    write.csv(as.data.frame(res), sub("\\.rds$", ".csv", rds), row.names = FALSE)
+    message("  ✓ ", nrow(as.data.frame(res)), " Pathways (padj < ", gsea_pval, ")")
+  } else {
+    message("  ○ Keine signifikanten Pathways")
+  }
+  res
+}
+
+#' GSEA Barplot mit NES-Richtung
+#' @param gsea gseaResult Objekt
+#' @param title Plot-Titel
+gsea_barplot <- function(gsea, title) {
+  if (is.null(gsea) || nrow(as.data.frame(gsea)) == 0) {
+    return(ggplot() +
+      annotate("text", x = .5, y = .5, label = "No significant pathways") +
+      theme_void() + ggtitle(title))
+  }
+
+  as.data.frame(gsea) |>
+    dplyr::arrange(p.adjust) |>
+    dplyr::slice_head(n = n_plot) |>
+    dplyr::mutate(
+      Direction = factor(ifelse(NES > 0, "Activated", "Suppressed"),
+                         levels = c("Activated", "Suppressed")),
+      Description = stringr::str_wrap(Description, 45),
+      Description = forcats::fct_reorder(Description, NES)
+    ) |>
+    ggplot(aes(NES, Description, fill = Direction)) +
+    geom_col(alpha = 0.85, width = 0.7) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey30") +
+    scale_fill_manual(values = c(Activated = "#c62828", Suppressed = "#1565c0")) +
+    labs(x = "Normalized Enrichment Score (NES)", y = NULL, title = title,
+         subtitle = paste0("GO ", gsea_ont, " | padj < ", gsea_pval)) +
+    theme_minimal(base_size = 10) +
+    theme(legend.position = "bottom", panel.grid.major.y = element_blank())
+}
+
+# =============================================================================
+# ANALYSE: Alle Wald-Kontraste
+# =============================================================================
+
+# Input: Wald-Results aus deseq2-wald-tests Chunk
+gsea_contrasts <- list(
+  V1_vs_A  = res_V1_vs_A,
+  V2_vs_A  = res_V2_vs_A,
+  V2_vs_V1 = res_V2_vs_V1
+)
+
+# Ranked lists erstellen und GSEA ausführen
+gsea_results <- purrr::imap(gsea_contrasts, \(res, name) {
+  ranked <- make_ranked_list(res)
+  run_gsea(ranked, name)
+})
+
+# =============================================================================
+# SUMMARY TABLE
+# =============================================================================
+gsea_summary <- purrr::imap_dfr(gsea_results, \(res, name) {
+  df <- if (!is.null(res)) as.data.frame(res) else data.frame(NES = numeric())
+  tibble::tibble(
+    contrast   = gsub("_", " ", name),
+    n_total    = nrow(df),
+    n_activated = sum(df$NES > 0, na.rm = TRUE),
+    n_suppressed = sum(df$NES < 0, na.rm = TRUE),
+    top_activated = if (any(df$NES > 0)) df$Description[which.max(df$NES)] else NA_character_,
+    top_suppressed = if (any(df$NES < 0)) df$Description[which.min(df$NES)] else NA_character_
+  )
+})
+
+gsea_summary |> dplyr::select(contrast, n_total, n_activated, n_suppressed)
+
+write.csv(gsea_summary, file.path(gsea_out_dir, "GSEA_GO_BP_summary.csv"), row.names = FALSE)
+
+# =============================================================================
+# VISUALISIERUNG
+# =============================================================================
+gsea_plots_dir <- file.path(gsea_out_dir, "plots")
+dir.create(gsea_plots_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Barplots für alle Kontraste
+purrr::iwalk(gsea_results, \(res, name) {
+  p <- gsea_barplot(res, paste0("GSEA: ", gsub("_", " ", name)))
+  print(p)
+  ggsave(file.path(gsea_plots_dir, paste0("GSEA_GO_BP_", name, "_barplot.png")),
+         p, width = 10, height = 7, dpi = 200)
+})
+
+# Running enrichment plot für Top-Pathway (nur wenn Ergebnisse vorhanden)
+purrr::iwalk(gsea_results, \(res, name) {
+  if (!is.null(res) && nrow(as.data.frame(res)) > 0) {
+    p_run <- enrichplot::gseaplot2(res, geneSetID = 1,
+                                    title = paste0(gsub("_", " ", name), ": Top Pathway"))
+    print(p_run)
+    ggsave(file.path(gsea_plots_dir, paste0("GSEA_GO_BP_", name, "_running.png")),
+           p_run, width = 8, height = 5, dpi = 200)
+  }
+})
+
+message("GSEA abgeschlossen. Output: ", gsea_out_dir)
 ```
 
 ## GO + KEGG Plots
 
-Erstellt Visualisierungen (Dotplots, Emapplots, Cnetplots) aus gecachten ORA-Ergebnissen. Lädt RDS-Dateien und erzeugt publikationsreife Plots in `../../res/functional/*/plots/`.
+Erstellt Visualisierungen (Dotplots, Emapplots, Cnetplots) aus gecachten ORA-Ergebnissen.
 
 ```{r}
 #| label: go-kegg-plots
 #| echo: false
 #| warning: false
-# -----------------------------
-# Defaults falls nicht gesetzt
-# -----------------------------
-if (!exists("padj_cutoff")) padj_cutoff <- 0.05
-if (!exists("lfc_min")) lfc_min <- 0.5   # WICHTIG: auf denselben Wert wie beim ORA-Lauf setzen!
-if (!exists("go_out_dir")) go_out_dir <- "../../res/functional/ora_go"
-if (!exists("kegg_out_dir")) kegg_out_dir <- "../../res/functional/ora_kegg"
 
-go_plots_dir <- file.path(go_out_dir, "plots")
+# --- Settings (nutzt Variablen aus go-kegg-ora) ---
+go_plots_dir   <- file.path(go_out_dir, "plots")
 kegg_plots_dir <- file.path(kegg_out_dir, "plots")
 dir.create(go_plots_dir, recursive = TRUE, showWarnings = FALSE)
 dir.create(kegg_plots_dir, recursive = TRUE, showWarnings = FALSE)
 
-# Plot-Defaults (anpassen)
-show_dot  <- 30
-show_emap <- 30
-show_cnet <- 5
+show_dot <- 30; show_emap <- 30; show_cnet <- 5
+go_ontologies <- c("BP")
 
-# GO Ontologies (meist BP im Main, MF/CC optional)
-go_ontologies <- c("BP")  # z.B. c("BP","MF","CC")
-
-# -----------------------------
-# Helpers
-# -----------------------------
-strip_ensembl_version <- function(x) sub("\\..*$", "", x)
-
-.ensure_tbl_results <- function(x) {
-  if (inherits(x, "DESeqResults")) {
-    x |>
-      as.data.frame() |>
-      tibble::rownames_to_column(var = "gene") |>
-      tibble::as_tibble()
-  } else {
-    tibble::as_tibble(x)
-  }
+# --- Helpers ---
+.load_enrich <- function(path) {
+  if (!file.exists(path)) return(NULL)
+ obj <- readRDS(path)
+  if (nrow(tryCatch(as.data.frame(obj), error = \(e) data.frame())) == 0) return(NULL)
+ obj
 }
 
-# FoldChange Vektor für GO (names=ENSEMBL ohne Version)
-.make_fc_go <- function(res_obj, padj_cutoff, direction, lfc_min = 0) {
-  res_tb <- .ensure_tbl_results(res_obj) |>
-    dplyr::filter(!is.na(padj)) |>
-    dplyr::mutate(ensembl_id = strip_ensembl_version(gene))
-
-  if (!"log2FoldChange" %in% names(res_tb)) return(NULL)
-
-  sig <- res_tb |>
-    dplyr::filter(padj < padj_cutoff)
-
-  if (direction == "all") {
-    sig <- sig |> dplyr::filter(abs(log2FoldChange) >= lfc_min)
-  } else if (direction == "up") {
-    sig <- sig |> dplyr::filter(log2FoldChange >= lfc_min)
-  } else if (direction == "down") {
-    sig <- sig |> dplyr::filter(log2FoldChange <= -lfc_min)
-  }
-
-  fc <- sig$log2FoldChange
-  names(fc) <- sig$ensembl_id
-  fc <- fc[!duplicated(names(fc))]
-  fc
-}
-
-# FoldChange Vektor für KEGG (names=ENTREZID)
-.make_fc_kegg <- function(res_obj, padj_cutoff, direction, lfc_min = 0) {
-  res_tb <- .ensure_tbl_results(res_obj) |>
-    dplyr::filter(!is.na(padj)) |>
-    dplyr::mutate(ensembl_id = strip_ensembl_version(gene))
-
-  if (!"log2FoldChange" %in% names(res_tb)) return(NULL)
-
-  sig <- res_tb |>
-    dplyr::filter(padj < padj_cutoff)
-
-  if (direction == "all") {
-    sig <- sig |> dplyr::filter(abs(log2FoldChange) >= lfc_min)
-  } else if (direction == "up") {
-    sig <- sig |> dplyr::filter(log2FoldChange >= lfc_min)
-  } else if (direction == "down") {
-    sig <- sig |> dplyr::filter(log2FoldChange <= -lfc_min)
-  }
-
-  # Map ENS -> ENTREZ (für cnetplot bei KEGG)
-  map_sig <- suppressMessages(
-    clusterProfiler::bitr(
-      unique(sig$ensembl_id),
-      fromType = "ENSEMBL",
-      toType   = "ENTREZID",
-      OrgDb    = org.Hs.eg.db
-    )
-  )
-
-  sig2 <- sig |>
-    dplyr::left_join(map_sig, by = c("ensembl_id" = "ENSEMBL")) |>
-    dplyr::filter(!is.na(ENTREZID))
-
-  fc <- sig2$log2FoldChange
-  names(fc) <- sig2$ENTREZID
-  fc <- fc[!duplicated(names(fc))]
-  fc
-}
-
-# RDS loader (Enrichment Objekt)
-.load_rds_enrich <- function(rds_path) {
-  if (!file.exists(rds_path)) return(NULL)
-  obj <- readRDS(rds_path)
-  tab <- tryCatch(as.data.frame(obj), error = function(e) NULL)
-  if (is.null(tab) || nrow(tab) == 0) return(NULL)
-  obj
-}
-
-# pairwise_termsim cache
-.get_termsim_cached <- function(enrich_obj, cache_path) {
-  if (file.exists(cache_path)) {
-    return(readRDS(cache_path))
-  }
-  ts <- tryCatch(enrichplot::pairwise_termsim(enrich_obj), error = function(e) NULL)
+.get_termsim <- function(obj, cache_path) {
+  if (file.exists(cache_path)) return(readRDS(cache_path))
+  ts <- tryCatch(enrichplot::pairwise_termsim(obj), error = \(e) NULL)
   if (!is.null(ts)) saveRDS(ts, cache_path)
   ts
 }
 
-# dotplot helper (lesbar, dynamische Höhe)
-.make_dotplot <- function(enrich_obj, title, show_dot = 30) {
-  tab <- as.data.frame(enrich_obj)
-  show_dot_local <- min(show_dot, nrow(tab))
-  height <- max(7, min(18, 0.28 * show_dot_local))
+.is_emap_safe <- function(x, min_terms = 3) {
+  if (is.null(x)) return(FALSE)
+  df <- tryCatch(as.data.frame(x), error = \(e) NULL)
+  if (is.null(df) || nrow(df) < min_terms) return(FALSE)
+  ts <- tryCatch(as.matrix(x@termsim), error = \(e) NULL)
+  if (is.null(ts) || nrow(ts) < min_terms) return(FALSE)
+  diag(ts) <- NA
+  any(is.finite(ts) & ts > 0, na.rm = TRUE)
+}
 
+.make_fc <- function(res_obj, dir, lfc_min, to_entrez = FALSE) {
+  if (is.null(res_obj)) return(NULL)
+  res_tb <- .prep_results(res_obj)
+  if (!"log2FoldChange" %in% names(res_tb)) return(NULL)
+
+  sig <- .filter_sig(res_tb, padj_cutoff, dir, lfc_min)
+  if (nrow(sig) == 0) return(NULL)
+
+  if (to_entrez) {
+    map <- suppressMessages(clusterProfiler::bitr(unique(sig$ensembl_id), "ENSEMBL", "ENTREZID", org.Hs.eg.db))
+    sig <- dplyr::inner_join(sig, map, by = c("ensembl_id" = "ENSEMBL"))
+    fc <- setNames(sig$log2FoldChange, sig$ENTREZID)
+  } else {
+    fc <- setNames(sig$log2FoldChange, sig$ensembl_id)
+  }
+  fc[!duplicated(names(fc))]
+}
+
+.make_dotplot <- function(obj, title) {
+  n <- min(show_dot, nrow(as.data.frame(obj)))
   p <- suppressWarnings(
-    enrichplot::dotplot(enrich_obj, showCategory = show_dot_local) +
+    enrichplot::dotplot(obj, showCategory = n) +
       ggplot2::ggtitle(title) +
       ggplot2::scale_y_discrete(labels = \(x) stringr::str_wrap(x, width = 38)) +
-      ggplot2::theme_bw() +
-      ggplot2::theme(axis.text.y = ggplot2::element_text(size = 9))
+      ggplot2::theme_bw(base_size = 10)
   )
-
-  list(plot = p, height = height)
+  list(plot = p, height = max(7, min(18, 0.28 * n)))
 }
 
-# safe ggsave
-.save_plot <- function(p, filename, width = 11, height = 7, dpi = 200) {
-  ggplot2::ggsave(filename = filename, plot = p, width = width, height = height, dpi = dpi)
+.save_plot <- function(p, path, w = 11, h = 7) {
+  ggplot2::ggsave(path, p, width = w, height = h, dpi = 200)
 }
 
-# -----------------------------
-# GO Plot Runner (RDS-first)
-# -----------------------------
-plot_go_from_rds <- function(set_label,
-                             res_obj_for_fc = NULL,
-                             directions = c("all", "up", "down"),
-                             ontologies = c("BP"),
-                             out_dir = go_out_dir,
-                             plots_dir = go_plots_dir,
-                             padj_cutoff = 0.05,
-                             lfc_min = 0) {
-  has_lfc <- !is.null(res_obj_for_fc) && ("log2FoldChange" %in% names(.ensure_tbl_results(res_obj_for_fc)))
-  if (!has_lfc) directions <- intersect(directions, "all")
+# --- Generische Plot-Engine ---
+.plot_ora <- function(set_label, res_obj, type = c("GO", "KEGG"), ontologies = "BP",
+                      directions = c("all", "up", "down")) {
+  type <- match.arg(type)
+  out_dir <- if (type == "GO") go_out_dir else kegg_out_dir
+  plots_dir <- if (type == "GO") go_plots_dir else kegg_plots_dir
+
+  has_lfc <- !is.null(res_obj) && "log2FoldChange" %in% names(.prep_results(res_obj))
+  if (!has_lfc) directions <- "all"
+  if (type == "KEGG") ontologies <- "KEGG"
 
   for (ont in ontologies) {
     for (dir in directions) {
-      stem <- paste0(
-        "GO_", ont, "_", set_label, "_", dir,
-        "_padj", format(padj_cutoff, nsmall = 2),
-        if (has_lfc) paste0("_lfc", format(lfc_min, nsmall = 2)) else ""
-      )
-      rds_path <- file.path(out_dir, paste0(stem, ".rds"))
-      ego <- .load_rds_enrich(rds_path)
-      if (is.null(ego)) {
-        message("GO skip (kein RDS/0 Terms): ", stem)
-        next
-      }
+      prefix <- if (type == "GO") paste0("GO_", ont) else "KEGG"
+      stem <- .make_stem(prefix, set_label, dir, padj_cutoff, lfc_min, has_lfc)
 
-      # 1) dotplot
-      dp <- .make_dotplot(ego, title = paste0(stem, " – dotplot"), show_dot = show_dot)
-      .save_plot(dp$plot, file.path(plots_dir, paste0(stem, "_dotplot.png")),
-                 width = 11, height = dp$height)
+      obj <- .load_enrich(file.path(out_dir, paste0(stem, ".rds")))
+      if (is.null(obj)) { message("Skip (no data): ", stem); next }
 
-      # 2) emapplot (cached termsim)
-      ts_path <- file.path(out_dir, paste0(stem, "_termsim.rds"))
-      ego_ts <- .get_termsim_cached(ego, ts_path)
-      if (!is.null(ego_ts)) {
+      # Dotplot
+      dp <- .make_dotplot(obj, paste0(stem, " - dotplot"))
+      .save_plot(dp$plot, file.path(plots_dir, paste0(stem, "_dotplot.png")), h = dp$height)
+
+      # Termsim + Emapplot
+      obj_ts <- .get_termsim(obj, file.path(out_dir, paste0(stem, "_termsim.rds")))
+      if (.is_emap_safe(obj_ts)) {
         p_emap <- tryCatch(
-          enrichplot::emapplot(ego_ts, showCategory = show_emap) +
-            ggplot2::ggtitle(paste0(stem, " – emapplot")) +
-            ggplot2::theme_void(),
-          error = function(e) NULL
+          enrichplot::emapplot(obj_ts, showCategory = show_emap, layout = "nicely") +
+            ggplot2::ggtitle(paste0(stem, " - emapplot")) + ggplot2::theme_void(),
+          error = \(e) NULL
         )
-        if (!is.null(p_emap)) {
-          .save_plot(p_emap, file.path(plots_dir, paste0(stem, "_emapplot.png")),
-                     width = 12, height = 9)
-        }
+        if (!is.null(p_emap)) .save_plot(p_emap, file.path(plots_dir, paste0(stem, "_emapplot.png")), 12, 9)
       }
 
-      # 3) cnetplot (nur Wald; foldChange)
-      if (has_lfc) {
-        fc <- .make_fc_go(res_obj_for_fc, padj_cutoff = padj_cutoff, direction = dir, lfc_min = lfc_min)
-        if (!is.null(fc) && length(fc) >= 5 && !is.null(ego_ts)) {
+      # Cnetplot (nur bei Wald mit FC)
+      if (has_lfc && !is.null(obj_ts)) {
+        fc <- .make_fc(res_obj, dir, lfc_min, to_entrez = (type == "KEGG"))
+        if (!is.null(fc) && length(fc) >= 5) {
           p_cnet <- tryCatch(
-            enrichplot::cnetplot(
-              ego_ts,
-              showCategory = show_cnet,
-              foldChange = fc,
-              node_label = "category"
-            ) +
-              ggplot2::ggtitle(paste0(stem, " – cnetplot")) +
-              ggplot2::theme_void(),
-            error = function(e) NULL
+            enrichplot::cnetplot(obj_ts, showCategory = show_cnet, foldChange = fc, node_label = "category") +
+              ggplot2::ggtitle(paste0(stem, " - cnetplot")) + ggplot2::theme_void(),
+            error = \(e) NULL
           )
-          if (!is.null(p_cnet)) {
-            .save_plot(p_cnet, file.path(plots_dir, paste0(stem, "_cnetplot.png")),
-                       width = 13, height = 9)
-          }
-        } else {
-          message("GO cnet skip (kein FC/termsim): ", stem)
+          if (!is.null(p_cnet)) .save_plot(p_cnet, file.path(plots_dir, paste0(stem, "_cnetplot.png")), 13, 9)
         }
       }
     }
   }
-
   invisible(TRUE)
 }
 
-# -----------------------------
-# KEGG Plot Runner (RDS-first)
-# -----------------------------
-plot_kegg_from_rds <- function(set_label,
-                               res_obj_for_fc = NULL,
-                               directions = c("all", "up", "down"),
-                               out_dir = kegg_out_dir,
-                               plots_dir = kegg_plots_dir,
-                               padj_cutoff = 0.05,
-                               lfc_min = 0) {
-  has_lfc <- !is.null(res_obj_for_fc) && ("log2FoldChange" %in% names(.ensure_tbl_results(res_obj_for_fc)))
-  if (!has_lfc) directions <- intersect(directions, "all")
+# --- Execute ---
+contrasts <- list(
+  list(label = "Wald_V1_vs_A",  res = res_V1_vs_A_tb),
+  list(label = "Wald_V2_vs_A",  res = res_V2_vs_A_tb),
+  list(label = "Wald_V2_vs_V1", res = res_V2_vs_V1_tb)
+)
 
-  for (dir in directions) {
-    stem <- paste0(
-      "KEGG_", set_label, "_", dir,
-      "_padj", format(padj_cutoff, nsmall = 2),
-      if (has_lfc) paste0("_lfc", format(lfc_min, nsmall = 2)) else ""
-    )
-    rds_path <- file.path(out_dir, paste0(stem, ".rds"))
-    ek <- .load_rds_enrich(rds_path)
-    if (is.null(ek)) {
-      message("KEGG skip (kein RDS/0 Terms): ", stem)
-      next
-    }
+purrr::walk(contrasts, \(x) .plot_ora(x$label, x$res, "GO", go_ontologies))
+purrr::walk(contrasts, \(x) .plot_ora(x$label, x$res, "KEGG"))
 
-    # 1) dotplot
-    dp <- .make_dotplot(ek, title = paste0(stem, " – dotplot"), show_dot = show_dot)
-    .save_plot(dp$plot, file.path(plots_dir, paste0(stem, "_dotplot.png")),
-               width = 11, height = dp$height)
-
-# --- helper: check if emapplot is safe ---------------------------------
-.is_emap_safe <- function(x, min_terms = 3) {
-  if (is.null(x)) return(FALSE)
-
-  df <- tryCatch(as.data.frame(x), error = function(e) NULL)
-  if (is.null(df) || nrow(df) < min_terms) return(FALSE)
-
-  # pairwise_termsim() stores similarity in @termsim for enrichResult objects
-  ts <- tryCatch(x@termsim, error = function(e) NULL)
-  if (is.null(ts)) return(FALSE)
-
-  # needs at least some finite similarity off-diagonal to make edges
-  ts2 <- as.matrix(ts)
-  if (nrow(ts2) < min_terms || ncol(ts2) < min_terms) return(FALSE)
-
-  # remove diagonal, check for any finite > 0 similarities
-  diag(ts2) <- NA_real_
-  ok <- any(is.finite(ts2) & ts2 > 0, na.rm = TRUE)
-  ok
-}
-
-# 2) emapplot (cached termsim) – ROBUST
-ts_path <- file.path(out_dir, paste0(stem, "_termsim.rds"))
-ek_ts <- .get_termsim_cached(ek, ts_path)
-
-if (.is_emap_safe(ek_ts, min_terms = 3)) {
-  p_emap <- tryCatch(
-    enrichplot::emapplot(
-      ek_ts,
-      showCategory = min(show_emap, nrow(as.data.frame(ek_ts))),
-      layout = "nicely"
-    ) +
-      ggplot2::ggtitle(paste0(stem, " – emapplot")) +
-      ggplot2::theme_void(),
-    error = function(e) {
-      message("Skip KEGG emapplot (", stem, "): ", conditionMessage(e))
-      NULL
-    }
-  )
-
-  if (!is.null(p_emap)) {
-    .save_plot(
-      p_emap,
-      file.path(plots_dir, paste0(stem, "_emapplot.png")),
-      width = 12,
-      height = 9
-    )
-  }
-} else {
-  message("Skip KEGG emapplot (zu wenige/keine Kanten): ", stem)
-}
-
-
-    # 3) cnetplot (nur Wald; foldChange)
-    if (has_lfc) {
-      fc <- .make_fc_kegg(res_obj_for_fc, padj_cutoff = padj_cutoff, direction = dir, lfc_min = lfc_min)
-      if (!is.null(fc) && length(fc) >= 5 && !is.null(ek_ts)) {
-        p_cnet <- tryCatch(
-          enrichplot::cnetplot(
-            ek_ts,
-            showCategory = show_cnet,
-            foldChange = fc,
-            node_label = "category"
-          ) +
-            ggplot2::ggtitle(paste0(stem, " – cnetplot")) +
-            ggplot2::theme_void(),
-          error = function(e) NULL
-        )
-        if (!is.null(p_cnet)) {
-          .save_plot(p_cnet, file.path(plots_dir, paste0(stem, "_cnetplot.png")),
-                     width = 13, height = 9)
-        }
-      } else {
-        message("KEGG cnet skip (kein FC/termsim): ", stem)
-      }
-    }
-  }
-
-  invisible(TRUE)
-}
-
-# ============================================================
-# RUN: alle Kontraste (GO + KEGG) aus RDS plotten
-# ============================================================
-
-# Wald
-plot_go_from_rds("Wald_V1_vs_A",  res_obj_for_fc = res_V1_vs_A_tb,
-                 directions = c("all","up","down"), ontologies = go_ontologies,
-                 padj_cutoff = padj_cutoff, lfc_min = lfc_min)
-
-plot_go_from_rds("Wald_V2_vs_A",  res_obj_for_fc = res_V2_vs_A_tb,
-                 directions = c("all","up","down"), ontologies = go_ontologies,
-                 padj_cutoff = padj_cutoff, lfc_min = lfc_min)
-
-plot_go_from_rds("Wald_V2_vs_V1", res_obj_for_fc = res_V2_vs_V1_tb,
-                 directions = c("all","up","down"), ontologies = go_ontologies,
-                 padj_cutoff = padj_cutoff, lfc_min = lfc_min)
-
-# LRT (nur all; kein FC)
+# LRT (kein FC)
 lrt_input <- if (exists("res_lrt_tb")) res_lrt_tb else res_lrt
-plot_go_from_rds("LRT_timepoint", res_obj_for_fc = NULL,
-                 directions = c("all"), ontologies = go_ontologies,
-                 padj_cutoff = padj_cutoff, lfc_min = 0)
+.plot_ora("LRT_timepoint", NULL, "GO", go_ontologies, "all")
+.plot_ora("LRT_timepoint", NULL, "KEGG", directions = "all")
 
-# KEGG
-plot_kegg_from_rds("Wald_V1_vs_A",  res_obj_for_fc = res_V1_vs_A_tb,
-                   directions = c("all","up","down"),
-                   padj_cutoff = padj_cutoff, lfc_min = lfc_min)
-
-plot_kegg_from_rds("Wald_V2_vs_A",  res_obj_for_fc = res_V2_vs_A_tb,
-                   directions = c("all","up","down"),
-                   padj_cutoff = padj_cutoff, lfc_min = lfc_min)
-
-plot_kegg_from_rds("Wald_V2_vs_V1", res_obj_for_fc = res_V2_vs_V1_tb,
-                   directions = c("all","up","down"),
-                   padj_cutoff = padj_cutoff, lfc_min = lfc_min)
-
-plot_kegg_from_rds("LRT_timepoint", res_obj_for_fc = NULL,
-                   directions = c("all"),
-                   padj_cutoff = padj_cutoff, lfc_min = 0)
-
-message("Fertig. GO Plots:   ", normalizePath(go_plots_dir))
-message("Fertig. KEGG Plots: ", normalizePath(kegg_plots_dir))
-
+message("GO Plots:   ", go_plots_dir)
+message("KEGG Plots: ", kegg_plots_dir)
 ```
 
-## Publikationsreife Multi-Panel Figure
+## TAVI Story Figure
 
-Erstellt eine kombinierte Figure mit GO-Dotplots, KEGG-Dotplots und Pathway-Heatmap für V1 vs A und V2 vs V1. Einheitliche Farbskalen und optimiertes Layout für Publikationen.
-
-```{r}
-#| label: fig-publication-go-kegg
-#| echo: false
-#| warning: false
-#| fig-width: 20
-#| fig-height: 14
-
-# -----------------------------
-# 0) Settings
-# -----------------------------
-padj_cutoff <- if (exists("padj_cutoff")) padj_cutoff else 0.05
-lfc_min     <- if (exists("lfc_min")) lfc_min else 0.5
-
-go_out_dir   <- if (exists("go_out_dir")) go_out_dir else "../../res/functional/ora_go"
-kegg_out_dir <- if (exists("kegg_out_dir")) kegg_out_dir else "../../res/functional/ora_kegg"
-
-fig_out_dir  <- "../../res/figures"
-dir.create(fig_out_dir, recursive = TRUE, showWarnings = FALSE)
-
-# Plot-Parameter
-n_category    <- 8        # Anzahl GO/KEGG Terms pro Panel
-padj_limits   <- c(1e-12, 0.05)  # Einheitliche Farbskala
-dot_size_range <- c(2, 8)        # Punktgrößen
-term_wrap_width <- 35            # Zeilenumbruch für Term-Labels
-
-# Titel
-title_main    <- "TAVI-associated immune trajectory (A → V1 → V2)"
-subtitle_main <- paste0("GO/KEGG ORA (padj < ", padj_cutoff, ", |log2FC| ≥ ", lfc_min, ")")
-
-# -----------------------------
-# 1) Helper-Funktionen
-# -----------------------------
-fmt2 <- function(x) format(x, nsmall = 2)
-
-stem_go <- function(ont, set_label, dir, padj_cutoff, lfc_min) {
-
-  paste0("GO_", ont, "_", set_label, "_", dir, "_padj", fmt2(padj_cutoff), "_lfc", fmt2(lfc_min))
-}
-
-stem_kegg <- function(set_label, dir, padj_cutoff, lfc_min) {
-  paste0("KEGG_", set_label, "_", dir, "_padj", fmt2(padj_cutoff), "_lfc", fmt2(lfc_min))
-}
-
-safe_read_rds <- function(path) {
-  if (!file.exists(path)) return(NULL)
-  obj <- tryCatch(readRDS(path), error = function(e) NULL)
-  df  <- tryCatch(as.data.frame(obj), error = function(e) NULL)
-  if (is.null(df) || nrow(df) == 0) return(NULL)
-  obj
-}
-
-# Verbesserter Dotplot mit einheitlicher Skala und besserem Wrapping
-pub_dotplot <- function(enrich_obj, title, n_cat = n_category,
-                        padj_lim = padj_limits, wrap_width = term_wrap_width) {
-
-  # Fallback für leere/fehlende Daten
-
-  if (is.null(enrich_obj)) {
-    return(
-      ggplot() +
-        annotate("text", x = 0.5, y = 0.5, label = "No enriched terms",
-                 size = 4, color = "grey50") +
-        theme_void() +
-        ggtitle(title) +
-        theme(plot.title = element_text(size = 11, face = "bold", hjust = 0.5))
-    )
-  }
-
-  df <- as.data.frame(enrich_obj)
-  if (nrow(df) == 0) {
-    return(
-      ggplot() +
-        annotate("text", x = 0.5, y = 0.5, label = "No enriched terms",
-                 size = 4, color = "grey50") +
-        theme_void() +
-        ggtitle(title) +
-        theme(plot.title = element_text(size = 11, face = "bold", hjust = 0.5))
-    )
-  }
-
-  # Top n_cat Terms
-
-  df_top <- df %>%
-    slice_head(n = n_cat) %>%
-    mutate(
-      Description = str_wrap(Description, width = wrap_width),
-      Description = factor(Description, levels = rev(Description)),
-      GeneRatio_num = sapply(strsplit(GeneRatio, "/"), function(x) as.numeric(x[1]) / as.numeric(x[2]))
-    )
-
-  ggplot(df_top, aes(x = GeneRatio_num, y = Description)) +
-    geom_point(aes(size = Count, color = p.adjust)) +
-    scale_color_gradient(
-      low = "#d73027", high = "#4575b4",
-      trans = "log10",
-      limits = padj_lim,
-      oob = scales::squish,
-      name = "p.adjust"
-    ) +
-    scale_size_continuous(range = dot_size_range, name = "Count") +
-    labs(x = "Gene Ratio", y = NULL, title = title) +
-    theme_bw(base_size = 10) +
-    theme(
-      plot.title = element_text(size = 11, face = "bold"),
-      axis.text.y = element_text(size = 9),
-      axis.text.x = element_text(size = 8),
-      legend.position = "right",
-      legend.key.size = unit(0.4, "cm"),
-      legend.title = element_text(size = 8),
-      legend.text = element_text(size = 7),
-      panel.grid.minor = element_blank()
-    )
-}
-
-# Gene aus ORA-Ergebnissen extrahieren
-get_top_genes_from_enrich <- function(enrich_obj, n_terms = 3) {
-  if (is.null(enrich_obj)) return(list(genes = character(), terms = character()))
-  df <- tryCatch(as.data.frame(enrich_obj), error = function(e) NULL)
-  if (is.null(df) || nrow(df) == 0) return(list(genes = character(), terms = character()))
-
-  df_top <- df %>% slice_head(n = min(n_terms, nrow(df)))
-
-  genes <- unlist(strsplit(df_top$geneID, "/", fixed = TRUE), use.names = FALSE)
-  genes <- unique(genes[!is.na(genes) & genes != ""])
-  terms <- df_top$Description
-
-  list(genes = genes, terms = terms)
-}
-
-# -----------------------------
-# 2) ORA RDS laden - EINHEITLICHE Vergleiche: V1 vs A + V2 vs V1
-# -----------------------------
-# GO BP
-go_v1a_up    <- safe_read_rds(file.path(go_out_dir, paste0(stem_go("BP", "Wald_V1_vs_A", "up", padj_cutoff, lfc_min), ".rds")))
-go_v1a_down  <- safe_read_rds(file.path(go_out_dir, paste0(stem_go("BP", "Wald_V1_vs_A", "down", padj_cutoff, lfc_min), ".rds")))
-go_v2v1_up   <- safe_read_rds(file.path(go_out_dir, paste0(stem_go("BP", "Wald_V2_vs_V1", "up", padj_cutoff, lfc_min), ".rds")))
-go_v2v1_down <- safe_read_rds(file.path(go_out_dir, paste0(stem_go("BP", "Wald_V2_vs_V1", "down", padj_cutoff, lfc_min), ".rds")))
-
-# KEGG - GLEICHE Vergleiche wie GO
-kegg_v1a_up    <- safe_read_rds(file.path(kegg_out_dir, paste0(stem_kegg("Wald_V1_vs_A", "up", padj_cutoff, lfc_min), ".rds")))
-kegg_v1a_down  <- safe_read_rds(file.path(kegg_out_dir, paste0(stem_kegg("Wald_V1_vs_A", "down", padj_cutoff, lfc_min), ".rds")))
-kegg_v2v1_up   <- safe_read_rds(file.path(kegg_out_dir, paste0(stem_kegg("Wald_V2_vs_V1", "up", padj_cutoff, lfc_min), ".rds")))
-kegg_v2v1_down <- safe_read_rds(file.path(kegg_out_dir, paste0(stem_kegg("Wald_V2_vs_V1", "down", padj_cutoff, lfc_min), ".rds")))
-
-# -----------------------------
-# 3) Dotplots erstellen
-# -----------------------------
-p_go_v1a_up    <- pub_dotplot(go_v1a_up,    "GO BP: V1 vs A (UP)")
-p_go_v1a_down  <- pub_dotplot(go_v1a_down,  "GO BP: V1 vs A (DOWN)")
-p_go_v2v1_up   <- pub_dotplot(go_v2v1_up,   "GO BP: V2 vs V1 (UP)")
-p_go_v2v1_down <- pub_dotplot(go_v2v1_down, "GO BP: V2 vs V1 (DOWN)")
-
-p_kegg_v1a_up    <- pub_dotplot(kegg_v1a_up,    "KEGG: V1 vs A (UP)")
-p_kegg_v1a_down  <- pub_dotplot(kegg_v1a_down,  "KEGG: V1 vs A (DOWN)")
-p_kegg_v2v1_up   <- pub_dotplot(kegg_v2v1_up,   "KEGG: V2 vs V1 (UP)")
-p_kegg_v2v1_down <- pub_dotplot(kegg_v2v1_down, "KEGG: V2 vs V1 (DOWN)")
-
-# -----------------------------
-# 4) Heatmap mit Pathway-Annotation
-# -----------------------------
-heat_panel <- NULL
-
-if (!exists("trans") || !exists("meta")) {
-  warning("Heatmap: 'trans' oder 'meta' nicht gefunden.")
-} else {
-  trans_mat <- SummarizedExperiment::assay(trans)
-
-  # Rownames der Matrix: ENSEMBL IDs (ggf. mit Version)
-  # Wir strippen die Version für konsistentes Matching
-  trans_rownames_clean <- sub("\\..*$", "", rownames(trans_mat))
-
-  # Gene aus verschiedenen ORA-Quellen mit Pathway-Zuordnung
-  # Mehr Terms extrahieren für robustere Genauswahl
-  genes_go_v1a_up    <- get_top_genes_from_enrich(go_v1a_up, n_terms = 3)
-  genes_go_v1a_down  <- get_top_genes_from_enrich(go_v1a_down, n_terms = 3)
-  genes_go_v2v1_up   <- get_top_genes_from_enrich(go_v2v1_up, n_terms = 3)
-  genes_go_v2v1_down <- get_top_genes_from_enrich(go_v2v1_down, n_terms = 3)
-  genes_kegg_v1a_up  <- get_top_genes_from_enrich(kegg_v1a_up, n_terms = 2)
-  genes_kegg_v1a_down<- get_top_genes_from_enrich(kegg_v1a_down, n_terms = 2)
-  genes_kegg_v2v1_up <- get_top_genes_from_enrich(kegg_v2v1_up, n_terms = 2)
-  genes_kegg_v2v1_down <- get_top_genes_from_enrich(kegg_v2v1_down, n_terms = 2)
-
-  # Pathway-Annotation aufbauen
-  pathway_anno <- dplyr::bind_rows(
-    tibble(gene = genes_go_v1a_up$genes, pathway = "GO: V1/A UP"),
-    tibble(gene = genes_go_v1a_down$genes, pathway = "GO: V1/A DOWN"),
-    tibble(gene = genes_go_v2v1_up$genes, pathway = "GO: V2/V1 UP"),
-    tibble(gene = genes_go_v2v1_down$genes, pathway = "GO: V2/V1 DOWN"),
-    tibble(gene = genes_kegg_v1a_up$genes, pathway = "KEGG: V1/A UP"),
-    tibble(gene = genes_kegg_v1a_down$genes, pathway = "KEGG: V1/A DOWN"),
-    tibble(gene = genes_kegg_v2v1_up$genes, pathway = "KEGG: V2/V1 UP"),
-    tibble(gene = genes_kegg_v2v1_down$genes, pathway = "KEGG: V2/V1 DOWN")
-  ) %>%
-    dplyr::filter(gene != "") %>%
-    dplyr::distinct(gene, .keep_all = TRUE)
-
-  genes_raw <- unique(pathway_anno$gene)
-  message("Heatmap: ", length(genes_raw), " unique genes from ORA")
-
-  # Alle Gene als SYMBOL behandeln (readable=TRUE in enrichGO) und zu ENSEMBL mappen
-  sym_to_ens_map <- NULL
-  if (length(genes_raw) > 0) {
-    sym_to_ens_map <- suppressMessages(AnnotationDbi::select(
-      org.Hs.eg.db,
-      keys = unique(genes_raw),
-      columns = c("ENSEMBL"),
-      keytype = "SYMBOL"
-    )) %>%
-      dplyr::filter(!is.na(ENSEMBL)) %>%
-      dplyr::distinct(SYMBOL, .keep_all = TRUE)
-
-    message("Heatmap: ", nrow(sym_to_ens_map), " genes mapped to ENSEMBL")
-  }
-
-  # Finde welche gemappten ENSEMBL IDs in der Matrix vorkommen
-  if (!is.null(sym_to_ens_map) && nrow(sym_to_ens_map) > 0) {
-    # Match gegen clean rownames (ohne Version)
-    genes_in_matrix <- sym_to_ens_map %>%
-      dplyr::filter(ENSEMBL %in% trans_rownames_clean)
-
-    message("Heatmap: ", nrow(genes_in_matrix), " genes found in expression matrix")
-
-    if (nrow(genes_in_matrix) >= 5) {
-      # Finde die originalen Rownames (mit Version) für diese Gene
-      idx_match <- match(genes_in_matrix$ENSEMBL, trans_rownames_clean)
-      genes_present <- rownames(trans_mat)[idx_match]
-
-      # Sample-Sortierung: A -> V1 -> V2
-      meta2 <- meta
-      meta2$timepoint <- factor(as.character(meta2$timepoint), levels = c("A", "V1", "V2"))
-      ord <- order(meta2$timepoint, meta2$pid)
-
-      trans_mat_ord <- trans_mat[, ord, drop = FALSE]
-
-      # Spalten-Annotation
-      anno_col <- data.frame(
-        timepoint = meta2$timepoint[ord],
-        row.names = colnames(trans_mat_ord)
-      )
-
-      # Zeilen-Annotation (Pathway) - über SYMBOL joinen
-      anno_row_df <- genes_in_matrix %>%
-        dplyr::left_join(pathway_anno, by = c("SYMBOL" = "gene")) %>%
-        dplyr::mutate(pathway = ifelse(is.na(pathway), "Other", pathway))
-
-      anno_row <- data.frame(
-        Pathway = anno_row_df$pathway,
-        row.names = genes_present
-      )
-
-      # Matrix subset
-      mat_sub <- trans_mat_ord[genes_present, , drop = FALSE]
-
-      # Rownames auf SYMBOL ändern (besser lesbar)
-      rownames(mat_sub) <- genes_in_matrix$SYMBOL
-      rownames(anno_row) <- genes_in_matrix$SYMBOL
-
-      # Farben für Pathways
-      all_pathways <- unique(anno_row$Pathway)
-      pathway_colors <- c(
-        "GO: V1/A UP" = "#e41a1c",
-        "GO: V1/A DOWN" = "#377eb8",
-        "GO: V2/V1 UP" = "#ff7f00",
-        "GO: V2/V1 DOWN" = "#984ea3",
-        "KEGG: V1/A UP" = "#4daf4a",
-        "KEGG: V1/A DOWN" = "#f781bf",
-        "KEGG: V2/V1 UP" = "#a65628",
-        "KEGG: V2/V1 DOWN" = "#999999",
-        "Other" = "grey70"
-      )
-
-      timepoint_colors <- c("A" = "#66c2a5", "V1" = "#fc8d62", "V2" = "#8da0cb")
-
-      anno_colors <- list(
-        timepoint = timepoint_colors,
-        Pathway = pathway_colors[all_pathways]
-      )
-
-      # pheatmap erstellen
-      ph <- pheatmap::pheatmap(
-        mat_sub,
-        scale = "row",
-        annotation_col = anno_col,
-        annotation_row = anno_row,
-        annotation_colors = anno_colors,
-        cluster_cols = FALSE,
-        cluster_rows = TRUE,
-        show_colnames = FALSE,
-        fontsize_row = 7,
-        fontsize = 9,
-        color = colorRampPalette(c("#4575b4", "white", "#d73027"))(100),
-        border_color = NA,
-        main = paste0("Top ORA genes (n=", nrow(mat_sub), ", row-scaled VST)"),
-        silent = TRUE
-      )
-
-      heat_panel <- patchwork::wrap_elements(grid::grid.grabExpr(print(ph)))
-      message("Heatmap: Successfully created with ", nrow(mat_sub), " genes")
-    } else {
-      warning("Heatmap: Only ", nrow(genes_in_matrix), " genes found in matrix (need >= 5)")
-    }
-  } else {
-    warning("Heatmap: No genes could be mapped to ENSEMBL")
-  }
-}
-
-# Fallback Heatmap
-if (is.null(heat_panel)) {
-  heat_panel <- ggplot() +
-    annotate("text", x = 0.5, y = 0.5, label = "Heatmap\n(insufficient data)",
-             size = 5, color = "grey50") +
-    theme_void() +
-    ggtitle("Gene Expression Heatmap") +
-    theme(plot.title = element_text(size = 11, face = "bold", hjust = 0.5))
-}
-
-# -----------------------------
-# 5) Layout zusammenbauen
-# -----------------------------
-# GO Block (2x2)
-go_row1 <- p_go_v1a_up + p_go_v1a_down
-go_row2 <- p_go_v2v1_up + p_go_v2v1_down
-
-# KEGG Block (2x2)
-kegg_row1 <- p_kegg_v1a_up + p_kegg_v1a_down
-kegg_row2 <- p_kegg_v2v1_up + p_kegg_v2v1_down
-
-# Linke Spalte: GO (2 Zeilen) + KEGG (2 Zeilen) = 4 Zeilen
-left_col <- (go_row1 / go_row2 / kegg_row1 / kegg_row2) +
-  ggplot2::plot_layout(heights = c(1, 1, 1, 1), guides = "collect") &
-  theme(legend.position = "right")
-
-# Gesamtfigur: Links (4 Zeilen Dotplots) | Rechts (Heatmap)
-fig <- (left_col | heat_panel) +
-  plot_layout(widths = c(2.5, 1)) +
-  plot_annotation(
-    title = title_main,
-    subtitle = subtitle_main,
-    tag_levels = "A",
-    theme = theme(
-      plot.title = element_text(size = 16, face = "bold"),
-      plot.subtitle = element_text(size = 11, color = "grey30"),
-      plot.tag = element_text(size = 14, face = "bold")
-    )
-  )
-
-print(fig)
-
-# -----------------------------
-# 6) Export
-# -----------------------------
-out_stem <- paste0("FIG_TAVI_GO_KEGG_HEAT_padj", fmt2(padj_cutoff), "_lfc", fmt2(lfc_min), "_pub")
-out_base <- file.path(fig_out_dir, out_stem)
-
-ggsave(paste0(out_base, "_v2.pdf"), fig, width = 20, height = 14, device = cairo_pdf)
-ggsave(paste0(out_base, "_v2.png"), fig, width = 20, height = 14, dpi = 300)
-
-message("Saved: ", out_base, "_v2.pdf / _v2.png")
-
-```
+Narrative Figure: Biphasische Immunantwort nach TAVI (Timeline + GO-Dotplots + Heatmap).
 
 ```{r}
 #| label: fig-tavi-story
+#| echo: false
+#| warning: false
 #| fig-width: 18
 #| fig-height: 16
-# ============================================================
-# STORY FIGURE: TAVI Immune Trajectory
-#
-# Die biologische Story:
-#   Phase 1 (V1 vs A): Akute Entzündung ↑, Adaptive Immunität ↓
-#   Phase 2 (V2 vs V1): Entzündung ↓, Immunität erholt sich ↑
-#   Phase 3 (V2 vs A): Weitgehend normalisiert
-#
-# Layout:
-#   A) Timeline-Schematic
-#   B) V1 vs A UP - Akute Entzündung
-#   C) V1 vs A DOWN - Adaptive Immunität supprimiert
-#   D) V2 vs V1 DOWN - Entzündung löst sich auf
-#   E) V2 vs V1 UP - Immunität erholt sich
-#   F) Heatmap - Schlüsselgene über alle Zeitpunkte
-# ============================================================
 
-# -----------------------------
-# 0) Settings
-# -----------------------------
-padj_cutoff <- 0.05
-lfc_min <- 0.5
-
-go_out_dir <- "../../res/functional/ora_go"
+# --- Settings (nutzt Variablen aus go-kegg-ora falls vorhanden) ---
 fig_out_dir <- "../../res/figures"
 dir.create(fig_out_dir, recursive = TRUE, showWarnings = FALSE)
 
-fmt2 <- function(x) format(x, nsmall = 2)
+# Farben für biologische Phasen
+col_inflam   <- "#d73027"
+col_immun    <- "#4575b4"
+col_resolve  <- "#1a9850"
+col_recovery <- "#ff7f00"
 
-# -----------------------------
-# 1) Timeline Schematic Panel
-# -----------------------------
-create_timeline <- function() {
-  # Daten für Timeline
-  timeline_df <- data.frame(
-    x = c(1, 2, 3),
-    y = c(0, 0, 0),
-    label = c("A\n(Baseline)", "V1\n(Post-TAVI)", "V2\n(3 Monate)"),
-    phase = c("Baseline", "Acute", "Recovery")
-  )
+# --- Timeline Panel ---
+timeline_panel <- ggplot() +
+ geom_segment(aes(x = 0.5, xend = 3.5, y = 0, yend = 0), linewidth = 1.5, color = "grey40") +
+ geom_point(aes(x = 1:3, y = 0), size = 12, color = c("#66c2a5", "#fc8d62", "#8da0cb")) +
+  geom_text(aes(x = 1:3, y = -0.25,
+            label = c("A\n(Baseline)", "V1\n(Post-TAVI)", "V2\n(3 Monate)")),
+            size = 4, fontface = "bold") +
+  geom_segment(aes(x = c(1.15, 2.15), xend = c(1.85, 2.85), y = 0.12, yend = 0.12),
+               arrow = arrow(length = unit(0.3, "cm"), type = "closed"),
+               linewidth = 1.2, color = "grey50") +
+  geom_label(aes(x = c(1.5, 2.5), y = 0.4,
+                 label = c("Inflammation ↑\nAdaptive Immunity ↓", "Inflammation ↓\nImmunity Recovery ↑")),
+             fill = c("#fee0d2", "#d9f0d3"), size = 3.2, fontface = "italic") +
+  coord_cartesian(xlim = c(0.3, 3.7), ylim = c(-0.5, 0.7)) +
+  theme_void() +
+  labs(title = "TAVI Immune Trajectory: A → V1 → V2") +
+  theme(plot.title = element_text(size = 14, face = "bold", hjust = 0.5))
 
-
-  # Pfeile zwischen Zeitpunkten
-  arrows_df <- data.frame(
-    x = c(1.15, 2.15),
-    xend = c(1.85, 2.85),
-    y = c(0, 0),
-    yend = c(0, 0),
-    label = c("Akute Phase", "Erholungsphase")
-  )
-
-  # Biologische Annotationen
-  annot_df <- data.frame(
-    x = c(1.5, 2.5),
-    y = c(0.4, 0.4),
-    label = c("Inflammation ↑\nAdaptive Immunity ↓",
-              "Inflammation ↓\nImmunity Recovery ↑"),
-    color = c("#e41a1c", "#4daf4a")
-  )
-
-  ggplot() +
-    # Zeitlinie
-    geom_segment(aes(x = 0.5, xend = 3.5, y = 0, yend = 0),
-                 linewidth = 1.5, color = "grey40") +
-    # Zeitpunkte
-    geom_point(data = timeline_df, aes(x = x, y = y),
-               size = 12, color = c("#66c2a5", "#fc8d62", "#8da0cb")) +
-    geom_text(data = timeline_df, aes(x = x, y = y - 0.25, label = label),
-              size = 4, fontface = "bold") +
-    # Pfeile
-    geom_segment(data = arrows_df,
-                 aes(x = x, xend = xend, y = y + 0.12, yend = yend + 0.12),
-                 arrow = arrow(length = unit(0.3, "cm"), type = "closed"),
-                 linewidth = 1.2, color = "grey50") +
-    # Biologische Annotationen
-    geom_label(data = annot_df, aes(x = x, y = y, label = label),
-               fill = c("#fee0d2", "#d9f0d3"), color = "grey20",
-               size = 3.2, fontface = "italic", label.padding = unit(0.4, "lines")) +
-    # Styling
-    coord_cartesian(xlim = c(0.3, 3.7), ylim = c(-0.5, 0.7)) +
-    theme_void() +
-    labs(title = "TAVI Immune Trajectory: A → V1 → V2") +
-    theme(
-      plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
-      plot.margin = margin(10, 10, 10, 10)
-    )
-}
-
-timeline_panel <- create_timeline()
-
-# -----------------------------
-# 2) Helper: Dotplot aus RDS
-# -----------------------------
-stem_go <- function(set_label, dir) {
-  paste0("GO_BP_", set_label, "_", dir, "_padj", fmt2(padj_cutoff), "_lfc", fmt2(lfc_min))
-}
-
-safe_read_rds <- function(path) {
-  if (!file.exists(path)) return(NULL)
-  obj <- tryCatch(readRDS(path), error = function(e) NULL)
-  df <- tryCatch(as.data.frame(obj), error = function(e) NULL)
-  if (is.null(df) || nrow(df) == 0) return(NULL)
-  obj
-}
-
-# Einheitliche Farben für die Story
-color_inflammation <- "#d73027"  # Rot für Entzündung
-color_immunity_down <- "#4575b4" # Blau für Immunität runter
-color_resolution <- "#1a9850"    # Grün für Auflösung
-color_recovery <- "#ff7f00"      # Orange für Erholung
-
-story_dotplot <- function(enrich_obj, title, subtitle = NULL,
-                          accent_color = "grey30", n_cat = 8) {
-
-  if (is.null(enrich_obj)) {
-    return(
-      ggplot() +
-        annotate("text", x = 0.5, y = 0.5, label = "No enriched terms",
-                 size = 4, color = "grey50") +
-        theme_void() +
-        ggtitle(title) +
-        theme(plot.title = element_text(size = 11, face = "bold", hjust = 0.5))
-    )
+# --- Story Dotplot Helper ---
+story_dotplot <- function(obj, title, subtitle, accent_color, n_cat = 8) {
+  if (is.null(obj) || nrow(as.data.frame(obj)) == 0) {
+    return(ggplot() + annotate("text", x = .5, y = .5, label = "No enriched terms", size = 4, color = "grey50") +
+             theme_void() + ggtitle(title) + theme(plot.title = element_text(size = 11, face = "bold", hjust = 0.5)))
   }
+  df <- as.data.frame(obj) |>
+    dplyr::slice_head(n = n_cat) |>
+    dplyr::mutate(Description = stringr::str_wrap(Description, 40),
+                  Description = factor(Description, rev(Description)),
+                  GeneRatio_num = sapply(strsplit(GeneRatio, "/"), \(x) as.numeric(x[1])/as.numeric(x[2])))
 
-  df <- as.data.frame(enrich_obj)
-  if (nrow(df) == 0) {
-    return(
-      ggplot() +
-        annotate("text", x = 0.5, y = 0.5, label = "No enriched terms",
-                 size = 4, color = "grey50") +
-        theme_void() +
-        ggtitle(title) +
-        theme(plot.title = element_text(size = 11, face = "bold", hjust = 0.5))
-    )
-  }
-
-  df_top <- df %>%
-    dplyr::slice_head(n = n_cat) %>%
-    dplyr::mutate(
-      Description = str_wrap(Description, width = 40),
-      Description = factor(Description, levels = rev(Description)),
-      GeneRatio_num = sapply(strsplit(GeneRatio, "/"),
-                             function(x) as.numeric(x[1]) / as.numeric(x[2]))
-    )
-
-  p <- ggplot(df_top, aes(x = GeneRatio_num, y = Description)) +
-    geom_segment(aes(x = 0, xend = GeneRatio_num, y = Description, yend = Description),
-                 color = "grey80", linewidth = 0.5) +
+  ggplot(df, aes(GeneRatio_num, Description)) +
+    geom_segment(aes(x = 0, xend = GeneRatio_num, yend = Description), color = "grey80") +
     geom_point(aes(size = Count), color = accent_color, alpha = 0.8) +
-    scale_size_continuous(range = c(3, 10), name = "Gene\nCount") +
+    scale_size_continuous(range = c(3, 10), name = "Count") +
     labs(x = "Gene Ratio", y = NULL, title = title, subtitle = subtitle) +
     theme_minimal(base_size = 10) +
-    theme(
-      plot.title = element_text(size = 12, face = "bold", color = accent_color),
-      plot.subtitle = element_text(size = 9, color = "grey40", face = "italic"),
-      axis.text.y = element_text(size = 9),
-      axis.text.x = element_text(size = 8),
-      legend.position = "right",
-      legend.key.size = unit(0.4, "cm"),
-      panel.grid.major.y = element_blank(),
-      panel.grid.minor = element_blank()
-    )
-
-  p
+    theme(plot.title = element_text(size = 12, face = "bold", color = accent_color),
+          plot.subtitle = element_text(size = 9, color = "grey40", face = "italic"),
+          panel.grid.major.y = element_blank(), panel.grid.minor = element_blank())
 }
 
-# -----------------------------
-# 3) Lade die 4 Schlüssel-Vergleiche
-# -----------------------------
-# V1 vs A UP - Akute Entzündung
-go_v1a_up <- safe_read_rds(file.path(go_out_dir, paste0(stem_go("Wald_V1_vs_A", "up"), ".rds")))
+# --- Load GO results (nutzt .load_enrich aus go-kegg-plots) ---
+.stem_go <- function(label, dir) paste0("GO_BP_", label, "_", dir, "_padj", fmt2(padj_cutoff), "_lfc", fmt2(lfc_min))
 
-# V1 vs A DOWN - Adaptive Immunität supprimiert
-go_v1a_down <- safe_read_rds(file.path(go_out_dir, paste0(stem_go("Wald_V1_vs_A", "down"), ".rds")))
+go_v1a_up    <- .load_enrich(file.path(go_out_dir, paste0(.stem_go("Wald_V1_vs_A", "up"), ".rds")))
+go_v1a_down  <- .load_enrich(file.path(go_out_dir, paste0(.stem_go("Wald_V1_vs_A", "down"), ".rds")))
+go_v2v1_up   <- .load_enrich(file.path(go_out_dir, paste0(.stem_go("Wald_V2_vs_V1", "up"), ".rds")))
+go_v2v1_down <- .load_enrich(file.path(go_out_dir, paste0(.stem_go("Wald_V2_vs_V1", "down"), ".rds")))
 
-# V2 vs V1 DOWN - Entzündung löst sich auf
-go_v2v1_down <- safe_read_rds(file.path(go_out_dir, paste0(stem_go("Wald_V2_vs_V1", "down"), ".rds")))
+# --- Dotplots ---
+p_v1a_up    <- story_dotplot(go_v1a_up,    "V1 vs A: Upregulated",   "Acute inflammatory response", col_inflam)
+p_v1a_down  <- story_dotplot(go_v1a_down,  "V1 vs A: Downregulated", "Adaptive immunity suppressed", col_immun)
+p_v2v1_down <- story_dotplot(go_v2v1_down, "V2 vs V1: Downregulated","Inflammation resolving", col_resolve)
+p_v2v1_up   <- story_dotplot(go_v2v1_up,   "V2 vs V1: Upregulated",  "Immune recovery", col_recovery)
 
-# V2 vs V1 UP - Immunität erholt sich
-go_v2v1_up <- safe_read_rds(file.path(go_out_dir, paste0(stem_go("Wald_V2_vs_V1", "up"), ".rds")))
+# --- Heatmap ---
+heat_panel <- ggplot() + annotate("text", x=.5, y=.5, label="Heatmap\n(insufficient data)", size=5, color="grey50") + theme_void()
 
-# Dotplots erstellen
-p_v1a_up <- story_dotplot(go_v1a_up,
-                          title = "V1 vs A: Upregulated",
-                          subtitle = "Acute inflammatory response",
-                          accent_color = color_inflammation)
+if (exists("vst_data") && exists("meta")) {
+  trans_mat <- SummarizedExperiment::assay(vst_data)
+  trans_clean <- setNames(rownames(trans_mat), sub("\\..*$", "", rownames(trans_mat)))
 
-p_v1a_down <- story_dotplot(go_v1a_down,
-                            title = "V1 vs A: Downregulated",
-                            subtitle = "Adaptive immunity suppressed",
-                            accent_color = color_immunity_down)
-
-p_v2v1_down <- story_dotplot(go_v2v1_down,
-                             title = "V2 vs V1: Downregulated",
-                             subtitle = "Inflammation resolving",
-                             accent_color = color_resolution)
-
-p_v2v1_up <- story_dotplot(go_v2v1_up,
-                           title = "V2 vs V1: Upregulated",
-                           subtitle = "Immune recovery",
-                           accent_color = color_recovery)
-
-# -----------------------------
-# 4) Heatmap: Schlüsselgene über alle Zeitpunkte
-# -----------------------------
-heat_panel <- NULL
-
-if (exists("trans") && exists("meta")) {
-  trans_mat <- SummarizedExperiment::assay(trans)
-  trans_rownames_clean <- sub("\\..*$", "", rownames(trans_mat))
-
-  # Gene aus ORA-Ergebnissen extrahieren
-  get_genes <- function(enrich_obj, n_terms = 2) {
-    if (is.null(enrich_obj)) return(character())
-    df <- tryCatch(as.data.frame(enrich_obj), error = function(e) NULL)
+  .get_genes <- function(obj, n = 2) {
+    if (is.null(obj)) return(character())
+    df <- tryCatch(as.data.frame(obj), error = \(e) NULL)
     if (is.null(df) || nrow(df) == 0) return(character())
-    df_top <- df %>% dplyr::slice_head(n = min(n_terms, nrow(df)))
-    genes <- unlist(strsplit(df_top$geneID, "/", fixed = TRUE))
-    unique(genes[!is.na(genes) & genes != ""])
+    unique(unlist(strsplit(dplyr::slice_head(df, n = n)$geneID, "/"), use.names = FALSE))
   }
 
-  # Gene aus allen 4 Vergleichen
-  genes_inflam <- get_genes(go_v1a_up, 2)
-  genes_immun_down <- get_genes(go_v1a_down, 2)
-  genes_resolve <- get_genes(go_v2v1_down, 2)
-  genes_recovery <- get_genes(go_v2v1_up, 2)
-
-  # Pathway-Annotation
   pathway_anno <- dplyr::bind_rows(
-    tibble(gene = genes_inflam, pathway = "Inflammation (V1↑)"),
-    tibble(gene = genes_immun_down, pathway = "Immunity (V1↓)"),
-    tibble(gene = genes_resolve, pathway = "Resolution (V2↓)"),
-    tibble(gene = genes_recovery, pathway = "Recovery (V2↑)")
-  ) %>%
-    dplyr::filter(gene != "") %>%
-    dplyr::distinct(gene, .keep_all = TRUE)
+    tibble::tibble(gene = .get_genes(go_v1a_up),    pathway = "Inflammation (V1 UP)"),
+    tibble::tibble(gene = .get_genes(go_v1a_down),  pathway = "Immunity (V1 DOWN)"),
+    tibble::tibble(gene = .get_genes(go_v2v1_down), pathway = "Resolution (V2 DOWN)"),
+    tibble::tibble(gene = .get_genes(go_v2v1_up),   pathway = "Recovery (V2 UP)")
+  ) |> dplyr::filter(gene != "") |> dplyr::distinct(gene, .keep_all = TRUE)
 
-  genes_raw <- unique(pathway_anno$gene)
+  if (nrow(pathway_anno) > 0) {
+    sym_map <- suppressMessages(AnnotationDbi::select(
+      org.Hs.eg.db, unique(pathway_anno$gene), "ENSEMBL", "SYMBOL"
+    )) |> dplyr::filter(!is.na(ENSEMBL)) |> dplyr::distinct(SYMBOL, .keep_all = TRUE)
 
-  # SYMBOL -> ENSEMBL Mapping
-  if (length(genes_raw) > 0) {
-    sym_to_ens <- suppressMessages(AnnotationDbi::select(
-      org.Hs.eg.db,
-      keys = unique(genes_raw),
-      columns = c("ENSEMBL"),
-      keytype = "SYMBOL"
-    )) %>%
-      dplyr::filter(!is.na(ENSEMBL)) %>%
-      dplyr::distinct(SYMBOL, .keep_all = TRUE)
+    genes_in_mat <- sym_map |> dplyr::filter(ENSEMBL %in% names(trans_clean))
 
-    genes_in_matrix <- sym_to_ens %>%
-      dplyr::filter(ENSEMBL %in% trans_rownames_clean)
+    if (nrow(genes_in_mat) >= 10) {
+      idx <- match(genes_in_mat$ENSEMBL, names(trans_clean))
+      valid <- !is.na(idx)
+      idx <- idx[valid]
+      genes_in_mat <- genes_in_mat[valid, ]
 
-    if (nrow(genes_in_matrix) >= 10) {
-      idx_match <- match(genes_in_matrix$ENSEMBL, trans_rownames_clean)
-      genes_present <- rownames(trans_mat)[idx_match]
+      if (length(idx) >= 10 && all(idx <= nrow(trans_mat))) {
+        meta2 <- meta
+        meta2$timepoint <- factor(meta2$timepoint, c("A", "V1", "V2"))
+        ord <- order(meta2$timepoint, meta2$pid)
 
-      # Sample-Sortierung
-      meta2 <- meta
-      meta2$timepoint <- factor(as.character(meta2$timepoint), levels = c("A", "V1", "V2"))
-      ord <- order(meta2$timepoint, meta2$pid)
+        mat <- trans_mat[idx, ord, drop = FALSE]
+        rownames(mat) <- genes_in_mat$SYMBOL
 
-      trans_mat_ord <- trans_mat[, ord, drop = FALSE]
+        anno_col <- data.frame(Timepoint = meta2$timepoint[ord], row.names = colnames(mat))
+        anno_row <- genes_in_mat |>
+          dplyr::left_join(pathway_anno, by = c("SYMBOL" = "gene")) |>
+          dplyr::mutate(Phase = ifelse(is.na(pathway), "Other", pathway)) |>
+          dplyr::select(Phase) |> as.data.frame()
+        rownames(anno_row) <- genes_in_mat$SYMBOL
 
-      # Annotations
-      anno_col <- data.frame(
-        Timepoint = meta2$timepoint[ord],
-        row.names = colnames(trans_mat_ord)
-      )
+        phase_cols <- c("Inflammation (V1 UP)" = col_inflam, "Immunity (V1 DOWN)" = col_immun,
+                        "Resolution (V2 DOWN)" = col_resolve, "Recovery (V2 UP)" = col_recovery, "Other" = "grey70")
 
-      anno_row_df <- genes_in_matrix %>%
-        dplyr::left_join(pathway_anno, by = c("SYMBOL" = "gene")) %>%
-        dplyr::mutate(pathway = ifelse(is.na(pathway), "Other", pathway))
+        ph <- pheatmap::pheatmap(mat, scale = "row", annotation_col = anno_col, annotation_row = anno_row,
+          annotation_colors = list(Timepoint = c(A="#66c2a5", V1="#fc8d62", V2="#8da0cb"),
+                                   Phase = phase_cols[unique(anno_row$Phase)]),
+          cluster_cols = FALSE, show_colnames = FALSE, fontsize_row = 7, fontsize = 9,
+          color = colorRampPalette(c("#2166ac", "#f7f7f7", "#b2182b"))(100), border_color = NA,
+          main = paste0("Key genes (n=", nrow(mat), ")"), silent = TRUE)
 
-      anno_row <- data.frame(
-        Phase = anno_row_df$pathway,
-        row.names = genes_present
-      )
-
-      mat_sub <- trans_mat_ord[genes_present, , drop = FALSE]
-      rownames(mat_sub) <- genes_in_matrix$SYMBOL
-      rownames(anno_row) <- genes_in_matrix$SYMBOL
-
-      # Farben
-      phase_colors <- c(
-        "Inflammation (V1↑)" = color_inflammation,
-        "Immunity (V1↓)" = color_immunity_down,
-        "Resolution (V2↓)" = color_resolution,
-        "Recovery (V2↑)" = color_recovery,
-        "Other" = "grey70"
-      )
-
-      timepoint_colors <- c("A" = "#66c2a5", "V1" = "#fc8d62", "V2" = "#8da0cb")
-
-      anno_colors <- list(
-        Timepoint = timepoint_colors,
-        Phase = phase_colors[unique(anno_row$Phase)]
-      )
-
-      # Heatmap
-      ph <- pheatmap::pheatmap(
-        mat_sub,
-        scale = "row",
-        annotation_col = anno_col,
-        annotation_row = anno_row,
-        annotation_colors = anno_colors,
-        cluster_cols = FALSE,
-        cluster_rows = TRUE,
-        show_colnames = FALSE,
-        fontsize_row = 7,
-        fontsize = 9,
-        color = colorRampPalette(c("#2166ac", "#f7f7f7", "#b2182b"))(100),
-        border_color = NA,
-        main = paste0("Key genes across timepoints (n=", nrow(mat_sub), ")"),
-        silent = TRUE
-      )
-
-      heat_panel <- patchwork::wrap_elements(grid::grid.grabExpr(print(ph)))
+        heat_panel <- patchwork::wrap_elements(grid::grid.grabExpr(print(ph)))
+      }
     }
   }
 }
 
-# Fallback
-if (is.null(heat_panel)) {
-  heat_panel <- ggplot() +
-    annotate("text", x = 0.5, y = 0.5, label = "Heatmap\n(insufficient data)",
-             size = 5, color = "grey50") +
-    theme_void()
-}
+# --- Layout ---
+phase1_label <- ggplot() + annotate("text", x=.5, y=.5, label="PHASE 1: Acute Response", size=5, fontface="bold", color="grey30") + theme_void()
+phase2_label <- ggplot() + annotate("text", x=.5, y=.5, label="PHASE 2: Recovery (3 months)", size=5, fontface="bold", color="grey30") + theme_void()
 
-# -----------------------------
-# 5) Layout zusammenbauen
-# -----------------------------
-# Obere Reihe: Timeline
-# Mittlere Reihe: Phase 1 (V1 vs A)
-# Untere Reihe: Phase 2 (V2 vs V1)
-# Rechts: Heatmap
-
-# Phase 1 Block
-phase1_label <- ggplot() +
-
-  annotate("text", x = 0.5, y = 0.5,
-           label = "PHASE 1: Acute Response",
-           size = 5, fontface = "bold", color = "grey30") +
-  theme_void()
-
-phase1_block <- (p_v1a_up | p_v1a_down) +
-  patchwork::plot_layout(guides = "collect")
-
-# Phase 2 Block
-phase2_label <- ggplot() +
-  annotate("text", x = 0.5, y = 0.5,
-           label = "PHASE 2: Recovery (3 months)",
-           size = 5, fontface = "bold", color = "grey30") +
-  theme_void()
-
-phase2_block <- (p_v2v1_down | p_v2v1_up) +
-  patchwork::plot_layout(guides = "collect")
-
-# Linke Spalte
-left_col <- (timeline_panel / phase1_label / phase1_block / phase2_label / phase2_block) +
+left_col <- (timeline_panel / phase1_label / (p_v1a_up | p_v1a_down) / phase2_label / (p_v2v1_down | p_v2v1_up)) +
   patchwork::plot_layout(heights = c(1.2, 0.2, 2, 0.2, 2))
 
-# Gesamtfigur
 fig_story <- (left_col | heat_panel) +
   patchwork::plot_layout(widths = c(2.5, 1)) +
   patchwork::plot_annotation(
     title = "Transcriptomic Response to TAVI: Biphasic Immune Modulation",
-    subtitle = paste0("GO Biological Process enrichment (padj < ", padj_cutoff,
-                      ", |log2FC| ≥ ", lfc_min, ") | RNA-seq from peripheral blood"),
+    subtitle = paste0("GO BP enrichment (padj < ", padj_cutoff, ", |log2FC| >= ", lfc_min, ")"),
     tag_levels = "A",
-    theme = theme(
-      plot.title = element_text(size = 16, face = "bold"),
-      plot.subtitle = element_text(size = 11, color = "grey40"),
-      plot.tag = element_text(size = 14, face = "bold")
-    )
-  )
+    theme = theme(plot.title = element_text(size = 16, face = "bold"),
+                  plot.subtitle = element_text(size = 11, color = "grey40")))
 
 print(fig_story)
 
-# -----------------------------
-# 6) Export
+# --- Export ---
 # -----------------------------
 out_base <- file.path(fig_out_dir, "FIG_TAVI_immune_trajectory_story")
 
@@ -2476,299 +1580,5 @@ ggsave(paste0(out_base, ".pdf"), fig_story, width = 18, height = 16, device = ca
 ggsave(paste0(out_base, ".png"), fig_story, width = 18, height = 16, dpi = 300)
 
 message("Saved: ", out_base, ".pdf / .png")
-
-```
-
-## Transkriptomische Entzündungs-, Effektoren- und Ribosomen-Scores nach TAVI
-
-Dieser Codeblock berechnet **RNA-basierte Scores**, die zentrale immunologische und zelluläre Prozesse nach Transkatheter-Aortenklappenimplantation (TAVI) quantifizieren. Ziel ist es, die **Stärke und Dynamik der systemischen Entzündungsantwort** sowie der nachfolgenden **immunologischen Reprogrammierung** auf Patientenebene abzubilden.
-
-Basierend auf variance-stabilisierter Expression (VST) werden drei biologisch motivierte Signaturen definiert:\
-(1) ein **akuter inflammatorischer Score**, der die frühe angeborene Immunantwort (z. B. neutrophile Aktivierung und Zytokinproduktion) widerspiegelt,\
-(2) ein **immunologischer Effektorscore**, der zytotoxische T-/NK-Zell-Programme erfasst, sowie\
-(3) ein **ribosomaler Aktivitätsscore**, der globale Veränderungen der Proteinbiosynthese als Marker zellulären Stresses und funktioneller Reprogrammierung abbildet.
-
-Die Scores werden für jedes Sample berechnet, entlang der Zeitpunkte (A → V1 → V2) visualisiert und erlauben eine **quantitative Beschreibung interindividueller Unterschiede** in der inflammatorischen Antwort auf TAVI. Sie bilden damit die Grundlage für weiterführende Analysen, einschließlich Korrelationen mit klinischen Parametern und der Identifikation potenzieller Biomarker.
-
-```{r}
-# ============================================================
-# Trajectory-Scores aus ORA-Genen (row-scaled VST) + Plot
-#   - verwendet genes_present (ENSG) und trans (VST)
-#   - erzeugt pro Sample 3 Scores:
-#       * Acute inflammatory score
-#       * Immune effector score
-#       * Ribosomal activity score
-#   - sortiert A -> V1 -> V2
-# ============================================================
-
-suppressPackageStartupMessages({
-  library(dplyr)
-  library(tidyr)
-  library(ggplot2)
-})
-
-# -----------------------------
-# 0) Preconditions
-# -----------------------------
-stopifnot(exists("trans"), exists("meta"), exists("genes_present"))
-stopifnot(length(genes_present) >= 5)
-
-# trans: DESeq2::vst Objekt
-mat <- assay(trans)
-
-# Ensembl-Versionen entfernen (sicher)
-rownames(mat) <- sub("\\..*$", "", rownames(mat))
-
-# nur Gene, die wirklich da sind
-genes_present2 <- intersect(genes_present, rownames(mat))
-stopifnot(length(genes_present2) >= 5)
-
-# sicherstellen, dass meta zu mat passt
-stopifnot(all(colnames(mat) == rownames(meta)))
-
-meta2 <- meta
-
-# -----------------------------
-# 1) Row-scale (z-score pro Gen über Samples)
-# -----------------------------
-mat_sub <- mat[genes_present2, , drop = FALSE]
-
-# robuste Z-Transformation (keine NA durch SD=0)
-row_z <- function(x) {
-  s <- stats::sd(x)
-  if (is.na(s) || s == 0) return(rep(0, length(x)))
-  (x - mean(x)) / s
-}
-mat_z <- t(apply(mat_sub, 1, row_z))
-
-# ============================================================
-# Gene-Sets für Scores aus ORA-RDS rekonstruieren
-#  - Effector:     GO BP Wald_V2_vs_V1 UP (top Terms)
-#  - Ribosome:     KEGG Wald_V2_vs_V1 DOWN (top Terms)
-#  - Inflammation: KEGG Wald_V2_vs_A  UP (top Terms)
-# ============================================================
-
-suppressPackageStartupMessages({
-  library(dplyr)
-  library(tibble)
-  library(clusterProfiler)
-  library(org.Hs.eg.db)
-  library(AnnotationDbi)
-})
-
-# ---- Settings müssen zu deinem ORA-Run passen
-padj_cutoff <- if (exists("padj_cutoff")) padj_cutoff else 0.05
-lfc_min     <- if (exists("lfc_min")) lfc_min else 0.5
-
-go_out_dir   <- if (exists("go_out_dir")) go_out_dir else "../../res/functional/ora_go"
-kegg_out_dir <- if (exists("kegg_out_dir")) kegg_out_dir else "../../res/functional/ora_kegg"
-
-fmt2 <- function(x) format(x, nsmall = 2)
-
-stem_go <- function(ont, set_label, dir, padj_cutoff, lfc_min) {
-  paste0("GO_", ont, "_", set_label, "_", dir,
-         "_padj", fmt2(padj_cutoff), "_lfc", fmt2(lfc_min))
-}
-stem_kegg <- function(set_label, dir, padj_cutoff, lfc_min) {
-  paste0("KEGG_", set_label, "_", dir,
-         "_padj", fmt2(padj_cutoff), "_lfc", fmt2(lfc_min))
-}
-
-safe_read_enrich <- function(path) {
-  if (!file.exists(path)) return(NULL)
-  obj <- tryCatch(readRDS(path), error = function(e) NULL)
-  if (is.null(obj)) return(NULL)
-  df <- tryCatch(as.data.frame(obj), error = function(e) NULL)
-  if (is.null(df) || nrow(df) == 0) return(NULL)
-  obj
-}
-
-# ---- RDS laden
-go_eff_obj <- safe_read_enrich(file.path(go_out_dir,
-  paste0(stem_go("BP","Wald_V2_vs_V1","up", padj_cutoff, lfc_min), ".rds")
-))
-kegg_ribo_obj <- safe_read_enrich(file.path(kegg_out_dir,
-  paste0(stem_kegg("Wald_V2_vs_V1","down", padj_cutoff, lfc_min), ".rds")
-))
-kegg_infl_obj <- safe_read_enrich(file.path(kegg_out_dir,
-  paste0(stem_kegg("Wald_V2_vs_A","up", padj_cutoff, lfc_min), ".rds")
-))
-
-# ---- helper: geneID-Spalte aus enrich-Result ziehen
-# clusterProfiler speichert geneID meist als "ID1/ID2/..."
-get_top_geneIDs <- function(enrich_obj, n_terms = 2) {
-  if (is.null(enrich_obj)) return(character())
-  df <- as.data.frame(enrich_obj)
-  if (!"geneID" %in% names(df)) return(character())
-  top <- df |> slice_head(n = min(n_terms, nrow(df))) |> pull(geneID)
-  unique(unlist(strsplit(top, "/", fixed = TRUE), use.names = FALSE))
-}
-
-# ---- helper: geneIDs -> ENSEMBL mappen (robust: ENSG / ENTREZ / SYMBOL)
-to_ens <- function(ids) {
-  ids <- unique(ids[!is.na(ids) & ids != ""])
-  if (length(ids) == 0) return(character())
-
-  # ENSEMBL?
-  if (all(grepl("^ENSG", ids))) return(sub("\\..*$", "", ids))
-
-  # reine Zahlen -> ENTREZ?
-  if (all(grepl("^[0-9]+$", ids))) {
-    m <- AnnotationDbi::select(org.Hs.eg.db,
-      keys = ids, keytype = "ENTREZID", columns = "ENSEMBL"
-    )
-    return(unique(m$ENSEMBL[!is.na(m$ENSEMBL)]))
-  }
-
-  # sonst als SYMBOL versuchen
-  m <- AnnotationDbi::select(org.Hs.eg.db,
-    keys = ids, keytype = "SYMBOL", columns = "ENSEMBL"
-  )
-  unique(m$ENSEMBL[!is.na(m$ENSEMBL)])
-}
-
-# ---- Gene-Sets bauen (als ENSEMBL)
-genes_go_eff   <- get_top_geneIDs(go_eff_obj, n_terms = 2)
-genes_kegg_ribo<- get_top_geneIDs(kegg_ribo_obj, n_terms = 2)
-genes_kegg_sig <- get_top_geneIDs(kegg_infl_obj, n_terms = 2)
-
-genes_go_eff    <- to_ens(genes_go_eff)
-genes_kegg_ribo <- to_ens(genes_kegg_ribo)
-genes_kegg_sig  <- to_ens(genes_kegg_sig)
-
-# Mini-Diagnostik
-message("Effector ENS: ", length(genes_go_eff))
-message("Ribosome ENS: ", length(genes_kegg_ribo))
-message("Inflammation ENS: ", length(genes_kegg_sig))
-
-# optional anschauen:
-# head(genes_go_eff); head(genes_kegg_ribo); head(genes_kegg_sig)
-
-
-# -----------------------------
-# 2) Drei Score-Gruppen definieren
-#    (Fallback: wenn du keine saubere Zuordnung hast, nimm 1 Score aus allen Genen,
-#     und zwei weitere aus zufälligen Dritteln – ABER das wollen wir nicht.
-#    -> Besser: wir nehmen die ORA-Quelle erneut:
-#       - In deinem Workflow kommen die Gene aus:
-#           GO V2vsV1 UP   (Effector)
-#           KEGG V2vsV1 DOWN (Ribosome)
-#           KEGG V2vsA UP  (Signaling/Inflammation)
-#    Falls du die getrennten Listen noch hast: nutze sie.
-# -----------------------------
-
-# Wenn du diese Objekte noch hast (aus dem ORA-rebuild):
-#   genes_go_eff, genes_kegg_ribo, genes_kegg_sig
-# dann benutzen wir sie, sonst definieren wir clean Fallbacks.
-
-have_split_lists <- all(sapply(
-  c("genes_go_eff", "genes_kegg_ribo", "genes_kegg_sig"),
-  exists
-))
-
-if (!have_split_lists) {
-  message("Hinweis: genes_go_eff / genes_kegg_ribo / genes_kegg_sig nicht gefunden -> nutze Fallback (alle Gene für alle Scores).")
-  eff_genes  <- genes_present2
-  ribo_genes <- genes_present2
-  infl_genes <- genes_present2
-} else {
-  # mappe ggf. SYMBOL/ENTREZ zu ENSEMBL wurde bei dir schon indirekt gemacht,
-  # aber die Split-Listen sind typischerweise SYMBOL/ENTREZ.
-  # Deshalb: wir bauen Sets über die bereits gemappte ENS-Liste genes_present2
-  # indem wir schlicht die präsentierten Gene verwenden, die aus den jeweiligen Quellen stammen:
-  # -> am robustesten: wir remappen die Split-Listen wieder nach ENS, falls nötig.
-  suppressPackageStartupMessages({
-    library(AnnotationDbi)
-    library(org.Hs.eg.db)
-  })
-
-  to_ens <- function(x) {
-    x <- unique(x[!is.na(x) & x != ""])
-    if (length(x) == 0) return(character())
-
-    # wenn schon ENSG:
-    if (all(grepl("^ENSG", x))) return(sub("\\..*$", "", x))
-
-    # sonst als SYMBOL versuchen
-    map <- AnnotationDbi::select(
-      org.Hs.eg.db,
-      keys = x,
-      keytype = "SYMBOL",
-      columns = "ENSEMBL"
-    )
-    unique(map$ENSEMBL[!is.na(map$ENSEMBL)])
-  }
-
-  eff_genes  <- intersect(to_ens(genes_go_eff),     genes_present2)
-  ribo_genes <- intersect(to_ens(genes_kegg_ribo),  genes_present2)
-  infl_genes <- intersect(to_ens(genes_kegg_sig),   genes_present2)
-
-  # Safety: falls ein Set zu klein ist -> fallback auf alle
-  if (length(eff_genes)  < 5) eff_genes  <- genes_present2
-  if (length(ribo_genes) < 5) ribo_genes <- genes_present2
-  if (length(infl_genes) < 5) infl_genes <- genes_present2
-}
-
-# -----------------------------
-# 3) Scores berechnen (mean z über Gene)
-# -----------------------------
-score_from_set <- function(mat_z, gene_set) {
-  gene_set <- intersect(gene_set, rownames(mat_z))
-  if (length(gene_set) == 0) return(rep(NA_real_, ncol(mat_z)))
-  colMeans(mat_z[gene_set, , drop = FALSE], na.rm = TRUE)
-}
-
-meta2$score_inflammation <- score_from_set(mat_z, infl_genes)
-meta2$score_effector     <- score_from_set(mat_z, eff_genes)
-meta2$score_ribosome     <- score_from_set(mat_z, ribo_genes)
-
-# Check gegen NA-Flatline
-stopifnot(any(!is.na(meta2$score_inflammation)))
-stopifnot(any(!is.na(meta2$score_effector)))
-stopifnot(any(!is.na(meta2$score_ribosome)))
-
-# -----------------------------
-# 4) Plot vorbereiten (A -> V1 -> V2)
-# -----------------------------
-meta2$timepoint <- factor(as.character(meta2$timepoint), levels = c("A","V1","V2"))
-
-scores_long <- meta2 |>
-  dplyr::select(pid, timepoint, score_inflammation, score_effector, score_ribosome) |>
-  tidyr::pivot_longer(
-    cols = starts_with("score_"),
-    names_to = "score",
-    values_to = "value"
-  ) |>
-  dplyr::mutate(
-    score = dplyr::recode(score,
-      score_inflammation = "Acute inflammatory score",
-      score_effector     = "Immune effector score",
-      score_ribosome     = "Ribosomal activity score"
-    )
-  )
-
-p_scores <- ggplot(scores_long, aes(x = timepoint, y = value, group = pid)) +
-  geom_line(alpha = 0.25) +
-  geom_point(size = 1.2, alpha = 0.6) +
-  stat_summary(aes(group = 1), fun = mean, geom = "line", linewidth = 1.0) +
-  stat_summary(aes(group = 1), fun = mean, geom = "point", size = 2.0) +
-  facet_wrap(~ score, nrow = 1, scales = "free_y") +
-  theme_bw(base_size = 11) +
-  labs(
-    title = "Transcriptomic immune response after TAVI",
-    x = NULL,
-    y = "Mean row-scaled VST (z-score)"
-  ) +
-  theme(
-    strip.background = element_rect(fill = "grey95"),
-    panel.grid.minor = element_blank()
-  )
-
-print(p_scores)
-
-# Optional: speichern
-# ggsave("../../res/figures/FIG_TAVI_scores_trajectory.png", p_scores, width = 9, height = 3, dpi = 300)
-# ggsave("../../res/figures/FIG_TAVI_scores_trajectory.pdf", p_scores, width = 9, height = 3)
-
 
 ```
