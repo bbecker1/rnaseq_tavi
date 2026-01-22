@@ -872,256 +872,63 @@ Clustering der Wald∩LRT-Overlap-Gene nach zeitlichem Expressionsmuster mittels
 #| label: pattern-clustering
 #| echo: false
 #| warning: false
+#| fig-width: 10
+#| fig-height: 6
 
-# ------------------------------------------------------------
-# Helper: Ensembl-Versionen entfernen (ENSG... .16 -> ENSG...)
-# ------------------------------------------------------------
-strip_ensembl_version <- function(x) sub("\\..*$", "", x)
-
-# ------------------------------------------------------------
-# 1) Metadaten für degPatterns vorbereiten
-#    WICHTIG:
-#    - metadata MUSS ein data.frame sein
-#    - rownames(metadata) = Sample-Namen
-# ------------------------------------------------------------
-meta_deg <- meta |>
-  tibble::rownames_to_column(var = "samplename") |>
-  dplyr::select(samplename, timepoint) |>
-  dplyr::mutate(condition = droplevels(timepoint)) |>
-  as.data.frame()
-
-rownames(meta_deg) <- meta_deg$samplename
-meta_deg$samplename <- NULL
-
-# Sanity-Check
-stopifnot(all(rownames(meta_deg) %in% colnames(normalized_counts)))
-
-# ------------------------------------------------------------
-# 2) Matrix für Overlap-Gene bauen (Gene x Samples)
-# ------------------------------------------------------------
-mat_overlap <- normalized_counts[
-  strip_ensembl_version(rownames(normalized_counts)) %in% overlap_genes_any_wald,
-  ,
-  drop = FALSE
-]
-
-# Rownames vereinheitlichen
-rownames(mat_overlap) <- strip_ensembl_version(rownames(mat_overlap))
-
-# Spaltenreihenfolge exakt an Metadaten anpassen
-mat_overlap <- mat_overlap[, rownames(meta_deg), drop = FALSE]
-
-# Optional: begrenzen, falls es zu viele Gene sind
-n_max <- 500
-if (nrow(mat_overlap) > n_max) {
-  mat_overlap <- mat_overlap[seq_len(n_max), , drop = FALSE]
-}
-
-# ------------------------------------------------------------
-# 3) degPatterns laufen lassen
-# ------------------------------------------------------------
-degPatterns(
-  mat_overlap,
-  metadata = meta_deg,
-  time = "condition",
-  minc = 30
+# Metadaten für degPatterns (data.frame mit rownames = Sample-Namen)
+meta_deg <- data.frame(
+  condition = droplevels(meta$timepoint),
+  row.names = rownames(meta)
 )
 
-# ============================================================
-# Interpretation:
-#   - Jeder Panel = ein Cluster / zeitliches Muster
-#   - Punkte = einzelne Gene
-#   - Linien = mittlerer Verlauf pro Cluster
-#
-# Ein großer Teil der LRT∩Wald-Gene zeigt ein transient erhöhtes Expressionsniveau bei V1 mit anschließender Rückkehr zu Baseline bei V2
-# ============================================================
+# mat_overlap aus vorherigem Chunk wiederverwenden, Spalten an Metadaten anpassen
+mat_pattern <- mat_overlap[, rownames(meta_deg), drop = FALSE]
 
-```
-
-## GO ORA (Helper-Funktionen)
-
-Helper-Funktionen für Gene Ontology Over-Representation Analysis. Definiert Funktionen für Genlisten-Erstellung, enrichGO-Aufrufe und Ergebnis-Speicherung.
-
-```{r}
-#| label: go-ora-helpers
-#| echo: false
-#| warning: false
-
-# -----------------------------
-# Helpers
-# -----------------------------
-strip_ensembl_version <- function(x) sub("\\..*$", "", x)
-
-.ensure_tbl_results <- function(x) {
-  if (inherits(x, "DESeqResults")) {
-    x |>
-      as.data.frame() |>
-      tibble::rownames_to_column(var = "gene") |>
-      tibble::as_tibble()
-  } else {
-    tibble::as_tibble(x)
-  }
+# Auf max. 500 Gene begrenzen (degPatterns-Performance)
+n_pattern_max <- 500
+if (nrow(mat_pattern) > n_pattern_max) {
+  mat_pattern <- mat_pattern[seq_len(n_pattern_max), , drop = FALSE]
 }
 
-.build_lists_for_ora <- function(res_tb, padj_cutoff = 0.05, lfc_col = "log2FoldChange") {
-  res_tb <- .ensure_tbl_results(res_tb) |>
-    dplyr::filter(!is.na(padj)) |>
-    dplyr::mutate(ensembl_id = strip_ensembl_version(gene))
+# Output-Verzeichnisse
+fig_dir <- "../../res/figures"
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
 
-  universe <- unique(res_tb$ensembl_id)
+# degPatterns mit Caching
+cache_degpatterns <- file.path(cache_dir, "degPatterns_overlap.rds")
 
-  sig <- res_tb |>
-    dplyr::filter(padj < padj_cutoff)
-
-  sig_all <- unique(sig$ensembl_id)
-
-  if (lfc_col %in% names(sig)) {
-    sig_up <- unique(sig |> dplyr::filter(.data[[lfc_col]] > 0) |> dplyr::pull(ensembl_id))
-    sig_down <- unique(sig |> dplyr::filter(.data[[lfc_col]] < 0) |> dplyr::pull(ensembl_id))
-  } else {
-    # LRT hat kein log2FoldChange
-    sig_up <- character(0)
-    sig_down <- character(0)
-  }
-
-  list(
-    universe = universe,
-    sig_all = sig_all,
-    sig_up = sig_up,
-    sig_down = sig_down
+if (file.exists(cache_degpatterns)) {
+  deg_clusters <- readRDS(cache_degpatterns)
+} else {
+  deg_clusters <- degPatterns(
+    mat_pattern,
+    metadata = meta_deg,
+    time = "condition",
+    minc = 30,
+    plot = FALSE
   )
+  saveRDS(deg_clusters, cache_degpatterns)
 }
 
-.run_enrichgo <- function(sig_vec, universe_vec, ont = "BP",
-                          p_adjust_method = "BH", q_cutoff = 0.05) {
-  if (length(sig_vec) < 5) {
-    return(NULL)
-  }
-
-  clusterProfiler::enrichGO(
-    gene = sig_vec,
-    universe = universe_vec,
-    OrgDb = org.Hs.eg.db,
-    keyType = "ENSEMBL",
-    ont = ont,
-    pAdjustMethod = p_adjust_method,
-    qvalueCutoff = q_cutoff,
-    readable = TRUE
-  )
-}
-
-.save_enrichment <- function(enrich_obj, out_dir, stem,
-                             make_plots = TRUE, show_category = 25) {
-  if (is.null(enrich_obj)) {
-    return(invisible(NULL))
-  }
-
-  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
-
-  tab <- as.data.frame(enrich_obj)
-  write.csv(tab, file.path(out_dir, paste0(stem, ".csv")), row.names = FALSE)
-  saveRDS(enrich_obj, file.path(out_dir, paste0(stem, ".rds")))
-
-  if (isTRUE(make_plots) && nrow(tab) > 0) {
-    p <- enrichplot::dotplot(enrich_obj, showCategory = show_category) +
-      ggplot2::ggtitle(stem) +
-      ggplot2::theme_bw()
-
-    ggplot2::ggsave(
-      filename = file.path(out_dir, paste0(stem, "_dotplot.png")),
-      plot = p,
-      width = 9,
-      height = 6,
-      dpi = 200
-    )
-  }
-
-  invisible(tab)
-}
-
-# -----------------------------
-# Main: GO ORA für ein Set (Kontrast oder LRT) – ohne Cache
-# -----------------------------
-run_go_ora_set <- function(res_obj,
-                           set_label,
-                           padj_cutoff = 0.05,
-                           ontologies = c("BP", "MF", "CC"),
-                           directions = c("all", "up", "down"),
-                           out_dir = "../../res/functional/ora_go",
-                           make_plots = TRUE) {
-  lists <- .build_lists_for_ora(res_obj, padj_cutoff = padj_cutoff)
-
-  summary_rows <- list()
-
-  for (ont in ontologies) {
-    for (dir in directions) {
-      sig_vec <- switch(
-        dir,
-        all  = lists$sig_all,
-        up   = lists$sig_up,
-        down = lists$sig_down
-      )
-
-      # LRT: up/down ggf. leer -> skip
-      if (length(sig_vec) == 0) next
-
-      ego <- .run_enrichgo(sig_vec, lists$universe, ont = ont)
-
-      stem <- paste0(
-        "GO_", ont, "_", set_label, "_", dir,
-        "_padj", format(padj_cutoff, nsmall = 2)
-      )
-
-      tab <- .save_enrichment(
-        enrich_obj = ego,
-        out_dir = out_dir,
-        stem = stem,
-        make_plots = make_plots,
-        show_category = 25
-      )
-
-      if (is.null(tab) || nrow(tab) == 0) {
-        summary_rows[[length(summary_rows) + 1]] <- tibble::tibble(
-          set = set_label,
-          ontology = ont,
-          direction = dir,
-          n_sig_genes = length(sig_vec),
-          n_terms = 0L,
-          top_term = NA_character_,
-          top_term_padj = NA_real_
-        )
-      } else {
-        summary_rows[[length(summary_rows) + 1]] <- tibble::tibble(
-          set = set_label,
-          ontology = ont,
-          direction = dir,
-          n_sig_genes = length(sig_vec),
-          n_terms = nrow(tab),
-          top_term = tab$Description[1],
-          top_term_padj = tab$p.adjust[1]
-        )
-      }
-    }
-  }
-
-  summary_tbl <- dplyr::bind_rows(summary_rows)
-
-  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
-  write.csv(
-    summary_tbl,
-    file.path(
-      out_dir,
-      paste0("GO_ORA_summary_", set_label, "_padj", format(padj_cutoff, nsmall = 2), ".csv")
-    ),
-    row.names = FALSE
+# Publikationsreifer Plot
+p_pattern <- deg_clusters$plot +
+  theme_bw(base_size = 11) +
+  labs(
+    title = "Temporal expression patterns of LRT ∩ Wald genes",
+    x = "Timepoint",
+    y = "Scaled expression (z-score)"
+  ) +
+  theme(
+    strip.background = element_rect(fill = "grey95"),
+    panel.grid.minor = element_blank(),
+    legend.position = "none"
   )
 
-  summary_tbl
-}
+print(p_pattern)
 
-# -----------------------------
-# Caching Wrapper: lädt Summary-RDS, sonst rechnet + cach
-
+# Figure speichern
+ggsave(file.path(fig_dir, "FIG_degPatterns_clusters.png"), p_pattern, width = 10, height = 6, dpi = 300)
+ggsave(file.path(fig_dir, "FIG_degPatterns_clusters.pdf"), p_pattern, width = 10, height = 6)
 ```
 
 ## GO + KEGG ORA Analyse
