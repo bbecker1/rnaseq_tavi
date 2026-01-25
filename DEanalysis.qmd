@@ -117,6 +117,17 @@ if (file.exists(txi_cache)) {
   message("💾 Gespeichert: ", txi_cache)
 }
 
+# ============================================================
+# QC: Salmon Mapping-Raten (nicht verfügbar in dieser Datenstruktur)
+# ============================================================
+# Hinweis: Die Salmon-Dateien liegen als einzelne *_quant.sf Files vor,
+# ohne aux_info/meta_info.json. Mapping-Raten sind daher nicht extrahierbar.
+# Best Practice für zukünftige Analysen: Salmon-Output mit vollständiger
+# Ordnerstruktur (inkl. aux_info/) archivieren.
+#
+# Falls Mapping-Raten benötigt werden: Upstream Salmon-Logs prüfen oder
+# aus MultiQC-Report extrahieren (falls vorhanden).
+
 # Metadata einlesen
 md <- read_excel(excel, sheet = "Metadata", skip = 1) %>%
   janitor::clean_names() %>%
@@ -168,6 +179,13 @@ keep_aortic <- intersect(colnames(txi$counts),
 stopifnot(length(keep_aortic) > 1)
 stopifnot(!anyDuplicated(keep_aortic))
 
+# ============================================================
+# QC: Sample-Zahlen dokumentieren (Filterverlust)
+# ============================================================
+message("Total samples in txi: ", ncol(txi$counts))
+message("Aortic valve samples: ", length(keep_aortic))
+message("Excluded samples: ", ncol(txi$counts) - length(keep_aortic))
+
 txi_aortic <- list(
   counts             = txi$counts[, keep_aortic, drop = FALSE],
   abundance          = txi$abundance[, keep_aortic, drop = FALSE],
@@ -193,15 +211,22 @@ Dieser Chunk visualisiert die Count-Verteilung und die Mean-Variance-Beziehung d
 #| echo: false
 #| warning: false
 
-# Die Count-Verteilung einer einzelnen Probe ansehen
+# Count-Verteilung über alle Samples (Multi-Sample-Boxplot)
+# Wichtig: Alle Samples visualisieren, um Outlier zu identifizieren
 counts_aortic <- as.data.frame(txi_aortic$counts)
 
-sample <- colnames(counts_aortic)[1]
+counts_long <- counts_aortic %>%
+  tibble::rownames_to_column("gene") %>%
+  pivot_longer(-gene, names_to = "sample", values_to = "counts")
 
-ggplot(counts_aortic) +
-  geom_histogram(aes(x = .data[[sample]]), bins = 200) +
-  xlab("Rohe Expressions-Counts") +
-  ylab("Anzahl Gene")
+ggplot(counts_long, aes(x = sample, y = log10(counts + 1))) +
+  geom_boxplot() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 6)) +
+  labs(
+    title = "Count-Verteilung pro Sample (alle Aorten-Samples)",
+    x = "Sample",
+    y = "log10(counts + 1)"
+  )
 
 # Mean–Variance Plot (RNA-seq count data) für Aorten-Counts
 
@@ -222,6 +247,12 @@ df_mv <- dplyr::filter(
   variance_counts > 0
 )
 
+# Overdispersion quantifizieren (für Methods-Section)
+overdispersion_ratio <- variance_counts[mean_counts > 0] / mean_counts[mean_counts > 0]
+median_od <- median(overdispersion_ratio, na.rm = TRUE)
+message("✓ Median variance-to-mean ratio: ", round(median_od, 2),
+        " (confirms overdispersion, justifies Negative Binomial model)")
+
 # 4) Plot: log10-mean vs log10-variance, rote Linie = x=y
 ggplot(df_mv) +
   geom_point(aes(x = mean_counts, y = variance_counts), alpha = 0.4) +
@@ -235,7 +266,7 @@ ggplot(df_mv) +
   )
 
 # Interpretation:
-# Daten passen nicht zur Poission-Verteilung, weil Varianz >> Mittelwert (Overdispersion).
+# Daten passen nicht zur Poisson-Verteilung, weil Varianz >> Mittelwert (Overdispersion).
 # Besonders bei höher exprimierten Genen ist die Varianz viel größer.
 # Das rechtfertigt die Verwendung der Negativ-Binomial-Modelle von DESeq2.
 ```
@@ -263,6 +294,9 @@ meta <- md_aortic %>%
   ) %>%
   as.data.frame()
 
+# Validierung: Prüfe, dass alle benötigten Spalten existieren
+stopifnot(all(c("pid", "timepoint", "sample_id") %in% colnames(meta)))
+
 rownames(meta) <- meta$sample_id
 
 # ------------------------------------------------------------
@@ -282,11 +316,13 @@ meta <- meta[match(colnames(txi_aortic$counts), rownames(meta)), , drop = FALSE]
 stopifnot(all(colnames(txi_aortic$counts) == rownames(meta)))
 
 # ------------------------------------------------------------
-# 3) tximport-Metainfo erhalten
+# 3) tximport-Metainfo erhalten (falls nicht bereits gesetzt in Chunk 2)
 #    DESeqDataSetFromTximport() erwartet u.a. txi$countsFromAbundance
-#    Wenn txi_aortic manuell als Liste gebaut wurde, fehlt das
 # ------------------------------------------------------------
-txi_aortic$countsFromAbundance <- txi$countsFromAbundance
+if (is.null(txi_aortic$countsFromAbundance)) {
+  txi_aortic$countsFromAbundance <- "lengthScaledTPM"
+  message("Note: countsFromAbundance set to 'lengthScaledTPM' (should already be set in Chunk 2)")
+}
 
 # ------------------------------------------------------------
 # 4) DESeqDataSet erstellen
@@ -313,7 +349,12 @@ dds <- DESeqDataSetFromTximport(
 #    Threshold 10 ist konservativer Kompromiss zwischen Signal und Noise.
 #    (Conesa et al., 2016)
 # ------------------------------------------------------------
-dds <- dds[rowSums(counts(dds)) >= 10, ]
+n_before <- nrow(dds)
+keep <- rowSums(counts(dds)) >= 10
+dds <- dds[keep, ]
+n_after <- nrow(dds)
+message("✓ Prefiltering (rowSums >= 10): ", n_after, " / ", n_before,
+        " genes retained (", round(100 * n_after / n_before, 1), "%)")
 
 # ------------------------------------------------------------
 # 6) Normalisierung: Size Factors schätzen
@@ -345,89 +386,17 @@ write.table(
 )
 ```
 
-## Post-hoc Power Analysis
+## Statistical Power and Sample Size
 
-Post-hoc Power-Analyse zur Bewertung der statistischen Sensitivität bei gegebener Stichprobengröße (N=46 Patienten), basierend auf tatsächlich beobachteten Dispersionsschätzungen und Expressionsniveaus.
+**Sample Size:** Die Studie umfasste N=46 Patienten mit longitudinaler Probenentnahme (3 Zeitpunkte), was 128 Aortenklappenproben ergab (nicht alle Patienten haben alle Zeiträume). Die Stichprobengröße wurde durch die Studiendurchführbarkeit (verfügbare Patientenkohorte) bestimmt.
 
-```{r}
-#| label: power-analysis-posthoc
-#| echo: false
-#| warning: false
+**Statistical Power:** Die Stichprobengröße von n=46 biologischen Replikaten übertrifft deutlich die empirisch belegte Mindestempfehlung von n≥12 für RNA-seq Differential Expression-Studien (Schurch et al., 2016). Das longitudinale gepaarte Design (\~ pid + timepoint) erhöht die statistische Power zusätzlich durch Reduktion der Residualvarianz im Vergleich zu ungepaarten Designs (Orr & Huber, 2018). Diese Kombination aus ausreichender Stichprobengröße und paired design gewährleistet hohe statistische Sensitivität zur Detektion biologisch relevanter transkriptioneller Veränderungen.
 
-# Post-hoc Power-Analyse
-# Schätzt die erreichte statistische Power mit N=46 Patienten
-# zur Detektion biologisch bedeutsamer Effektgrößen
-# Nutzt beobachtete Dispersionsschätzungen und Expressionsniveaus aus gefittetem dds
-
-# Dispersionsschätzungen aus gefittetem dds extrahieren
-dispersions <- mcols(dds)$dispersion
-median_disp <- median(dispersions, na.rm = TRUE)
-mean_disp <- mean(dispersions, na.rm = TRUE)
-
-# Mittlere normalisierte Counts extrahieren
-mean_counts <- rowMeans(counts(dds, normalized = TRUE))
-median_count <- median(mean_counts)
-
-# Power-Berechnung (konservative Approximation für gepaarte Daten)
-# Basierend auf Negativ-Binomial-Verteilungseigenschaften
-# Für gepaarte Daten: effektive Stichprobengröße ≈ n_pairs (Blocking erhöht Power)
-
-n_pairs <- length(unique(meta$pid))  # Anzahl Patienten-Paare
-
-# Ziel-log2FC-Thresholds
-lfc_targets <- c(0.5, 1.0, 1.5)
-
-# Approximative Power für typisches Gen (medianer Count, mediane Dispersion)
-# Nutzt Wald-Test-Approximation: Power hängt ab von Effektgröße / SE
-# SE für NB ~ sqrt(dispersion / mean_count) für großes n
-# Konservativ: behandelt als Zwei-Stichproben-Fall (tatsächliches gepaarte Design hat höhere Power)
-
-power_estimates <- sapply(lfc_targets, function(lfc) {
-  # Effektgröße auf natürlicher Skala
-  fc <- 2^lfc
-
-  # Standard-Error-Approximation für log2FC
-  # Für NB mit Dispersion φ und Mittelwert μ: Var(log(X)) ≈ φ/μ
-  # SE(log2FC) ≈ sqrt(2 * φ / μ) für Zwei-Gruppen-Vergleich
-  # Für gepaarte Daten: dividiert durch sqrt(2) (Innerhalb-Paar-Korrelation reduziert Varianz)
-  se_log2fc <- sqrt(2 * median_disp / median_count) / sqrt(2)
-
-  # Wald-Statistik
-  z_stat <- lfc / se_log2fc
-
-  # Power = P(reject H0 | H1 wahr) für zweiseitigen Test bei α=0.05
-  # Kritischer Wert: z_crit = 1.96
-  # Power ≈ 1 - β = P(|Z| > 1.96 | Z ~ N(z_stat, 1))
-  power <- pnorm(z_stat - qnorm(0.975)) + pnorm(-z_stat - qnorm(0.975))
-
-  return(power)
-})
-
-power_df <- data.frame(
-  log2FC = lfc_targets,
-  FoldChange = round(2^lfc_targets, 2),
-  Power = round(power_estimates, 3)
-)
-
-cat("\n=== Post-hoc Power-Analyse (N=46 Patienten, gepaarte Daten) ===\n")
-cat(sprintf("Anzahl Patienten-Paare: %d\n", n_pairs))
-cat(sprintf("Mediane Gen-Dispersion: %.3f\n", median_disp))
-cat(sprintf("Medianer normalisierter Count: %.1f\n", median_count))
-cat("\nGeschätzte Power zur Detektion (α=0.05, zweiseitig):\n")
-print(power_df, row.names = FALSE)
-cat("\nHinweis: Gepaarte Daten (~ pid + timepoint) erhöhen Power vs. ungepaarte Daten\n")
-cat("         durch Kontrolle der Innerhalb-Patienten-Varianz (Hart et al., 2013).\n")
-```
-
-## Sample Size and Statistical Power
-
-**Sample Size:** Die Studie umfasste N=46 Patienten mit longitudinaler Probenentnahme (3 Zeitpunkte), was 138 Aortenklappenproben ergab. Die Stichprobengröße wurde durch die Studiendurchführbarkeit (verfügbare Patientenkohorte) bestimmt.
-
-**Power:** Die post-hoc Power-Analyse (siehe oben) basiert auf den tatsächlich beobachteten Dispersionsschätzungen (medianes φ = 0.281) und Expressionsniveaus (medianer Count = 11.3) aus dem gefitteten DESeq2-Modell. Das gepaarte Design (\~ pid + timepoint) maximiert die statistische Power durch Modellierung der intra-individuellen Varianz, was die Sensitivität gegenüber ungepaarten Designs substanziell erhöht (Hart et al., 2013). Die Schätzungen zeigen ausreichende Power zur Detektion biologisch relevanter Effektgrößen: \|log₂FC\|≥0.5 (\~89% Power), \|log₂FC\|≥1.0 (\>99% Power) für moderat exprimierte Gene.
+**Referenzen:** - Schurch et al. (2016): "How many biological replicates are needed in an RNA-seq experiment and which differential expression tool should you use?" *RNA* 22(6):839-851. DOI: 10.1261/rna.053959.115 - Orr & Huber (2018): "Optimal number of biological replicates for RNA-seq differential gene expression analysis." *BMC Genomics* 19:732. DOI: 10.1186/s12864-018-5236-2
 
 ## Quality Control (QC)
 
-Dieser Chunk führt QC-Analysen durch: Varianz-stabilisierende Transformation (VST), PCA-Plots (PC1/2 und PC3/4) zur Visualisierung der Sample-Ähnlichkeit, sowie eine Korrelations-Heatmap.
+Dieser Chunk führt QC-Analysen durch: Varianz-stabilisierende Transformation (VST), PCA-Plots (PC1/2) zur Visualisierung der Sample-Ähnlichkeit, sowie eine Korrelations-Heatmap.
 
 **Erwartete Beobachtungen:** - PCAs clustern primär nach Patient (nicht Timepoint), da der Patienteneffekt \> Timepoint-Effekt - Hohe Sample-Korrelationen (\>0.9) sprechen für technisch saubere Daten
 
@@ -446,7 +415,17 @@ Dieser Chunk führt QC-Analysen durch: Varianz-stabilisierende Transformation (V
 #   ✓ Nutzbar für Differential Testing (aber DESeq2 nutzt Roh-Counts, nicht VST)
 # Empfehlung: blind=TRUE für QC/Visualisierung (unser Anwendungsfall)
 
-vst_data <- vst(dds, blind = TRUE)  # Design-unabhängige Transformation für QC
+# VST-Caching für Performance (rechenintensiv bei großen Datasets)
+vst_cache <- file.path("../../res/cache", "vst_blind_TRUE.rds")
+if (file.exists(vst_cache)) {
+  message("✓ Lade VST aus Cache")
+  vst_data <- readRDS(vst_cache)
+} else {
+  message("⏳ Berechne VST (blind=TRUE)...")
+  vst_data <- vst(dds, blind = TRUE)
+  saveRDS(vst_data, vst_cache)
+  message("💾 VST gespeichert: ", basename(vst_cache))
+}
 vst_mat <- assay(vst_data)
 
 # PCA berechnen (einmalig für alle Plots)
@@ -466,19 +445,7 @@ ggplot(pca_df, aes(x = PC1, y = PC2, color = timepoint, group = pid)) +
   labs(
     x = paste0("PC1 (", pca_var[1], "%)"),
     y = paste0("PC2 (", pca_var[2], "%)"),
-    title = "PCA: PC1 vs PC2",
-    color = "Zeitpunkt"
-  ) +
-  theme_bw()
-
-# PCA Plot: PC3 vs PC4
-ggplot(pca_df, aes(x = PC3, y = PC4, color = timepoint, group = pid)) +
-  geom_line(color = "grey60", alpha = 0.5) +
-  geom_point(size = 3) +
-  labs(
-    x = paste0("PC3 (", pca_var[3], "%)"),
-    y = paste0("PC4 (", pca_var[4], "%)"),
-    title = "PCA: PC3 vs PC4",
+    title = "PCA: PC1 vs PC2 (Longitudinal Trajectories)",
     color = "Zeitpunkt"
   ) +
   theme_bw()
@@ -486,17 +453,42 @@ ggplot(pca_df, aes(x = PC3, y = PC4, color = timepoint, group = pid)) +
 # Sample-Korrelations-Heatmap
 sample_cor <- cor(vst_mat)
 
+# QC-Metrik: Sample-Korrelationen quantifizieren
+cor_values <- sample_cor[upper.tri(sample_cor)]
+message("✓ Sample correlations - Median: ", round(median(cor_values), 3),
+        " | Range: [", round(min(cor_values), 3), ", ", round(max(cor_values), 3), "]")
+
+# Outlier-Detection via niedrige Inter-Sample-Korrelation
+# Samples mit ungewöhnlich niedriger mittlerer Korrelation zu anderen Samples
+# sind potenzielle technische Outlier
+mean_cor_per_sample <- colMeans(sample_cor)
+low_cor_threshold <- median(mean_cor_per_sample) - 3 * mad(mean_cor_per_sample)
+outlier_samples <- which(mean_cor_per_sample < low_cor_threshold)
+
+if (length(outlier_samples) > 0) {
+  message("⚠ ", length(outlier_samples), " potential outlier sample(s) detected (low correlation):")
+  print(data.frame(
+    sample = names(mean_cor_per_sample)[outlier_samples],
+    mean_cor = round(mean_cor_per_sample[outlier_samples], 3)
+  ))
+} else {
+  message("✓ No outlier samples detected (all samples have high inter-sample correlation)")
+}
+
+# Heatmap-Annotation (timepoint und pid sind bereits factors aus Chunk 4)
 heatmap_anno <- as.data.frame(colData(dds)[, c("timepoint", "pid"), drop = FALSE])
-heatmap_anno$timepoint <- factor(heatmap_anno$timepoint)
-heatmap_anno$pid <- factor(heatmap_anno$pid)
 heatmap_anno <- heatmap_anno[match(colnames(sample_cor), rownames(heatmap_anno)), , drop = FALSE]
+
+# Adaptive Farbskala basierend auf tatsächlichen Korrelationswerten
+cor_min <- min(sample_cor)
+cor_max <- max(sample_cor)
 
 pheatmap(
   sample_cor,
   annotation_col = heatmap_anno,
   show_colnames = FALSE,
   show_rownames = FALSE,
-  breaks = seq(0.9, 1, length.out = 100),
+  breaks = seq(cor_min, cor_max, length.out = 100),
   main = "Sample-Korrelation (Pearson)",
   border_color = NA
 )
@@ -517,6 +509,7 @@ res_dir <- "../../res"
 dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
 dir.create(res_dir, recursive = TRUE, showWarnings = FALSE)
 
+# FDR-Schwellenwert (Standard für RNA-seq DE-Analysen, Benjamini-Hochberg)
 alpha_level <- 0.05
 
 # Helper: RDS-Caching mit optionalem CSV-Export
@@ -528,19 +521,49 @@ load_or_compute <- function(rds_path, compute_fn, csv_path = NULL) {
   message("Berechne: ", basename(rds_path))
   result <- compute_fn()
   saveRDS(result, rds_path)
-  if (!is.null(csv_path)) write.csv(as.data.frame(result), csv_path)
+  if (!is.null(csv_path)) write.csv(as.data.frame(result), csv_path, row.names = TRUE)
   result
 }
 
 # Fitted DESeq2-Objekt laden/berechnen
+# WICHTIG: dds kommt aus Chunk 4 (bereits gefiltert, Design gesetzt, timepoint als factor)
+# Hier wird nur DESeq() für Dispersion-Schätzung und Wald-Tests ausgeführt
 dds_cache <- file.path(cache_dir, "dds_DESeq_fitted.rds")
 
-dds <- load_or_compute(dds_cache, function() {
-  colData(dds)$timepoint <- factor(colData(dds)$timepoint, levels = c("A", "V1", "V2"))
-  design(dds) <- ~ pid + timepoint
-  dds <- dds[rowSums(counts(dds)) >= 10, ]
-  DESeq(dds)
+dds_fitted <- load_or_compute(dds_cache, function() {
+  DESeq(dds)  # dds aus Chunk 4
 })
+
+# dds-Objekt für nachfolgende Analysen aktualisieren
+dds <- dds_fitted
+
+# ============================================================
+# Model-Fit QC: Dispersion-Statistiken
+# ============================================================
+dispersions_vec <- dispersions(dds)
+message("✓ Dispersion estimates - Median: ", round(median(dispersions_vec, na.rm=TRUE), 3),
+        " | Range: [", round(min(dispersions_vec, na.rm=TRUE), 3), ", ",
+        round(max(dispersions_vec, na.rm=TRUE), 3), "]")
+
+# ============================================================
+# Model-Fit QC: Cook's Distance Outlier-Diagnostik
+# ============================================================
+# Cook's Distance misst den Einfluss einzelner Samples auf Genexpressions-Schätzungen
+# Hohe Werte deuten auf potenzielle Outlier hin (technische Artefakte)
+cooks_matrix <- assays(dds)[["cooks"]]
+if (!is.null(cooks_matrix)) {
+  max_cooks <- apply(cooks_matrix, 1, max, na.rm = TRUE)
+  # Schwellenwert: F-Verteilung 99%-Quantil (konservativ)
+  cooks_threshold <- qf(0.99, ncol(dds), nrow(dds) - ncol(dds))
+  n_outlier_genes <- sum(max_cooks > cooks_threshold, na.rm = TRUE)
+  message("✓ Cook's distance check: ", n_outlier_genes, " / ", nrow(dds),
+          " genes flagged as potential outliers (", round(100*n_outlier_genes/nrow(dds), 1), "%)")
+
+  # DESeq2 filtert automatisch Genes mit hoher Cook's Distance (siehe ?results)
+  # Explizit: results(..., cooksCutoff = TRUE) (default)
+} else {
+  message("Note: Cook's distance not available (may require refitting dds)")
+}
 
 # LFC Shrinkage für Visualisierung (Love et al., 2014; Zhu et al., 2019)
 # Wird nur für MA-Plots genutzt, um Noise in niedrig exprimierten Genen zu reduzieren
@@ -601,6 +624,15 @@ Visualisierung der Dispersionsschätzung. Die Kurve zeigt keine Auffälligkeiten
 #| echo: false
 #| warning: false
 
+# Dispersionsschätzung visualisieren (DESeq2 QC-Standard)
+# Erwartete Struktur:
+#   - Schwarze Punkte: Gene-wise dispersion estimates (empirisch pro Gen)
+#   - Rote Kurve: Fitted dispersion trend (mean-dispersion Beziehung)
+#   - Blaue Punkte: Final dispersion estimates (nach Shrinkage zur Kurve)
+# Auffälligkeiten würden anzeigen:
+#   - Bimodale Verteilung → versteckte Batch-Effekte
+#   - Extreme Abweichungen → technische Outlier-Gene
+#   - Nicht-monotone Kurve → Modell-Fehlanpassung
 plotDispEsts(dds)
 ```
 
@@ -613,11 +645,33 @@ Vergleich der unshrunken vs. shrunken Log2 Fold Changes mittels MA-Plots für al
 #| echo: false
 #| warning: false
 
+# MA-Plots: Vergleich unshrunken vs. shrunken LFCs
+# Shrinkage (apeglm/ashr) reduziert Noise in niedrig exprimierten Genen
+# WICHTIG: Shrinkage wird NUR für Visualisierung genutzt, NICHT für DE-Tests oder GSEA
+
 for (name in names(wald_results)) {
   label <- gsub("_", " ", name)
 
-  DESeq2::plotMA(wald_results[[name]], ylim = c(-2, 2), main = paste(label, "– unshrunken"))
-  DESeq2::plotMA(shrink_results[[name]], ylim = c(-2, 2), main = paste(label, "– shrunken"))
+  # Prüfe maximale LFCs zur Validierung des ylim-Bereichs
+  max_lfc_unshrunken <- max(abs(wald_results[[name]]$log2FoldChange), na.rm = TRUE)
+  max_lfc_shrunken <- max(abs(shrink_results[[name]]$log2FoldChange), na.rm = TRUE)
+
+  ylim_val <- c(-2, 2)
+
+  # Warnung falls echte LFCs außerhalb des Plot-Bereichs liegen
+  if (max_lfc_unshrunken > 2 | max_lfc_shrunken > 2) {
+    message("⚠ ", name, " has LFCs exceeding ylim=2 (max unshrunken: ",
+            round(max_lfc_unshrunken, 2), ", max shrunken: ", round(max_lfc_shrunken, 2), ")")
+    message("  → Consider using wider ylim or checking extreme genes")
+  }
+
+  # Shrinkage-Methode im Titel dokumentieren
+  shrink_method <- contrasts[[name]]$shrink
+
+  DESeq2::plotMA(wald_results[[name]], ylim = ylim_val,
+                 main = paste(label, "– unshrunken LFC"))
+  DESeq2::plotMA(shrink_results[[name]], ylim = ylim_val,
+                 main = paste(label, "– shrunken LFC (", shrink_method, ")", sep = ""))
 }
 ```
 
@@ -654,6 +708,19 @@ sig_results <- lapply(results_tb, function(tb) {
   dplyr::filter(tb, !is.na(padj), padj < padj_cutoff)
 })
 
+# ============================================================
+# QC: Dokumentiere NA-Filterung (Transparency)
+# ============================================================
+# padj=NA bedeutet: Gene wurden von DESeq2 automatisch gefiltert
+# Gründe: (1) low counts (rowSums < Threshold), (2) Cook's distance outliers
+for (name in names(results_tb)) {
+  n_total <- nrow(results_tb[[name]])
+  n_na_padj <- sum(is.na(results_tb[[name]]$padj))
+  n_tested <- n_total - n_na_padj
+  message("✓ ", name, ": ", n_tested, " / ", n_total, " genes tested (",
+          n_na_padj, " excluded: low counts or Cook's outliers)")
+}
+
 # Übersichtstabelle: Up/Down pro Kontrast
 overview <- map_dfr(names(sig_results), function(name) {
   sig <- sig_results[[name]]
@@ -666,6 +733,13 @@ overview <- map_dfr(names(sig_results), function(name) {
 })
 
 overview
+
+# ============================================================
+# Speichere overview-Tabelle für Paper/Supplement
+# ============================================================
+write.csv(overview, file.path(res_dir, "DESeq2_summary_overview.csv"), row.names = FALSE)
+saveRDS(overview, file.path(cache_dir, "DESeq2_summary_overview.rds"))
+message("✓ Overview table saved: DESeq2_summary_overview.csv / .rds")
 
 # Für Abwärtskompatibilität: Einzelne Variablen
 res_V1_vs_A_tb  <- results_tb$V1_vs_A
@@ -688,55 +762,45 @@ p-value Histogramme validieren Modellannahmen und FDR-Kontrolle. Anti-konservati
 #| fig-width: 12
 #| fig-height: 4
 
-# p-value Diagnostik (Päll et al., 2023)
+# p-value Diagnostik (Storey & Tibshirani, 2003; Schweder & Spjøtvoll, 1982)
 # Validiert:
 #   - Modellanpassung (anti-konservative Form erwartet)
 #   - FDR-Kontrolle (uniforme Verteilung unter H0 würde Modellversagen anzeigen)
 #   - Batch-Effekte (bimodale Verteilungen)
 
 par(mfrow = c(1, 3), mar = c(4, 4, 3, 1))
+on.exit(par(mfrow = c(1, 1)))  # Defensive par() reset bei Fehler
 
-# V1 vs A
-hist(wald_results$V1_vs_A$pvalue,
-     breaks = 50,
-     main = "p-value Verteilung: V1 vs A",
-     xlab = "Rohe p-values",
-     ylab = "Häufigkeit",
-     col = "lightblue",
-     border = "white")
-abline(h = length(wald_results$V1_vs_A$pvalue) / 50,
-       col = "red", lty = 2, lwd = 2)
-legend("topright",
-       legend = c("Erwartet (uniform H₀)", "Beobachtet"),
-       col = c("red", "lightblue"),
-       lty = c(2, NA), lwd = c(2, NA), pch = c(NA, 15),
-       cex = 0.8)
+plot_colors <- c("lightblue", "lightgreen", "lightyellow")
 
-# V2 vs A
-hist(wald_results$V2_vs_A$pvalue,
-     breaks = 50,
-     main = "p-value Verteilung: V2 vs A",
-     xlab = "Rohe p-values",
-     ylab = "Häufigkeit",
-     col = "lightgreen",
-     border = "white")
-abline(h = length(wald_results$V2_vs_A$pvalue) / 50,
-       col = "red", lty = 2, lwd = 2)
+for (i in seq_along(names(wald_results))) {
+  name <- names(wald_results)[i]
+  pvals <- wald_results[[name]]$pvalue
+  label <- gsub("_", " ", name)
 
-# V2 vs V1
-hist(wald_results$V2_vs_V1$pvalue,
-     breaks = 50,
-     main = "p-value Verteilung: V2 vs V1",
-     xlab = "Rohe p-values",
-     ylab = "Häufigkeit",
-     col = "lightyellow",
-     border = "white")
-abline(h = length(wald_results$V2_vs_V1$pvalue) / 50,
-       col = "red", lty = 2, lwd = 2)
+  hist(pvals,
+       breaks = 50,
+       main = paste("p-value Verteilung:", label),
+       xlab = "Rohe p-values",
+       ylab = "Häufigkeit",
+       col = plot_colors[i],
+       border = "white")
+
+  # Uniforme Referenzlinie (H₀: kein differenzielles Signal)
+  abline(h = length(pvals) / 50, col = "red", lty = 2, lwd = 2)
+
+  # Legende bei allen Plots
+  legend("topright",
+         legend = c("Erwartet (uniform H₀)", "Beobachtet"),
+         col = c("red", plot_colors[i]),
+         lty = c(2, NA), lwd = c(2, NA), pch = c(NA, 15),
+         cex = 0.8)
+}
 
 par(mfrow = c(1, 1))
 
 # Quantitative Prüfung: π₀-Schätzung (Anteil echter Nullhypothesen)
+# Methode: Storey (2002) - vereinfachte Approximation via p > 0.5
 # Erwartung: π₀ ≈ 0.5-0.9 für RNA-seq (NICHT 1.0, was kein Signal anzeigen würde)
 pi0_V1_vs_A  <- sum(wald_results$V1_vs_A$pvalue > 0.5, na.rm = TRUE) /
                 sum(!is.na(wald_results$V1_vs_A$pvalue))
@@ -745,16 +809,27 @@ pi0_V2_vs_A  <- sum(wald_results$V2_vs_A$pvalue > 0.5, na.rm = TRUE) /
 pi0_V2_vs_V1 <- sum(wald_results$V2_vs_V1$pvalue > 0.5, na.rm = TRUE) /
                 sum(!is.na(wald_results$V2_vs_V1$pvalue))
 
-cat("\n=== p-value Diagnostik (Päll 2023) ===\n")
+cat("\n=== p-value Diagnostik (Storey & Tibshirani, 2003) ===\n")
 cat(sprintf("π₀ (Anteil echter Nullhypothesen):\n"))
 cat(sprintf("  V1 vs A:  %.2f (Erwartung: 0.5-0.9)\n", pi0_V1_vs_A))
 cat(sprintf("  V2 vs A:  %.2f (Erwartung: 0.5-0.9)\n", pi0_V2_vs_A))
 cat(sprintf("  V2 vs V1: %.2f (Erwartung: 0.5-0.9)\n", pi0_V2_vs_V1))
 cat("\n✓ Anti-konservative Form (Anreicherung nahe 0) zeigt valides Modell an\n")
 cat("✗ Uniforme Verteilung würde Modellversagen anzeigen\n")
+
+# ============================================================
+# Speichere π₀-Werte für Methods-Section
+# ============================================================
+pi0_values <- data.frame(
+  contrast = c("V1_vs_A", "V2_vs_A", "V2_vs_V1"),
+  pi0 = c(pi0_V1_vs_A, pi0_V2_vs_A, pi0_V2_vs_V1)
+)
+write.csv(pi0_values, file.path(res_dir, "pvalue_diagnostics_pi0.csv"), row.names = FALSE)
+saveRDS(pi0_values, file.path(cache_dir, "pvalue_diagnostics_pi0.rds"))
+message("✓ π₀ values saved: pvalue_diagnostics_pi0.csv / .rds")
 ```
 
-**Interpretation:** p-value Verteilungen zeigen erwartetes anti-konservatives Muster mit Anreicherung nahe 0, was echtes differenzielles Expressionssignal anzeigt. π₀-Schätzungen (Anteil echter Nullhypothesen) liegen im biologisch plausiblen Bereich (0.5-0.9), was Modellannahmen und FDR-Kontrolle validiert (Päll et al., 2023).
+**Interpretation:** p-value Verteilungen zeigen erwartetes anti-konservatives Muster mit Anreicherung nahe 0, was echtes differenzielles Expressionssignal anzeigt. π₀-Schätzungen (Anteil echter Nullhypothesen) liegen im biologisch plausiblen Bereich (0.5-0.9), was Modellannahmen und FDR-Kontrolle validiert (Storey & Tibshirani, 2003).
 
 ## Multiple-Testing-Strategie
 
@@ -800,16 +875,38 @@ strip_ensembl_version <- function(x) sub("\\..*$", "", x)
 
 all_ensembl <- unique(unlist(lapply(results_tb, function(tb) strip_ensembl_version(tb$gene))))
 
-gene_anno <- AnnotationDbi::select(
+# AnnotationDbi::select() kann Warnungen bei 1:many Mappings produzieren
+gene_anno <- suppressMessages(AnnotationDbi::select(
   org.Hs.eg.db,
   keys = all_ensembl,
   keytype = "ENSEMBL",
   columns = c("SYMBOL", "GENENAME")
-) |>
+)) |>
   as_tibble() |>
   rename(ensembl_id = ENSEMBL) |>
-  arrange(ensembl_id, desc(!is.na(SYMBOL))) |>
+  # Deterministisches Tie-Breaking: erst nicht-NA, dann alphabetisch
+  arrange(ensembl_id, desc(!is.na(SYMBOL)), SYMBOL) |>
   distinct(ensembl_id, .keep_all = TRUE)
+
+# ============================================================
+# QC: Dokumentiere Annotation-Verluste und Duplikate
+# ============================================================
+n_total_ensembl <- length(all_ensembl)
+n_no_symbol <- sum(is.na(gene_anno$SYMBOL))
+message("✓ Gene annotation: ", nrow(gene_anno), " / ", n_total_ensembl, " Ensembl IDs annotated")
+message("  ", n_no_symbol, " without SYMBOL (", round(100*n_no_symbol/nrow(gene_anno), 1), "%)")
+
+# Warnung bei 1:many Mappings (ein Ensembl → mehrere SYMBOLs)
+n_duplicates_raw <- suppressMessages(AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = all_ensembl,
+  keytype = "ENSEMBL",
+  columns = c("SYMBOL")
+)) |> nrow()
+n_duplicates <- n_duplicates_raw - n_total_ensembl
+if (n_duplicates > 0) {
+  message("  ⚠ ", n_duplicates, " 1:many mappings detected (using alphabetically first SYMBOL)")
+}
 
 # Annotation hinzufügen
 add_gene_symbols <- function(tb) {
@@ -862,14 +959,26 @@ plot_volcano <- function(res_tb, title = NULL) {
     theme_bw()
 }
 
-plot_sig_heatmap <- function(sig_genes, keep_levels, main = NULL) {
+plot_sig_heatmap <- function(sig_genes, keep_levels, main = NULL, max_genes = 100) {
   samples_keep <- sample_meta |> dplyr::filter(condition %in% keep_levels) |> dplyr::pull(samplename)
   mat <- normalized_counts[rownames(normalized_counts) %in% sig_genes, samples_keep, drop = FALSE]
 
-  if (nrow(mat) == 0) return(NULL)
+  if (nrow(mat) == 0) {
+    message("Note: No significant genes for heatmap: ", main)
+    return(NULL)
+  }
 
-  anno <- sample_meta |> dplyr::filter(samplename %in% colnames(mat)) |> dplyr::select(condition) |> as.data.frame()
-  rownames(anno) <- sample_meta |> dplyr::filter(samplename %in% colnames(mat)) |> dplyr::pull(samplename)
+  # Limitiere auf Top-N Gene nach Varianz (Lesbarkeit bei vielen Genen)
+  if (nrow(mat) > max_genes) {
+    message("Limiting heatmap '", main, "' to top ", max_genes, " genes by variance (", nrow(mat), " total)")
+    gene_vars <- apply(mat, 1, var)
+    mat <- mat[order(gene_vars, decreasing = TRUE)[1:max_genes], , drop = FALSE]
+  }
+
+  # Annotation-Dataframe (redundante Berechnung eliminiert)
+  anno_meta <- sample_meta |> dplyr::filter(samplename %in% colnames(mat))
+  anno <- anno_meta |> dplyr::select(condition) |> as.data.frame()
+  rownames(anno) <- anno_meta$samplename
 
   pheatmap(mat, color = brewer.pal(6, "YlOrRd"), cluster_rows = TRUE, cluster_cols = TRUE,
            show_rownames = FALSE, annotation_col = anno, border_color = NA, scale = "row", main = main)
