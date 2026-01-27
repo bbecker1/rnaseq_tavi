@@ -1024,6 +1024,13 @@ Likelihood Ratio Test für den globalen Timepoint-Effekt (Full: `~ pid + timepoi
 #| echo: false
 #| warning: false
 
+# Input-Validierung: Prüfe, ob dds und padj_cutoff aus Wald-Chunk vorhanden sind
+if (!exists("dds")) stop("dds-Objekt nicht gefunden. Wald-Chunk muss vorher laufen.")
+if (!exists("padj_cutoff")) stop("padj_cutoff nicht definiert. Setup-Chunk fehlt.")
+if (!all(c("pid", "timepoint") %in% colnames(colData(dds)))) {
+  stop("dds-colData fehlt 'pid' oder 'timepoint'. Design-Modell fehlerhaft.")
+}
+
 # Cache-Pfade für LRT
 dds_lrt_cache_file <- file.path(cache_dir, "dds_DESeq_LRT_fitted.rds")
 res_lrt_rds        <- file.path(cache_dir, "DESeq2_results_LRT_timepoint.rds")
@@ -1035,22 +1042,95 @@ if (file.exists(dds_lrt_cache_file)) {
   dds_lrt <- readRDS(dds_lrt_cache_file)
 } else {
   message("Berechne DESeq2 LRT…")
+
+  # Kopiere dds-Objekt (bereits Wald-fitted, wird für LRT re-fitted)
+  # Wichtig: Verwende IDENTISCHES Gen-Set wie Wald-Analyse für faire Vergleiche
   dds_lrt <- dds
-  colData(dds_lrt)$timepoint <- factor(colData(dds_lrt)$timepoint, levels = c("A", "V1", "V2"))
-  design(dds_lrt) <- ~ pid + timepoint
-  dds_lrt <- dds_lrt[rowSums(counts(dds_lrt)) >= 10, ]
+
+  # Design und Factor-Levels sollten bereits korrekt sein (aus Wald-Chunk)
+  # Re-leveling nur falls nötig (defensive Prüfung)
+  if (!identical(levels(colData(dds_lrt)$timepoint), c("A", "V1", "V2"))) {
+    message("  Re-leveling timepoint factor für LRT")
+    colData(dds_lrt)$timepoint <- factor(colData(dds_lrt)$timepoint, levels = c("A", "V1", "V2"))
+  }
+
+  # KEIN erneutes Prefiltering - verwende identisches Gen-Set wie Wald
+  # (Prefiltering wurde bereits vor Wald-Analyse durchgeführt)
+
+  # LRT-Fitting: Full model ~ pid + timepoint vs. Reduced model ~ pid
   dds_lrt <- DESeq(dds_lrt, test = "LRT", reduced = ~ pid)
   saveRDS(dds_lrt, dds_lrt_cache_file)
+
+  # Validiere Gen-Set-Konsistenz
+  if (!identical(rownames(dds), rownames(dds_lrt))) {
+    warning("LRT und Wald haben unterschiedliche Gene - Overlap-Analyse könnte verzerrt sein!")
+  }
 }
 
 # LRT-Results laden oder berechnen (nutzt load_or_compute aus Wald-Chunk)
 res_lrt <- load_or_compute(
   rds_path = res_lrt_rds,
   csv_path = res_lrt_csv,
-  compute_fn = function() results(dds_lrt, alpha = 0.05)
+  compute_fn = function() results(dds_lrt, alpha = padj_cutoff)
 )
 
 summary(res_lrt)
+
+# Zusätzliche QC-Metriken für LRT
+n_sig_lrt <- sum(res_lrt$padj < padj_cutoff, na.rm = TRUE)
+n_total_lrt <- sum(!is.na(res_lrt$padj))
+message("LRT signifikante Gene (padj < ", padj_cutoff, "): ", n_sig_lrt, " / ", n_total_lrt,
+        " (", round(100 * n_sig_lrt / n_total_lrt, 1), "%)")
+
+# p-value Histogram für LRT (Model-QC)
+pvals_lrt <- res_lrt$pvalue[!is.na(res_lrt$pvalue)]
+hist(pvals_lrt, breaks = 50, col = "lightblue", border = "white",
+     main = "LRT p-value Distribution (QC)", xlab = "p-value", ylab = "Frequency")
+abline(h = length(pvals_lrt) / 50, col = "red", lty = 2, lwd = 2)
+
+# π₀-Schätzung (Proportion of true null hypotheses)
+# WICHTIG: Nach independent filtering (10k+ Gene entfernt) ist π₀ schwer zu interpretieren
+# → Fokus auf robuste BH-FDR-kontrollierten Signifikanzen (Bourgon et al., 2010)
+
+pi0_lrt <- tryCatch({
+  qobj_lrt <- qvalue::qvalue(pvals_lrt)
+  qobj_lrt$pi0
+}, error = function(e) {
+  message("qvalue::qvalue() fehlgeschlagen: ", e$message)
+  NA
+})
+
+sig_rate_lrt <- n_sig_lrt / n_total_lrt
+
+# Diagnose: π₀ nach independent filtering oft unzuverlässig
+if (!is.na(pi0_lrt)) {
+  message("LRT π₀ (Storey bootstrap) = ", round(pi0_lrt, 3))
+
+  # Widerspruch zwischen π₀ und Signifikanzrate?
+  expected_sig_rate <- 1 - pi0_lrt
+  if (abs(expected_sig_rate - sig_rate_lrt) > 0.2) {
+    n_filtered <- sum(is.na(res_lrt$padj)) - sum(is.na(res_lrt$pvalue))
+    message("⚠️  HINWEIS: π₀-Schätzung inkonsistent mit Signifikanzrate")
+    message("    Independent filtering (", n_filtered, " Gene entfernt) verändert p-value-Verteilung")
+    message("    → π₀-Interpretation schwierig; BH-FDR (", round(sig_rate_lrt * 100, 1),
+            "% signifikant) ist robust")
+  } else {
+    message("    → ca. ", round((1 - pi0_lrt) * 100, 1),
+            "% der Gene zeigen zeitliche Effekte")
+  }
+} else {
+  message("π₀-Schätzung nicht verfügbar")
+}
+
+# Robuste Interpretation basierend auf Signifikanzrate (unabhängig von π₀)
+if (sig_rate_lrt > 0.3) {
+  message("✓ Starke globale zeitliche Effekte (", round(sig_rate_lrt * 100, 1),
+          "% Gene padj < ", padj_cutoff, ")")
+} else if (sig_rate_lrt > 0.1) {
+  message("✓ Moderate zeitliche Effekte (", round(sig_rate_lrt * 100, 1), "% signifikant)")
+} else {
+  message("! Schwache zeitliche Effekte - prüfe Modell-Fit")
+}
 ```
 
 ## LRT-Ergebnisse Visualisierung
@@ -1061,6 +1141,12 @@ Weiterverarbeitung der LRT-Ergebnisse: Annotation mit SYMBOL/GENENAME, Filterung
 #| label: lrt-visualization
 #| echo: false
 #| warning: false
+
+# Input-Validierung
+if (!exists("res_lrt")) stop("res_lrt nicht gefunden. LRT-Chunk muss vorher laufen.")
+if (!exists("gene_anno")) stop("gene_anno nicht gefunden. Setup-Chunk fehlt.")
+if (!exists("normalized_counts")) stop("normalized_counts nicht gefunden.")
+if (!exists("sample_meta")) stop("sample_meta nicht gefunden.")
 
 # LRT-Results -> Tibble mit Annotation
 res_lrt_tb <- res_lrt |>
@@ -1075,7 +1161,9 @@ new_ids <- setdiff(lrt_ensembl_ids, gene_anno$ensembl_id)
 
 if (length(new_ids) > 0) {
   new_anno <- AnnotationDbi::select(
-    org.Hs.eg.db, keys = new_ids, keytype = "ENSEMBL", columns = c("SYMBOL", "GENENAME")
+    org.Hs.eg.db, keys = new_ids, keytype = "ENSEMBL",
+    columns = c("SYMBOL", "GENENAME"),
+    multiVals = "first"  # Deterministisch: erste Annotation bei 1:many mappings
   ) |> as_tibble() |> rename(ensembl_id = ENSEMBL) |>
     arrange(ensembl_id, desc(!is.na(SYMBOL))) |>
     distinct(ensembl_id, .keep_all = TRUE)
@@ -1084,29 +1172,69 @@ if (length(new_ids) > 0) {
 
 res_lrt_annot <- res_lrt_tb |> left_join(gene_anno, by = "ensembl_id")
 
-# Signifikante LRT-Gene (Top 200)
-n_heatmap <- 200
+# Signifikante LRT-Gene filtern
+# Top 100 nach padj (Balance zwischen Interpretierbarkeit und Coverage)
+# Bei typischen Figure-Größen sind >100 Gene in Heatmaps unleserlich
+n_heatmap <- 100
 sig_lrt <- res_lrt_annot |>
   dplyr::filter(!is.na(padj), padj < padj_cutoff) |>
   arrange(padj) |>
   slice_head(n = n_heatmap)
 
-sig_lrt |> dplyr::select(gene, ensembl_id, SYMBOL, GENENAME, pvalue, padj) |> slice_head(n = 20)
+# QC: Anzahl signifikante Gene
+n_sig_total <- sum(!is.na(res_lrt_annot$padj) & res_lrt_annot$padj < padj_cutoff)
+message("LRT Heatmap: ", nrow(sig_lrt), " Gene (von ", n_sig_total, " signifikanten, max ", n_heatmap, ")")
 
-# Heatmap der LRT-signifikanten Gene
-mat_lrt <- normalized_counts[
-  strip_ensembl_version(rownames(normalized_counts)) %in% sig_lrt$ensembl_id, , drop = FALSE
-]
-rownames(mat_lrt) <- strip_ensembl_version(rownames(mat_lrt))
-mat_lrt <- mat_lrt[intersect(sig_lrt$ensembl_id, rownames(mat_lrt)), , drop = FALSE]
+if (nrow(sig_lrt) == 0) {
+  message("⚠️  Keine signifikanten LRT-Gene für Heatmap - Skip Visualisierung")
+} else {
+  sig_lrt |> dplyr::select(gene, ensembl_id, SYMBOL, GENENAME, pvalue, padj) |> slice_head(n = 20)
+}
 
-annotation_col <- sample_meta |> dplyr::select(samplename, condition) |> as.data.frame()
-rownames(annotation_col) <- annotation_col$samplename
-annotation_col$samplename <- NULL
+# Heatmap der LRT-signifikanten Gene (nur wenn Gene vorhanden)
+if (nrow(sig_lrt) > 0) {
+  # Matrix für Heatmap erstellen (gefiltert nach sig_lrt)
+  mat_lrt <- normalized_counts[
+    strip_ensembl_version(rownames(normalized_counts)) %in% sig_lrt$ensembl_id, , drop = FALSE
+  ]
+  rownames(mat_lrt) <- strip_ensembl_version(rownames(mat_lrt))
+  # Re-order nach sig_lrt (sortiert nach padj)
+  mat_lrt <- mat_lrt[sig_lrt$ensembl_id[sig_lrt$ensembl_id %in% rownames(mat_lrt)], , drop = FALSE]
 
-pheatmap(mat_lrt, color = brewer.pal(6, "YlOrRd"), cluster_rows = TRUE, cluster_cols = TRUE,
-         show_rownames = FALSE, annotation_col = annotation_col, border_color = NA,
-         fontsize = 10, scale = "row", main = paste0("LRT signifikante Gene (padj < ", padj_cutoff, ")"))
+  # Sample-Annotation für Heatmap (condition = Zeitpunkt)
+  annotation_col <- sample_meta |> dplyr::select(condition) |> as.data.frame()
+  rownames(annotation_col) <- sample_meta$samplename
+
+  # Smooth color palette (100 bins statt 6)
+  heatmap_colors <- colorRampPalette(brewer.pal(9, "YlOrRd"))(100)
+
+  # Erstelle Heatmap EINMAL (pheatmap-Objekt)
+  # silent = TRUE verhindert auto-plot, wir zeichnen manuell
+  p_lrt_heatmap <- pheatmap(mat_lrt, color = heatmap_colors, cluster_rows = TRUE, cluster_cols = TRUE,
+                            show_rownames = FALSE, annotation_col = annotation_col, border_color = NA,
+                            fontsize = 10, scale = "row",
+                            main = paste0("LRT signifikante Gene (top ", nrow(sig_lrt), ", padj < ", padj_cutoff, ")"),
+                            silent = TRUE)
+
+  # Display in Console/HTML (für Quarto-Output)
+  grid::grid.newpage()
+  grid::grid.draw(p_lrt_heatmap$gtable)
+
+  # Save als publication-grade PNG
+  # Prüfe ob fig_dir existiert, falls nicht: erstelle es oder nutze res_dir
+  if (!exists("fig_dir")) {
+    fig_dir_lrt <- file.path(res_dir, "figures")
+    dir.create(fig_dir_lrt, recursive = TRUE, showWarnings = FALSE)
+  } else {
+    fig_dir_lrt <- fig_dir
+  }
+
+  heatmap_file <- file.path(fig_dir_lrt, paste0("LRT_heatmap_top", nrow(sig_lrt), ".png"))
+  png(heatmap_file, width = 10, height = 12, units = "in", res = 300)
+  grid::grid.draw(p_lrt_heatmap$gtable)
+  dev.off()
+  message("LRT Heatmap gespeichert: ", heatmap_file)
+}
 ```
 
 ## Wald vs. LRT Overlap
@@ -1118,8 +1246,17 @@ Berechnung des Overlaps zwischen LRT-signifikanten Genen (global) und Wald-signi
 #| echo: false
 #| warning: false
 
-# LRT-Gene (bereits mit ensembl_id)
-genes_lrt <- unique(sig_lrt$ensembl_id)
+# Input-Validierung
+if (!exists("sig_results")) stop("sig_results nicht gefunden. Wald-Chunk muss vorher laufen.")
+if (!exists("res_lrt_annot")) stop("res_lrt_annot nicht gefunden. LRT-Chunk fehlt.")
+if (!exists("padj_cutoff")) stop("padj_cutoff nicht definiert.")
+
+# LRT-Gene: ALLE signifikanten (nicht nur Top 100 aus sig_lrt!)
+# Wichtig: Für faire Overlap-Analyse müssen komplette Sets verglichen werden
+genes_lrt <- res_lrt_annot |>
+  dplyr::filter(!is.na(padj), padj < padj_cutoff) |>
+  dplyr::pull(ensembl_id) |>
+  unique()
 
 # Wald-Gene pro Kontrast (nutzt sig_results Liste)
 genes_wald <- lapply(sig_results, function(sig) {
@@ -1132,6 +1269,11 @@ overlap_genes <- lapply(genes_wald, function(g) intersect(genes_lrt, g))
 overlap_genes_any_wald <- intersect(genes_lrt, genes_wald_any)
 genes_lrt_only  <- setdiff(genes_lrt, genes_wald_any)
 genes_wald_only <- setdiff(genes_wald_any, genes_lrt)
+
+# QC: Log Overlap-Statistik
+message("Overlap-Analyse: ", length(genes_lrt), " LRT-Gene vs. ", length(genes_wald_any), " Wald-Gene")
+message("  Overlap (LRT ∩ any Wald): ", length(overlap_genes_any_wald),
+        " (", round(100 * length(overlap_genes_any_wald) / length(genes_lrt), 1), "% der LRT-Gene)")
 
 # Zusammenfassung
 overlap_summary <- tibble(
@@ -1169,29 +1311,69 @@ Heatmap der Wald∩LRT-Overlap-Gene (robuste Kandidaten). Diese Gene ändern sic
 #| echo: false
 #| warning: false
 
-# Matrix für Overlap-Gene
-mat_overlap <- normalized_counts[
-  strip_ensembl_version(rownames(normalized_counts)) %in% overlap_genes_any_wald, , drop = FALSE
-]
-rownames(mat_overlap) <- strip_ensembl_version(rownames(mat_overlap))
-mat_overlap <- mat_overlap[intersect(overlap_genes_any_wald, rownames(mat_overlap)), , drop = FALSE]
+# Input-Validierung
+if (!exists("overlap_genes_any_wald")) stop("overlap_genes_any_wald nicht gefunden. Overlap-Chunk muss vorher laufen.")
+if (!exists("normalized_counts")) stop("normalized_counts nicht gefunden.")
+if (!exists("n_heatmap")) n_heatmap <- 100  # Fallback
 
-# Auf max 200 Gene begrenzen
-if (nrow(mat_overlap) > n_heatmap) {
-  mat_overlap <- mat_overlap[seq_len(n_heatmap), , drop = FALSE]
+# Overlap-Gene nach LRT-padj sortieren (zeigt signifikanteste zuerst)
+overlap_sorted <- res_lrt_annot |>
+  dplyr::filter(ensembl_id %in% overlap_genes_any_wald) |>
+  arrange(padj) |>
+  dplyr::pull(ensembl_id)
+
+# Limitiere auf max n_heatmap Gene (Top nach padj)
+n_overlap_display <- min(n_heatmap, length(overlap_sorted))
+overlap_to_plot <- overlap_sorted[1:n_overlap_display]
+
+message("Overlap Heatmap: ", n_overlap_display, " Gene (von ", length(overlap_genes_any_wald),
+        " Overlap-Genen, max ", n_heatmap, ")")
+
+# Matrix für Heatmap erstellen und plotten (nur wenn Gene vorhanden)
+if (n_overlap_display > 0) {
+  mat_overlap <- normalized_counts[
+    strip_ensembl_version(rownames(normalized_counts)) %in% overlap_to_plot, , drop = FALSE
+  ]
+  rownames(mat_overlap) <- strip_ensembl_version(rownames(mat_overlap))
+  # Re-order nach overlap_sorted (sortiert nach padj)
+  mat_overlap <- mat_overlap[overlap_to_plot[overlap_to_plot %in% rownames(mat_overlap)], , drop = FALSE]
+
+  # Sample-Annotation für Heatmap (condition = Zeitpunkt)
+  annotation_col_overlap <- sample_meta |> dplyr::select(condition) |> as.data.frame()
+  rownames(annotation_col_overlap) <- sample_meta$samplename
+
+  # Smooth color palette (100 bins)
+  heatmap_colors <- colorRampPalette(brewer.pal(9, "YlOrRd"))(100)
+
+  # Erstelle Heatmap EINMAL (pheatmap-Objekt)
+  # silent = TRUE verhindert auto-plot, wir zeichnen manuell
+  p_overlap_heatmap <- pheatmap(mat_overlap, color = heatmap_colors,
+                                cluster_rows = TRUE, cluster_cols = TRUE,
+                                show_rownames = FALSE, annotation_col = annotation_col_overlap,
+                                border_color = NA, fontsize = 10, scale = "row",
+                                main = paste0("Overlap-Heatmap (LRT ∩ Wald), n = ", nrow(mat_overlap)),
+                                silent = TRUE)
+
+  # Display in Console/HTML (für Quarto-Output)
+  grid::grid.newpage()
+  grid::grid.draw(p_overlap_heatmap$gtable)
+
+  # Save als publication-grade PNG
+  if (!exists("fig_dir")) {
+    fig_dir_overlap <- file.path(res_dir, "figures")
+    dir.create(fig_dir_overlap, recursive = TRUE, showWarnings = FALSE)
+  } else {
+    fig_dir_overlap <- fig_dir
+  }
+
+  overlap_heatmap_file <- file.path(fig_dir_overlap, paste0("Overlap_heatmap_n", nrow(mat_overlap), ".png"))
+  png(overlap_heatmap_file, width = 10, height = 12, units = "in", res = 300)
+  grid::grid.draw(p_overlap_heatmap$gtable)
+  dev.off()
+  message("Overlap Heatmap gespeichert: ", overlap_heatmap_file)
+} else {
+  message("⚠️  Keine Overlap-Gene für Heatmap - Skip Visualisierung")
 }
-
-# Annotation (nutzt annotation_col aus lrt-visualization falls vorhanden)
-if (!exists("annotation_col")) {
-  annotation_col <- sample_meta |> dplyr::select(samplename, condition) |> as.data.frame()
-  rownames(annotation_col) <- annotation_col$samplename
-  annotation_col$samplename <- NULL
-}
-
-pheatmap(mat_overlap, color = brewer.pal(6, "YlOrRd"), cluster_rows = TRUE, cluster_cols = TRUE,
-         show_rownames = FALSE, annotation_col = annotation_col, border_color = NA,
-         fontsize = 10, scale = "row",
-         main = paste0("Overlap-Heatmap (LRT ∩ Wald), n = ", nrow(mat_overlap)))
 ```
 
 ## Pattern-Clustering (DEGreport)
@@ -1205,40 +1387,85 @@ Clustering der Wald∩LRT-Overlap-Gene nach zeitlichem Expressionsmuster mittels
 #| fig-width: 10
 #| fig-height: 6
 
-# Metadaten für degPatterns (data.frame mit rownames = Sample-Namen)
+# Input-Validierung
+if (!exists("mat_overlap")) stop("mat_overlap nicht gefunden. Overlap-Chunk muss vorher laufen.")
+if (!exists("sample_meta")) stop("sample_meta nicht gefunden.")
+if (!exists("cache_dir")) stop("cache_dir nicht gefunden.")
+if (!exists("res_lrt_annot")) stop("res_lrt_annot nicht gefunden (für padj-Sortierung).")
+
+# Metadaten für degPatterns: Nur Samples die in mat_overlap vorhanden sind
+# (mat_overlap basiert auf normalized_counts, könnte gefilterte Samples nicht enthalten)
+samples_in_overlap <- colnames(mat_overlap)
+
+# Filter sample_meta auf verfügbare Samples
+meta_deg <- sample_meta |>
+  dplyr::filter(samplename %in% samples_in_overlap) |>
+  dplyr::select(samplename, timepoint) |>
+  as.data.frame()
+rownames(meta_deg) <- meta_deg$samplename
+
+# Konvertiere zu degPatterns-Format (nur timepoint-Spalte, rownames = Samples)
 meta_deg <- data.frame(
-  condition = droplevels(meta$timepoint),
-  row.names = rownames(meta)
+  condition = droplevels(meta_deg$timepoint),
+  row.names = rownames(meta_deg)
 )
 
-# mat_overlap aus vorherigem Chunk wiederverwenden, Spalten an Metadaten anpassen
+# mat_overlap Spalten an Metadaten anpassen (sollte jetzt passen)
 mat_pattern <- mat_overlap[, rownames(meta_deg), drop = FALSE]
 
+# Validierung
+if (ncol(mat_pattern) != nrow(meta_deg)) {
+  stop("Sample-Mismatch: mat_pattern hat ", ncol(mat_pattern), " Samples, meta_deg hat ", nrow(meta_deg))
+}
+message("Pattern-Clustering: ", ncol(mat_pattern), " Samples × ", nrow(mat_pattern), " Gene")
+
 # Auf max. 500 Gene begrenzen (degPatterns-Performance)
+# Top-Gene nach LRT-padj (signifikanteste zuerst)
 n_pattern_max <- 500
 if (nrow(mat_pattern) > n_pattern_max) {
-  mat_pattern <- mat_pattern[seq_len(n_pattern_max), , drop = FALSE]
+  # Sortiere Gene nach LRT-padj
+  pattern_ids <- rownames(mat_pattern)
+  pattern_sorted <- res_lrt_annot |>
+    dplyr::filter(ensembl_id %in% pattern_ids) |>
+    arrange(padj) |>
+    dplyr::pull(ensembl_id)
+
+  # Nimm Top n_pattern_max
+  mat_pattern <- mat_pattern[pattern_sorted[1:n_pattern_max], , drop = FALSE]
+  message("Pattern-Clustering: Top ", n_pattern_max, " Gene (sortiert nach LRT-padj)")
+} else {
+  message("Pattern-Clustering: Alle ", nrow(mat_pattern), " Overlap-Gene verwendet")
 }
 
-# Output-Verzeichnisse
-fig_dir <- "../../res/figures"
-dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+# Output-Verzeichnis (falls noch nicht definiert)
+if (!exists("fig_dir")) {
+  fig_dir <- "../../res/figures"
+  dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+}
 
 # degPatterns mit Caching
 cache_degpatterns <- file.path(cache_dir, "degPatterns_overlap.rds")
 
 if (file.exists(cache_degpatterns)) {
+  message("Lade cached degPatterns: ", cache_degpatterns)
   deg_clusters <- readRDS(cache_degpatterns)
 } else {
+  message("Berechne degPatterns (kann einige Minuten dauern)...")
   deg_clusters <- degPatterns(
     mat_pattern,
     metadata = meta_deg,
     time = "condition",
-    minc = 30,
+    minc = 30,  # Minimum 30 Gene pro Cluster (robust gegen noise, filtert sehr kleine Cluster)
     plot = FALSE
   )
   saveRDS(deg_clusters, cache_degpatterns)
+  message("degPatterns cached: ", cache_degpatterns)
 }
+
+# QC: Anzahl Cluster und Gene
+n_clusters <- length(unique(deg_clusters$df$cluster))
+n_genes_clustered <- nrow(deg_clusters$df)
+message("degPatterns: ", n_clusters, " Cluster mit ", n_genes_clustered, " Genen")
 
 # Publikationsreifer Plot
 p_pattern <- deg_clusters$plot +
@@ -1270,9 +1497,17 @@ Führt GO und KEGG Over-Representation Analysis durch für alle Kontraste (Wald 
 #| echo: false
 #| warning: false
 
+# Input-Validierung
+if (!exists("res_V1_vs_A_tb")) stop("res_V1_vs_A_tb nicht gefunden. Wald-Chunk muss vorher laufen.")
+if (!exists("res_V2_vs_A_tb")) stop("res_V2_vs_A_tb nicht gefunden. Wald-Chunk muss vorher laufen.")
+if (!exists("res_V2_vs_V1_tb")) stop("res_V2_vs_V1_tb nicht gefunden. Wald-Chunk muss vorher laufen.")
+if (!exists("res_lrt") && !exists("res_lrt_tb")) {
+  stop("Weder res_lrt noch res_lrt_tb gefunden. LRT-Chunk muss vorher laufen.")
+}
+
 # --- Settings ---
 if (!exists("padj_cutoff")) padj_cutoff <- 0.05
-lfc_min <- 0.5
+if (!exists("lfc_min")) lfc_min <- 0.5
 
 go_out_dir   <- "../../res/functional/ora_go"
 kegg_out_dir <- "../../res/functional/ora_kegg"
@@ -1396,7 +1631,7 @@ fmt2 <- function(x) format(x, nsmall = 2)
         set = set_label, ontology = if (type == "GO") ont else NA_character_,
         direction = dir, padj_cutoff = padj_cutoff,
         lfc_min = if (has_lfc) lfc_min else NA_real_,
-        n_sig = n_sig %||% NA_integer_,
+        n_sig = if (is.null(n_sig) || is.na(n_sig)) NA_integer_ else n_sig,
         n_terms = if (!is.null(tab) && nrow(tab) > 0) nrow(tab) else 0L,
         top_term = if (!is.null(tab) && nrow(tab) > 0) tab$Description[1] else NA_character_,
         top_padj = if (!is.null(tab) && nrow(tab) > 0) tab$p.adjust[1] else NA_real_
@@ -1426,7 +1661,14 @@ go_results   <- purrr::map_dfr(contrasts, ~run_go_ora(.x$res, .x$label))
 kegg_results <- purrr::map_dfr(contrasts, ~run_kegg_ora(.x$res, .x$label))
 
 # LRT (kein LFC-Filter)
-lrt_input <- if (exists("res_lrt_tb")) res_lrt_tb else res_lrt
+if (exists("res_lrt_tb")) {
+  lrt_input <- res_lrt_tb
+} else {
+  message("⚠️  res_lrt_tb nicht gefunden, verwende res_lrt (DESeqResults-Objekt)")
+  if (!exists("res_lrt")) stop("Weder res_lrt_tb noch res_lrt gefunden. LRT-Chunk fehlt.")
+  lrt_input <- res_lrt
+}
+
 go_lrt   <- .run_ora_set(lrt_input, "LRT_timepoint", padj_cutoff, 0, go_out_dir, "GO", c("BP","MF","CC"), "all")
 kegg_lrt <- .run_ora_set(lrt_input, "LRT_timepoint", padj_cutoff, 0, kegg_out_dir, "KEGG", "KEGG", "all", kegg_organism)
 
@@ -1492,6 +1734,10 @@ make_ranked_list <- function(res) {
   tb |>
     dplyr::filter(!is.na(stat)) |>
     dplyr::mutate(ens = sub("\\..*$", "", gene)) |>
+    # Bei Duplikaten (multiple transcripts per gene): nimm höchste |stat|
+    dplyr::group_by(ens) |>
+    dplyr::slice_max(abs(stat), n = 1, with_ties = FALSE) |>
+    dplyr::ungroup() |>
     dplyr::select(ens, stat) |>
     dplyr::arrange(desc(stat)) |>
     tibble::deframe()
@@ -1511,6 +1757,12 @@ run_gsea <- function(ranked, label) {
 
   message("⏳ GSEA: ", label, " (", length(ranked), " Gene)")
 
+  # Validierung: Warnung bei zu kurzem Ranking
+  if (length(ranked) < 100) {
+    warning(sprintf("GSEA %s: Kurzes Ranking (%d Gene) kann unstabil sein",
+                    label, length(ranked)))
+  }
+
   res <- tryCatch(
     clusterProfiler::gseGO(
       geneList     = ranked,
@@ -1519,6 +1771,7 @@ run_gsea <- function(ranked, label) {
       ont          = gsea_ont,
       minGSSize    = gsea_minGS,
       maxGSSize    = gsea_maxGS,
+      exponent     = 1,           # Weighted ES (Subramanian 2005 standard)
       pvalueCutoff = gsea_pval,
       pAdjustMethod = "BH",
       verbose      = FALSE
@@ -1546,9 +1799,10 @@ gsea_barplot <- function(gsea, title) {
       theme_void() + ggtitle(title))
   }
 
-  as.data.frame(gsea) |>
+  df <- as.data.frame(gsea)
+  df |>
     dplyr::arrange(p.adjust) |>
-    dplyr::slice_head(n = n_plot) |>
+    dplyr::slice_head(n = min(n_plot, nrow(df))) |>
     dplyr::mutate(
       Direction = factor(ifelse(NES > 0, "Activated", "Suppressed"),
                          levels = c("Activated", "Suppressed")),
@@ -1639,6 +1893,10 @@ Erstellt Visualisierungen (Dotplots, Emapplots, Cnetplots) aus gecachten ORA-Erg
 #| warning: false
 
 # --- Settings (nutzt Variablen aus go-kegg-ora) ---
+if (!exists("go_out_dir") || !exists("kegg_out_dir")) {
+  stop("go_out_dir/kegg_out_dir nicht gefunden. Chunk 'go-kegg-ora' muss vorher laufen.")
+}
+
 go_plots_dir   <- file.path(go_out_dir, "plots")
 kegg_plots_dir <- file.path(kegg_out_dir, "plots")
 dir.create(go_plots_dir, recursive = TRUE, showWarnings = FALSE)
@@ -1657,7 +1915,10 @@ go_ontologies <- c("BP")
 
 .get_termsim <- function(obj, cache_path) {
   if (file.exists(cache_path)) return(readRDS(cache_path))
-  ts <- tryCatch(enrichplot::pairwise_termsim(obj), error = \(e) NULL)
+  ts <- tryCatch(
+    enrichplot::pairwise_termsim(obj),
+    error = \(e) { message("⚠️  Termsim failed: ", e$message); NULL }
+  )
   if (!is.null(ts)) saveRDS(ts, cache_path)
   ts
 }
@@ -1683,11 +1944,20 @@ go_ontologies <- c("BP")
   if (to_entrez) {
     map <- suppressMessages(clusterProfiler::bitr(unique(sig$ensembl_id), "ENSEMBL", "ENTREZID", org.Hs.eg.db))
     sig <- dplyr::inner_join(sig, map, by = c("ensembl_id" = "ENSEMBL"))
-    fc <- setNames(sig$log2FoldChange, sig$ENTREZID)
+    # Bei Duplikaten (1:many mapping): nimm Gen mit höchster |LFC|
+    sig_dedup <- sig |>
+      dplyr::group_by(ENTREZID) |>
+      dplyr::slice_max(abs(log2FoldChange), n = 1, with_ties = FALSE) |>
+      dplyr::ungroup()
+    fc <- setNames(sig_dedup$log2FoldChange, sig_dedup$ENTREZID)
   } else {
-    fc <- setNames(sig$log2FoldChange, sig$ensembl_id)
+    sig_dedup <- sig |>
+      dplyr::group_by(ensembl_id) |>
+      dplyr::slice_max(abs(log2FoldChange), n = 1, with_ties = FALSE) |>
+      dplyr::ungroup()
+    fc <- setNames(sig_dedup$log2FoldChange, sig_dedup$ensembl_id)
   }
-  fc[!duplicated(names(fc))]
+  fc
 }
 
 .make_dotplot <- function(obj, title) {
@@ -1766,7 +2036,7 @@ contrasts <- list(
 purrr::walk(contrasts, \(x) .plot_ora(x$label, x$res, "GO", go_ontologies))
 purrr::walk(contrasts, \(x) .plot_ora(x$label, x$res, "KEGG"))
 
-# LRT (kein FC)
+# LRT (kein FC → keine Cnetplots, nur Dot-/Emapplots)
 lrt_input <- if (exists("res_lrt_tb")) res_lrt_tb else res_lrt
 .plot_ora("LRT_timepoint", NULL, "GO", go_ontologies, "all")
 .plot_ora("LRT_timepoint", NULL, "KEGG", directions = "all")
@@ -1824,7 +2094,10 @@ story_dotplot <- function(obj, title, subtitle, accent_color, n_cat = 8) {
     dplyr::slice_head(n = n_cat) |>
     dplyr::mutate(Description = stringr::str_wrap(Description, 40),
                   Description = factor(Description, rev(Description)),
-                  GeneRatio_num = sapply(strsplit(GeneRatio, "/"), \(x) as.numeric(x[1])/as.numeric(x[2])))
+                  GeneRatio_num = tryCatch(
+                    sapply(strsplit(GeneRatio, "/"), \(x) as.numeric(x[1])/as.numeric(x[2])),
+                    error = \(e) rep(NA_real_, length(GeneRatio))
+                  ))
 
   ggplot(df, aes(GeneRatio_num, Description)) +
     geom_segment(aes(x = 0, xend = GeneRatio_num, yend = Description), color = "grey80") +
@@ -1854,15 +2127,17 @@ p_v2v1_up   <- story_dotplot(go_v2v1_up,   "V2 vs V1: Upregulated",  "Immune rec
 # --- Heatmap ---
 heat_panel <- ggplot() + annotate("text", x=.5, y=.5, label="Heatmap\n(insufficient data)", size=5, color="grey50") + theme_void()
 
-if (exists("vst_data") && exists("meta")) {
+if (exists("vst_data") && inherits(vst_data, "SummarizedExperiment") &&
+    exists("meta") && is.data.frame(meta) && nrow(meta) > 0) {
   trans_mat <- SummarizedExperiment::assay(vst_data)
   trans_clean <- setNames(rownames(trans_mat), sub("\\..*$", "", rownames(trans_mat)))
 
-  .get_genes <- function(obj, n = 2) {
+  .get_genes <- function(obj, n = 5, max_genes = 40) {
     if (is.null(obj)) return(character())
     df <- tryCatch(as.data.frame(obj), error = \(e) NULL)
     if (is.null(df) || nrow(df) == 0) return(character())
-    unique(unlist(strsplit(dplyr::slice_head(df, n = n)$geneID, "/"), use.names = FALSE))
+    genes <- unique(unlist(strsplit(dplyr::slice_head(df, n = n)$geneID, "/"), use.names = FALSE))
+    head(genes, max_genes)
   }
 
   pathway_anno <- dplyr::bind_rows(
@@ -1875,7 +2150,11 @@ if (exists("vst_data") && exists("meta")) {
   if (nrow(pathway_anno) > 0) {
     sym_map <- suppressMessages(AnnotationDbi::select(
       org.Hs.eg.db, unique(pathway_anno$gene), "ENSEMBL", "SYMBOL"
-    )) |> dplyr::filter(!is.na(ENSEMBL)) |> dplyr::distinct(SYMBOL, .keep_all = TRUE)
+    )) |>
+      dplyr::filter(!is.na(ENSEMBL)) |>
+      # Bei 1:many SYMBOL→ENSEMBL: nimm erstes ENSEMBL (alphabetisch = deterministisch)
+      dplyr::arrange(SYMBOL, ENSEMBL) |>
+      dplyr::distinct(SYMBOL, .keep_all = TRUE)
 
     genes_in_mat <- sym_map |> dplyr::filter(ENSEMBL %in% names(trans_clean))
 
@@ -1957,6 +2236,14 @@ Gene Set Variation Analysis (GSVA) berechnet Pathway-Enrichment-Scores pro Sampl
 #| fig-height: 10
 
 # --- Setup ---
+# Input-Validierung
+if (!exists("vst_mat") || !is.matrix(vst_mat) || nrow(vst_mat) == 0) {
+  stop("vst_mat nicht gefunden oder leer. VST-Chunk muss vorher laufen.")
+}
+if (!exists("meta") || !is.data.frame(meta)) {
+  stop("meta nicht gefunden. Metadata muss geladen sein.")
+}
+
 gsva_cache <- "../../res/cache/gsva_hallmark_scores.rds"
 msigdb_file <- "../../dat/h.all.v2023.2.Hs.symbols.gmt"
 msigdb_dir <- dirname(msigdb_file)
@@ -1970,8 +2257,8 @@ if (!file.exists(msigdb_file)) {
   msigdb_url <- "https://data.broadinstitute.org/gsea-msigdb/msigdb/release/2023.2.Hs/h.all.v2023.2.Hs.symbols.gmt"
 
   tryCatch({
-    download.file(msigdb_url, msigdb_file, mode = "wb", quiet = FALSE)
-    message("Successfully downloaded MSigDB Hallmark gene sets to: ", msigdb_file)
+    download.file(msigdb_url, msigdb_file, mode = "wb", quiet = FALSE, timeout = 300)
+    message("Successfully downloaded MSigDB Hallmark gene sets (", date(), ") to: ", msigdb_file)
   }, error = function(e) {
     message("Automatic download failed. Please manually download from:")
     message("https://www.gsea-msigdb.org/gsea/msigdb/human/collections.jsp")
@@ -1994,6 +2281,8 @@ ensembl_to_symbol <- suppressMessages(
                        columns = "SYMBOL", keytype = "ENSEMBL")
 ) |>
   dplyr::filter(!is.na(SYMBOL)) |>
+  # Bei 1:many ENSEMBL→SYMBOL: nimm erstes SYMBOL (alphabetisch = deterministisch)
+  dplyr::arrange(ENSEMBL, SYMBOL) |>
   dplyr::distinct(ENSEMBL, .keep_all = TRUE)
 
 # Filtere Matrix auf mappbare Gene
@@ -2013,6 +2302,10 @@ gsva_scores <- load_or_compute(gsva_cache, function() {
   # Neue GSVA API (v1.40+) verwendet Parameter-Objekte
   gsva_version <- packageVersion("GSVA")
   message("GSVA version: ", gsva_version)
+
+  # Adaptive Parallelisierung (max 4 cores, min 1)
+  n_workers <- max(1, min(4, parallel::detectCores() - 1))
+  message("Using ", n_workers, " cores for GSVA")
 
   # GSVA kcdf Parameter (Hänzelmann et al., 2013)
   # kcdf (kernel cumulative distribution function) bestimmt, wie GSVA
@@ -2036,7 +2329,7 @@ gsva_scores <- load_or_compute(gsva_cache, function() {
       maxSize = 500,
       kcdf = "Gaussian"  # Geeignet für VST-transformierte Daten
     )
-    gsva(param, verbose = TRUE, BPPARAM = BiocParallel::MulticoreParam(workers = 4))
+    gsva(param, verbose = TRUE, BPPARAM = BiocParallel::MulticoreParam(workers = n_workers))
   } else {
     # Alte API (< 1.40)
     message("Using legacy GSVA API (< 1.40)")
@@ -2047,7 +2340,7 @@ gsva_scores <- load_or_compute(gsva_cache, function() {
       kcdf = "Gaussian",  # Geeignet für VST-transformierte Daten
       min.sz = 10,
       max.sz = 500,
-      parallel.sz = 4,
+      parallel.sz = n_workers,
       verbose = TRUE
     )
   }
@@ -2080,8 +2373,8 @@ p_gsva_heatmap <- pheatmap(
   annotation_colors = list(
     Timepoint = c(A = "#66c2a5", V1 = "#fc8d62", V2 = "#8da0cb"),
     Patient = setNames(
-      rainbow(length(unique(meta$pid))),
-      unique(meta$pid)
+      viridis::viridis(length(unique(meta$pid)), option = "D"),
+      sort(unique(meta$pid))  # Sortiert für Determinismus
     )
   ),
   cluster_cols = FALSE,
