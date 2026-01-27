@@ -7,12 +7,35 @@ title: "DEanalysis"
 
 ## Setup und Pakete
 
+**Reproduzierbarkeit:** Vollständig reproduzierbar ist die Analyse nur, wenn `renv.lock` im Projekt vorhanden ist und `renv` aktiv verwendet wird.
+
 Lädt alle benötigten R-Pakete für die Analyse: DESeq2, tximport, clusterProfiler, tidyverse, pheatmap, etc.
 
 ```{r}
 #| label: setup-packages
 #| echo: false
 #| warning: false
+
+# Reproduzierbarkeit: renv nutzen, falls lockfile vorhanden
+if (file.exists("renv.lock")) {
+  if (requireNamespace("renv", quietly = TRUE)) {
+    renv::load()
+    message("✓ renv aktiv (renv.lock gefunden)")
+  } else {
+    message("⚠ renv.lock vorhanden, aber Paket 'renv' ist nicht installiert")
+  }
+} else {
+  message("ℹ renv.lock nicht gefunden – nutze aktuelle Library")
+}
+
+# Einmaliges renv-Setup (optional):
+# - Wird NUR einmal ausgeführt, danach ist renv.lock vorhanden.
+# - Der Chunk kann danach beliebig oft laufen, ohne renv zu verändern.
+renv_setup_flag <- file.path("renv", ".setup_done")
+if (!file.exists("renv.lock") && !file.exists(renv_setup_flag)) {
+  message("ℹ Einmaliges renv-Setup: renv::init() und renv::snapshot() manuell ausführen.")
+  message("   Danach bitte eine leere Datei anlegen: renv/.setup_done")
+}
 
 # Pakete installieren (falls nötig)
 source("../../org/setup_packages.R")
@@ -45,6 +68,7 @@ suppressPackageStartupMessages({
   library(broom.mixed)
   library(lme4)
   library(lmerTest)
+  library(digest)
 })
 
 # Reproduzierbarkeit: Seed für alle stochastischen Operationen setzen
@@ -52,7 +76,30 @@ suppressPackageStartupMessages({
 set.seed(42)
 message("✓ Seed set to 42 for reproducibility")
 
-sessionInfo()
+params <- list(
+  padj_cutoff = 0.05,
+  lfc_min = 0.5,
+  seed = 42
+)
+
+padj_cutoff <- params$padj_cutoff
+lfc_min <- params$lfc_min
+
+log_dir <- "../../res/logs"
+dir.create(log_dir, recursive = TRUE, showWarnings = FALSE)
+writeLines(
+  jsonlite::toJSON(params, auto_unbox = TRUE, pretty = TRUE),
+  file.path(log_dir, "params.json")
+)
+
+cache_key <- function(...) {
+  if (!requireNamespace("digest", quietly = TRUE)) {
+    stop("Package 'digest' required for cache_key(). Please install it.")
+  }
+  digest::digest(list(...), algo = "xxhash64")
+}
+
+
 ```
 
 ## Datenimport und Vorbereitung
@@ -90,7 +137,10 @@ tx2gene[,1] <- sub("\\..*$", "", tx2gene[,1])  # Versionsnummer entfernen
 tx2gene <- tx2gene[, c(1,2)]                    # Nur tx_id und gene_id
 
 # tximport
-txi_cache <- "../../res/cache/txi_salmon_tximport.rds"
+txi_cache <- file.path(
+  "../../res/cache",
+  paste0("txi_salmon_tximport_", cache_key(files, tx2g, file.info(tx2g)$mtime), ".rds")
+)
 dir.create(dirname(txi_cache), recursive = TRUE, showWarnings = FALSE)
 
 if (file.exists(txi_cache)) {
@@ -290,7 +340,7 @@ meta <- md_aortic %>%
   mutate(
     sample_id = as.character(sample_id),
     pid       = factor(pid),        # Patient-ID
-    timepoint = factor(timepoint)   
+    timepoint = factor(timepoint, levels = c("A","V1","V2"))
   ) %>%
   as.data.frame()
 
@@ -390,7 +440,7 @@ write.table(
 
 **Sample Size:** Die Studie umfasste N=46 Patienten mit longitudinaler Probenentnahme (3 Zeitpunkte), was 128 Aortenklappenproben ergab (nicht alle Patienten haben alle Zeiträume). Die Stichprobengröße wurde durch die Studiendurchführbarkeit (verfügbare Patientenkohorte) bestimmt.
 
-**Statistical Power:** Die Stichprobengröße von n=46 biologischen Replikaten übertrifft deutlich die empirisch belegte Mindestempfehlung von n≥12 für RNA-seq Differential Expression-Studien (Schurch et al., 2016). Das longitudinale gepaarte Design (\~ pid + timepoint) erhöht die statistische Power zusätzlich durch Reduktion der Residualvarianz im Vergleich zu ungepaarten Designs (Orr & Huber, 2018). Diese Kombination aus ausreichender Stichprobengröße und paired design gewährleistet hohe statistische Sensitivität zur Detektion biologisch relevanter transkriptioneller Veränderungen.
+**Statistical Power:** Die Stichprobengröße von n=46 biologischen Replikaten liegt über gängigen Empfehlungen (z. B. n≥12 für RNA-seq DE; Schurch et al., 2016). Das longitudinale gepaarte Design (\~ pid + timepoint) sollte die Power durch Reduktion interindividueller Varianz verbessern (Orr & Huber, 2018). Eine formale Power‑Analyse für das konkrete Design wurde jedoch nicht durchgeführt; daher werden Effektstärken und FDR‑kontrollierte Signifikanzen in der Ergebnisinterpretation priorisiert.
 
 **Referenzen:** - Schurch et al. (2016): "How many biological replicates are needed in an RNA-seq experiment and which differential expression tool should you use?" *RNA* 22(6):839-851. DOI: 10.1261/rna.053959.115 - Orr & Huber (2018): "Optimal number of biological replicates for RNA-seq differential gene expression analysis." *BMC Genomics* 19:732. DOI: 10.1186/s12864-018-5236-2
 
@@ -416,7 +466,10 @@ Dieser Chunk führt QC-Analysen durch: Varianz-stabilisierende Transformation (V
 # Empfehlung: blind=TRUE für QC/Visualisierung (unser Anwendungsfall)
 
 # VST-Caching für Performance (rechenintensiv bei großen Datasets)
-vst_cache <- file.path("../../res/cache", "vst_blind_TRUE.rds")
+vst_cache <- file.path(
+  "../../res/cache",
+  paste0("vst_blind_TRUE_", cache_key("vst", nrow(dds), ncol(dds), design(dds), levels(colData(dds)$timepoint)), ".rds")
+)
 if (file.exists(vst_cache)) {
   message("✓ Lade VST aus Cache")
   vst_data <- readRDS(vst_cache)
@@ -510,7 +563,12 @@ dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
 dir.create(res_dir, recursive = TRUE, showWarnings = FALSE)
 
 # FDR-Schwellenwert (Standard für RNA-seq DE-Analysen, Benjamini-Hochberg)
-alpha_level <- 0.05
+alpha_level <- params$padj_cutoff
+
+cache_suffix_wald <- paste0(
+  "_",
+  cache_key("wald", alpha_level, design(dds), levels(colData(dds)$timepoint), nrow(dds), ncol(dds))
+)
 
 # Helper: RDS-Caching mit optionalem CSV-Export
 load_or_compute <- function(rds_path, compute_fn, csv_path = NULL) {
@@ -528,7 +586,7 @@ load_or_compute <- function(rds_path, compute_fn, csv_path = NULL) {
 # Fitted DESeq2-Objekt laden/berechnen
 # WICHTIG: dds kommt aus Chunk 4 (bereits gefiltert, Design gesetzt, timepoint als factor)
 # Hier wird nur DESeq() für Dispersion-Schätzung und Wald-Tests ausgeführt
-dds_cache <- file.path(cache_dir, "dds_DESeq_fitted.rds")
+dds_cache <- file.path(cache_dir, paste0("dds_DESeq_fitted", cache_suffix_wald, ".rds"))
 
 dds_fitted <- load_or_compute(dds_cache, function() {
   DESeq(dds)  # dds aus Chunk 4
@@ -536,6 +594,10 @@ dds_fitted <- load_or_compute(dds_cache, function() {
 
 # dds-Objekt für nachfolgende Analysen aktualisieren
 dds <- dds_fitted
+
+# Validierung: erwartete Koeffizienten vorhanden
+expected_coefs <- c("timepoint_V1_vs_A", "timepoint_V2_vs_A")
+stopifnot(all(expected_coefs %in% resultsNames(dds)))
 
 # ============================================================
 # Model-Fit QC: Dispersion-Statistiken
@@ -587,15 +649,15 @@ for (name in names(contrasts)) {
 
   # Wald-Test Results
   wald_results[[name]] <- load_or_compute(
-    rds_path = file.path(cache_dir, paste0("DESeq2_results_", name, ".rds")),
-    csv_path = file.path(res_dir, paste0("DESeq2_results_", name, ".csv")),
+    rds_path = file.path(cache_dir, paste0("DESeq2_results_", name, cache_suffix_wald, ".rds")),
+    csv_path = file.path(res_dir, paste0("DESeq2_results_", name, cache_suffix_wald, ".csv")),
     compute_fn = function() results(dds, contrast = cfg$contrast, alpha = alpha_level)
   )
 
   # LFC Shrinkage
   shrink_results[[name]] <- load_or_compute(
-    rds_path = file.path(cache_dir, paste0("DESeq2_LFCshrink_", name, ".rds")),
-    csv_path = file.path(res_dir, paste0("DESeq2_LFCshrink_", name, ".csv")),
+    rds_path = file.path(cache_dir, paste0("DESeq2_LFCshrink_", name, cache_suffix_wald, ".rds")),
+    csv_path = file.path(res_dir, paste0("DESeq2_LFCshrink_", name, cache_suffix_wald, ".csv")),
     compute_fn = function() {
       if (!is.null(cfg$coef)) {
         lfcShrink(dds, coef = cfg$coef, res = wald_results[[name]], type = cfg$shrink)
@@ -677,14 +739,14 @@ for (name in names(wald_results)) {
 
 ## Wald-Ergebnisse Zusammenfassung
 
-Zusammenfassung der Wald-Test-Ergebnisse: Konvertierung zu Tibbles, Filterung signifikanter Gene (padj \< 0.05), Zählung up/down-regulierter Gene.
+Zusammenfassung der Wald-Test-Ergebnisse: Konvertierung zu Tibbles, Filterung signifikanter Gene (padj \< padj_cutoff), Zählung up/down-regulierter Gene.
 
 ```{r}
 #| label: wald-results-summary
 #| echo: false
 #| warning: false
 
-padj_cutoff <- 0.05
+padj_cutoff <- params$padj_cutoff
 
 # Summary für alle Kontraste
 for (name in names(wald_results)) {
@@ -834,6 +896,8 @@ message("✓ π₀ values saved: pvalue_diagnostics_pi0.csv / .rds")
 ## Multiple-Testing-Strategie
 
 **Benjamini-Hochberg FDR-Korrektur** wurde unabhängig für jeden paarweisen Kontrast (V1 vs A, V2 vs A, V2 vs V1) angewendet, wie es Standard-Praxis in RNA-seq Differenzial-Expressions-Analysen ist. Wir haben KEINE familienweise Fehlerkorrektur über die 3 Kontraste hinweg angewendet aus folgenden Gründen:
+
+**DESeq2 Defaults:** Für `results()` wurden die Standard-Filter verwendet (`independentFiltering = TRUE`, `cooksCutoff = TRUE`). Damit werden Gene mit sehr niedrigen Counts bzw. extremen Cook's Distances automatisch ausgeschlossen, was die FDR-Kontrolle stabilisiert.
 
 1.  **Biologische Unabhängigkeit:** Jeder Kontrast adressiert eine distinkte biologische Fragestellung (akute Antwort, Langzeitanpassung, Erholungsdynamik).
 
@@ -1032,9 +1096,13 @@ if (!all(c("pid", "timepoint") %in% colnames(colData(dds)))) {
 }
 
 # Cache-Pfade für LRT
-dds_lrt_cache_file <- file.path(cache_dir, "dds_DESeq_LRT_fitted.rds")
-res_lrt_rds        <- file.path(cache_dir, "DESeq2_results_LRT_timepoint.rds")
-res_lrt_csv        <- file.path(res_dir, "DESeq2_results_LRT_timepoint.csv")
+cache_suffix_lrt <- paste0(
+  "_",
+  cache_key("lrt", padj_cutoff, design(dds), levels(colData(dds)$timepoint), nrow(dds), ncol(dds))
+)
+dds_lrt_cache_file <- file.path(cache_dir, paste0("dds_DESeq_LRT_fitted", cache_suffix_lrt, ".rds"))
+res_lrt_rds        <- file.path(cache_dir, paste0("DESeq2_results_LRT_timepoint", cache_suffix_lrt, ".rds"))
+res_lrt_csv        <- file.path(res_dir, paste0("DESeq2_results_LRT_timepoint", cache_suffix_lrt, ".csv"))
 
 # LRT-fitted dds laden oder berechnen
 if (file.exists(dds_lrt_cache_file)) {
@@ -1135,7 +1203,7 @@ if (sig_rate_lrt > 0.3) {
 
 ## LRT-Ergebnisse Visualisierung
 
-Weiterverarbeitung der LRT-Ergebnisse: Annotation mit SYMBOL/GENENAME, Filterung signifikanter Gene (padj \< 0.05, Top 200), und Heatmap über alle Zeitpunkte (A/V1/V2).
+Weiterverarbeitung der LRT-Ergebnisse: Annotation mit SYMBOL/GENENAME, Filterung signifikanter Gene (padj \< padj_cutoff, Top 200), und Heatmap über alle Zeitpunkte (A/V1/V2).
 
 ```{r}
 #| label: lrt-visualization
@@ -1506,8 +1574,8 @@ if (!exists("res_lrt") && !exists("res_lrt_tb")) {
 }
 
 # --- Settings ---
-if (!exists("padj_cutoff")) padj_cutoff <- 0.05
-if (!exists("lfc_min")) lfc_min <- 0.5
+padj_cutoff <- params$padj_cutoff
+lfc_min <- params$lfc_min
 
 go_out_dir   <- "../../res/functional/ora_go"
 kegg_out_dir <- "../../res/functional/ora_kegg"
@@ -1579,7 +1647,12 @@ fmt2 <- function(x) format(x, nsmall = 2)
   # Reviewer-Begründung: "Die statistische Validität von ORA hängt kritisch von der
   # Universumsdefinition ab. Ungetestete Gene führen zu falsch-positiven Raten." (Kim 2012)
 
-  universe_ens <- unique(res_tb$ensembl_id)
+  universe_ens <- if (exists("dds")) {
+    unique(strip_ensembl_version(rownames(dds)))
+  } else {
+    warning("dds nicht verfügbar; Universe aus res_tb verwendet")
+    unique(res_tb$ensembl_id)
+  }
   universe <- if (type == "KEGG") .map_to_entrez(universe_ens) else universe_ens
 
   summary_rows <- vector("list", length(ontologies) * length(directions))
@@ -1612,11 +1685,11 @@ fmt2 <- function(x) format(x, nsmall = 2)
           if (type == "GO") {
             clusterProfiler::enrichGO(gene = sig, universe = universe, OrgDb = org.Hs.eg.db,
                                       keyType = "ENSEMBL", ont = ont, pAdjustMethod = "BH",
-                                      qvalueCutoff = 0.05, readable = TRUE)
+                                      qvalueCutoff = padj_cutoff, readable = TRUE)
           } else {
             suppressMessages(clusterProfiler::enrichKEGG(gene = sig, universe = universe,
                                       organism = organism, pAdjustMethod = "BH",
-                                      pvalueCutoff = 0.05, qvalueCutoff = 0.05))
+                                      pvalueCutoff = padj_cutoff, qvalueCutoff = padj_cutoff))
           }
         }
 
@@ -1699,7 +1772,7 @@ Threshold-freie Validierung der ORA-Ergebnisse. GSEA nutzt das vollständige Ran
 gsea_out_dir <- "../../res/functional/gsea_go"
 dir.create(gsea_out_dir, recursive = TRUE, showWarnings = FALSE)
 
-gsea_pval   <- 0.05
+gsea_pval   <- params$padj_cutoff
 gsea_minGS  <- 15
 gsea_maxGS  <- 500
 gsea_ont    <- "BP"    # Biological Process (konsistent mit ORA)
@@ -2244,7 +2317,10 @@ if (!exists("meta") || !is.data.frame(meta)) {
   stop("meta nicht gefunden. Metadata muss geladen sein.")
 }
 
-gsva_cache <- "../../res/cache/gsva_hallmark_scores.rds"
+gsva_cache <- file.path(
+  "../../res/cache",
+  paste0("gsva_hallmark_scores_", cache_key(msigdb_file, file.info(msigdb_file)$mtime, nrow(vst_mat), ncol(vst_mat)), ".rds")
+)
 msigdb_file <- "../../dat/h.all.v2023.2.Hs.symbols.gmt"
 msigdb_dir <- dirname(msigdb_file)
 
@@ -2269,6 +2345,13 @@ if (!file.exists(msigdb_file)) {
 
 hallmark <- getGmt(msigdb_file)
 message("Loaded ", length(hallmark), " Hallmark pathways from MSigDB")
+
+log_dir <- "../../res/logs"
+dir.create(log_dir, recursive = TRUE, showWarnings = FALSE)
+writeLines(c(
+  paste("MSigDB file:", msigdb_file),
+  paste("MSigDB mtime:", file.info(msigdb_file)$mtime)
+), file.path(log_dir, "msigdb_version.txt"))
 
 # --- Konvertiere vst_mat zu Gene-Symbolen ---
 # vst_mat hat ENSEMBL IDs als rownames, GSVA benötigt Symbole
@@ -2329,7 +2412,9 @@ gsva_scores <- load_or_compute(gsva_cache, function() {
       maxSize = 500,
       kcdf = "Gaussian"  # Geeignet für VST-transformierte Daten
     )
-    gsva(param, verbose = TRUE, BPPARAM = BiocParallel::MulticoreParam(workers = n_workers))
+    is_win <- .Platform$OS.type == "windows"
+    bp <- if (is_win) BiocParallel::SnowParam(workers = n_workers) else BiocParallel::MulticoreParam(workers = n_workers)
+    gsva(param, verbose = TRUE, BPPARAM = bp)
   } else {
     # Alte API (< 1.40)
     message("Using legacy GSVA API (< 1.40)")
@@ -2537,7 +2622,7 @@ ggsave(
 # Ziel: Quantifiziere Zeitpunkt-Effekte auf Pathway-Ebene unter Berücksichtigung
 #       der paired-design Struktur (~ timepoint + (1|pid))
 # Grund: GSVA-Plots zeigen nur deskriptive Statistik (mean ± SE)
-#       → Mixed models liefern formale Signifikanz-Tests für Reviewer
+#       → Mixed models liefern formale Signifikanz-Tests
 # Methode: Linear Mixed Model (lme4::lmer) mit Random Intercept pro Patient
 
 # --- GSVA Mixed Models (Long format) ---
@@ -2599,18 +2684,18 @@ if (!requireNamespace("lme4", quietly = TRUE)) {
 
   # Show significant (BH)
   sig_pathways <- gsva_stats %>%
-    dplyr::filter(!is.na(padj), padj < 0.05) %>%
+    dplyr::filter(!is.na(padj), padj < padj_cutoff) %>%
     dplyr::arrange(padj)
 
   if (nrow(sig_pathways) > 0) {
-    cat("\n=== GSVA: Signifikante Zeitpunkt-Effekte (BH padj < 0.05) ===\n")
+    cat("\n=== GSVA: Signifikante Zeitpunkt-Effekte (BH padj < ", padj_cutoff, ") ===\n")
     cat(sprintf("Gefunden: %d signifikante Fixed-Effects\n\n", nrow(sig_pathways)))
     print(sig_pathways %>%
             dplyr::select(pathway_clean, term, estimate, padj) %>%
             dplyr::slice_head(n = 50),
           n = 50)
   } else {
-    cat("\n⚠ GSVA: Keine signifikanten Zeitpunkt-Effekte (BH padj < 0.05)\n")
+    cat("\n⚠ GSVA: Keine signifikanten Zeitpunkt-Effekte (BH padj < ", padj_cutoff, ")\n")
   }
 }
 
@@ -2638,9 +2723,20 @@ Identifikation von Master-Regulatoren (Transkriptionsfaktoren) für die differen
 #| warning: false
 
 
+# Input-Validierung
+if (!exists("sig_annot") || !is.list(sig_annot) || length(sig_annot) == 0) {
+  stop("sig_annot nicht gefunden. Wald-Test-Chunks mit Annotation müssen vorher laufen.")
+}
+
 # Cache-Pfade (cache_dir bereits im Setup definiert)
 tf_out_dir <- "../../res/functional/tf_enrichment"
 dir.create(tf_out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Qualitätsfilter-Parameter
+min_overlap_genes <- 20      # Mindestens 20 Gene Overlap für biologische Relevanz
+min_odds_ratio_val <- 1.5    # Mindestens 1.5-fache Anreicherung
+p_floor_val <- 1e-50          # p-value Capping bei 1e-50
+cap_log10p <- 50              # Capping für -log10(p) in Visualisierungen
 
 # --- enrichR Databases für TF-Enrichment ---
 # Stratifiziert nach Datenqualität:
@@ -2667,9 +2763,18 @@ tryCatch({
   setEnrichrSite("Enrichr")
   available_dbs <- listEnrichrDbs()
   message("[enrichR] Successfully connected to Enrichr API")
+  message("[enrichR] Package version: ", packageVersion("enrichR"))
+  message("[enrichR] Analysis date: ", date())
 }, error = function(e) {
   warning("[enrichR] Connection failed: ", e$message)
 })
+
+log_dir <- "../../res/logs"
+dir.create(log_dir, recursive = TRUE, showWarnings = FALSE)
+writeLines(c(
+  paste("Enrichr date:", date()),
+  paste("Enrichr DBs:", paste(tf_databases, collapse = ", "))
+), file.path(log_dir, "enrichr_version.txt"))
 
 # --- Helper-Funktion: enrichR TF-Enrichment ---
 run_enrichr_tf <- function(gene_symbols, query_name, databases = tf_databases, cache_path = NULL) {
@@ -2699,52 +2804,52 @@ run_enrichr_tf <- function(gene_symbols, query_name, databases = tf_databases, c
   return(result)
 }
 
-# --- Helper-Funktion: ChEA3 API Call (optional, falls enrichR nicht ausreicht) ---
-run_chea3 <- function(gene_symbols, query_name, cache_path = NULL, timeout_sec = 120) {
-
-  # Cache-Check
-  if (!is.null(cache_path) && file.exists(cache_path)) {
-    message("[ChEA3] Loading cached results for: ", query_name)
-    return(readRDS(cache_path))
-  }
-
-  message("[ChEA3] Running TF enrichment for: ", query_name, " (", length(gene_symbols), " genes)")
-  message("[ChEA3] This may take up to ", timeout_sec, " seconds...")
-
-  # API Call mit Error Handling
-  result <- tryCatch({
-    response <- POST(
-      url = "https://maayanlab.cloud/chea3/api/enrich/",
-      body = list(
-        query_name = query_name,
-        gene_set = gene_symbols
-      ),
-      encode = "json",
-      timeout(timeout_sec)
-    )
-
-    # Status-Check
-    if (status_code(response) != 200) {
-      warning("ChEA3 API returned status ", status_code(response))
-      return(NULL)
-    }
-
-    # Parse JSON
-    fromJSON(content(response, "text", encoding = "UTF-8"))
-
-  }, error = function(e) {
-    warning("[ChEA3] API call failed for ", query_name, ": ", e$message)
-    return(NULL)
-  })
-
-  # Cache Result
-  if (!is.null(result) && !is.null(cache_path)) {
-    saveRDS(result, cache_path)
-    message("[ChEA3] Cached to: ", cache_path)
-  }
-
-  return(result)
-}
+# --- Optional: ChEA3 API Call (aktuell nicht genutzt) ---
+# Kann aktiviert werden, falls enrichR nicht ausreicht
+# run_chea3 <- function(gene_symbols, query_name, cache_path = NULL, timeout_sec = 120) {
+#   # Cache-Check
+#   if (!is.null(cache_path) && file.exists(cache_path)) {
+#     message("[ChEA3] Loading cached results for: ", query_name)
+#     return(readRDS(cache_path))
+#   }
+#
+#   message("[ChEA3] Running TF enrichment for: ", query_name, " (", length(gene_symbols), " genes)")
+#   message("[ChEA3] This may take up to ", timeout_sec, " seconds...")
+#
+#   # API Call mit Error Handling
+#   result <- tryCatch({
+#     response <- POST(
+#       url = "https://maayanlab.cloud/chea3/api/enrich/",
+#       body = list(
+#         query_name = query_name,
+#         gene_set = gene_symbols
+#       ),
+#       encode = "json",
+#       timeout(timeout_sec)
+#     )
+#
+#     # Status-Check
+#     if (status_code(response) != 200) {
+#       warning("ChEA3 API returned status ", status_code(response))
+#       return(NULL)
+#     }
+#
+#     # Parse JSON
+#     fromJSON(content(response, "text", encoding = "UTF-8"))
+#
+#   }, error = function(e) {
+#     warning("[ChEA3] API call failed for ", query_name, ": ", e$message)
+#     return(NULL)
+#   })
+#
+#   # Cache Result
+#   if (!is.null(result) && !is.null(cache_path)) {
+#     saveRDS(result, cache_path)
+#     message("[ChEA3] Cached to: ", cache_path)
+#   }
+#
+#   return(result)
+# }
 
 # --- Helper-Funktion: Extract TF from enrichR result ---
 # Verbessert mit Qualitätsfiltern für robuste Ergebnisse
@@ -2769,10 +2874,10 @@ run_chea3 <- function(gene_symbols, query_name, cache_path = NULL, timeout_sec =
 # Referenz: Keenan et al., 2019 (DOI:10.1093/nar/gkz446)
 
 extract_tf_from_enrichr <- function(enrichr_result, database_name, top_n = 30,
-                                     p_cutoff = 0.05,
-                                     min_overlap = 20,      # Mindestens 20 Gene Overlap
-                                     min_odds_ratio = 1.5,  # Mindestens 1.5-fache Anreicherung
-                                     p_floor = 1e-50) {     # p-value Capping bei 1e-50
+                                     p_cutoff = padj_cutoff,
+                                     min_overlap = min_overlap_genes,
+                                     min_odds_ratio = min_odds_ratio_val,
+                                     p_floor = p_floor_val) {
 
   if (is.null(enrichr_result) || !(database_name %in% names(enrichr_result))) {
     warning("Database '", database_name, "' not found in enrichR results")
@@ -2798,8 +2903,9 @@ extract_tf_from_enrichr <- function(enrichr_result, database_name, top_n = 30,
       P.value_capped = pmax(P.value, p_floor),
       Adjusted.P.value_capped = pmax(Adjusted.P.value, p_floor),
 
-      # Extrahiere TF-Name (vor dem ersten Leerzeichen oder Unterstrich)
-      TF = sub("^([A-Z0-9]+)[_ ].*", "\\1", Term),
+      # Extrahiere TF-Name: Alles vor erstem Space (typisch: "POLR2AphosphoS5 MEL cell" → "POLR2AphosphoS5")
+      # Einfacher Ansatz: Entferne alles nach erstem Space
+      TF = sub(" .*$", "", Term),
       Database = database_name
     )
 
@@ -2876,7 +2982,7 @@ top_tfs_all <- lapply(names(enrichr_results), function(contrast_name) {
 
   # Extrahiere aus allen Datenbanken
   combined <- lapply(tf_databases, function(db) {
-    extract_tf_from_enrichr(result, db, top_n = 30, p_cutoff = 0.05)
+    extract_tf_from_enrichr(result, db, top_n = 30, p_cutoff = padj_cutoff)
   }) |>
     bind_rows() |>
     mutate(Contrast = contrast_name)
@@ -2894,7 +3000,8 @@ top_tfs_consensus <- top_tfs_all |>
     min_pval = min(Adjusted.P.value),
     mean_pval = mean(Adjusted.P.value),
     # Geometrisches Mittel für p-Werte (robuster als arithmetisches Mittel)
-    geom_mean_pval = exp(mean(log(Adjusted.P.value))),
+    # Mit explizitem Floor gegen log(0) = -Inf
+    geom_mean_pval = exp(mean(log(pmax(Adjusted.P.value, p_floor_val)))),
     # Aggregierte Overlap-Statistik
     total_overlap_genes = sum(Overlap_k),
     mean_overlap_ratio = mean(Overlap_ratio),
@@ -2905,7 +3012,7 @@ top_tfs_consensus <- top_tfs_all |>
   mutate(
     # Score: n_databases gewichtet + -log10(geom_mean_pval)
     # Mehr Datenbanken = robuster
-    robustness_score = n_databases * 2 + pmin(-log10(geom_mean_pval), 30)
+    robustness_score = n_databases * 2 + pmin(-log10(geom_mean_pval), cap_log10p)
   ) |>
   arrange(Contrast, desc(robustness_score)) |>
   group_by(Contrast) |>
@@ -2965,8 +3072,8 @@ plot_data_consensus <- top_tfs_consensus |>
       Contrast == "V2_vs_V1" ~ "V2 vs V1",
       TRUE ~ Contrast
     ),
-    # Verwende geometrisches Mittel (robuster) mit Capping bei 50
-    neg_log_pval = pmin(-log10(geom_mean_pval), 50),
+    # Verwende geometrisches Mittel (robuster) mit Capping
+    neg_log_pval = pmin(-log10(geom_mean_pval), cap_log10p),
     # Datenbank-Label für Konsistenz
     db_label = paste0(n_databases, " DB", ifelse(n_databases > 1, "s", ""))
   )
@@ -2985,7 +3092,7 @@ p_tf_consensus <- ggplot(
     name = "-log10(p)\n(geom. mean)",
     low = "#fee5d9",
     high = "#a50f15",
-    limits = c(0, 50)  # Capping für Visualisierung
+    limits = c(0, cap_log10p)  # Capping für Visualisierung
   ) +
   labs(
     x = NULL,
@@ -3018,8 +3125,8 @@ encode_data <- top_tfs_all |>
       Contrast == "V2_vs_V1" ~ "V2 vs V1",
       TRUE ~ Contrast
     ),
-    # Capping für numerische Stabilität (max 50)
-    neg_log_pval = pmin(-log10(Adjusted.P.value), 50)
+    # Capping für numerische Stabilität
+    neg_log_pval = pmin(-log10(Adjusted.P.value), cap_log10p)
   )
 
 if (nrow(encode_data) > 0) {
@@ -3042,7 +3149,7 @@ if (nrow(encode_data) > 0) {
       x = "-log10(Adjusted p-value)",
       y = "Transcription Factor",
       title = "TF-Enrichment: ENCODE ChIP-seq Database",
-      subtitle = sprintf("Minimum overlap: %d genes | Size = proportion of TF targets in DE gene set", 20)
+      subtitle = sprintf("Minimum overlap: %d genes | Size = proportion of TF targets in DE gene set", min_overlap_genes)
     ) +
     theme_bw(base_size = 11) +
     theme(
@@ -3065,7 +3172,7 @@ tf_overlap_data <- top_tfs_consensus |>
   ungroup() |>
   mutate(
     # Verwende geometrisches Mittel mit Capping für robustere Scores
-    score = pmin(-log10(geom_mean_pval), 30),
+    score = pmin(-log10(geom_mean_pval), cap_log10p),
     Contrast_label = case_when(
       Contrast == "V1_vs_A" ~ "V1 vs A",
       Contrast == "V2_vs_A" ~ "V2 vs A",
@@ -3283,12 +3390,18 @@ Validiert, ob die extremen p-Werte in KEGG ORA (z.B. Ribosome biogenesis p = 10\
 # --- Load DESeq2 Results (UNSHRUNKEN für Konsistenz mit ORA) ---
 # WICHTIG: Verwende die gleichen Daten wie die ursprüngliche ORA (Chunk 16)
 # Die ursprüngliche ORA verwendet res_V2_vs_A_tb (normale LFC, nicht shrunken)
-res_V2_vs_A <- readRDS("../../res/cache/DESeq2_results_V2_vs_A.rds")
+cache_suffix_wald_local <- if (exists("cache_suffix_wald")) cache_suffix_wald else ""
+rds_path <- file.path("../../res/cache", paste0("DESeq2_results_V2_vs_A", cache_suffix_wald_local, ".rds"))
+  if (!file.exists(rds_path)) {
+    stop("DESeq2-Results nicht gefunden: ", rds_path, ". Wald-Chunk muss vorher laufen.")
+  }
+  res_V2_vs_A <- readRDS(rds_path)
 
 # --- Test verschiedene LFC-Cutoffs ---
 lfc_cutoffs <- c(0, 0.25, 0.5, 0.75, 1.0)
-padj_cutoff <- 0.05
+padj_cutoff <- params$padj_cutoff
 
+kegg_organism <- "hsa"  # Human (aus ORA-Chunk)
 sensitivity_results <- lapply(lfc_cutoffs, function(lfc) {
 
   # Filtere signifikante Gene
@@ -3314,7 +3427,7 @@ sensitivity_results <- lapply(lfc_cutoffs, function(lfc) {
       top_term = NA_character_,
       top_padj = NA_real_,
       ribosome_biogenesis_padj = NA_real_,
-      ribosome_biogenesis_generatio = NA_character_
+      ribosome_biogenesis_gene_ratio = NA_character_
     ))
   }
 
@@ -3325,8 +3438,8 @@ sensitivity_results <- lapply(lfc_cutoffs, function(lfc) {
         universe = universe_entrez,
         organism = kegg_organism,
         pAdjustMethod = "BH",
-        pvalueCutoff = 0.05,
-        qvalueCutoff = 0.05
+        pvalueCutoff = padj_cutoff,
+        qvalueCutoff = padj_cutoff
       )
     )
   }, error = function(e) NULL)
@@ -3339,7 +3452,7 @@ sensitivity_results <- lapply(lfc_cutoffs, function(lfc) {
       top_term = NA_character_,
       top_padj = NA_real_,
       ribosome_biogenesis_padj = NA_real_,
-      ribosome_biogenesis_generatio = NA_character_
+      ribosome_biogenesis_gene_ratio = NA_character_
     ))
   }
 
@@ -3355,7 +3468,7 @@ sensitivity_results <- lapply(lfc_cutoffs, function(lfc) {
     top_term = kegg_df$Description[1],
     top_padj = kegg_df$p.adjust[1],
     ribosome_biogenesis_padj = if (nrow(ribo_row) > 0) ribo_row$p.adjust[1] else NA_real_,
-    ribosome_biogenesis_generatio = if (nrow(ribo_row) > 0) ribo_row$GeneRatio[1] else NA_character_
+    ribosome_biogenesis_gene_ratio = if (nrow(ribo_row) > 0) ribo_row$GeneRatio[1] else NA_character_
   )
 })
 
@@ -3376,13 +3489,13 @@ p_sensitivity <- sensitivity_table |>
   ) |>
   ggplot(aes(x = factor(lfc_cutoff), y = neg_log10_padj)) +
   geom_col(fill = "#2166ac", alpha = 0.8) +
-  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "red") +
+  geom_hline(yintercept = -log10(padj_cutoff), linetype = "dashed", color = "red") +
   geom_text(aes(label = sprintf("n=%d", n_sig_genes)), vjust = -0.5, size = 3.5) +
   labs(
     x = "log2 Fold-Change Cutoff",
     y = "-log10(adjusted p-value) [capped at 100]",
     title = "Sensitivity Analysis: Ribosome Biogenesis Enrichment (KEGG hsa03008)",
-    subtitle = "V2 vs. A | Red line: FDR = 0.05 | Labels show number of DE genes",
+    subtitle = paste0("V2 vs. A | Red line: FDR = ", padj_cutoff, " | Labels show number of DE genes"),
     caption = "Conclusion: Ribosome biogenesis remains highly significant across all LFC thresholds"
   ) +
   theme_bw(base_size = 12) +
@@ -3425,8 +3538,17 @@ Prüft, ob Pathways mit extremen p-Werten in ORA (z.B. 10\^-84) auch in GSEA sig
 # =============================================================================
 
 # --- Load GSEA Results (V2_vs_A) ---
-gsea_V2_vs_A <- readRDS("../../res/functional/gsea_go/GSEA_GO_BP_V2_vs_A.rds")
+gsea_path <- "../../res/functional/gsea_go/GSEA_GO_BP_V2_vs_A.rds"
+  if (!file.exists(gsea_path)) {
+    stop("GSEA-Results nicht gefunden: ", gsea_path, ". GSEA-Chunk muss vorher laufen.")
+  }
+  gsea_V2_vs_A <- readRDS(gsea_path)
+  
 gsea_df <- as.data.frame(gsea_V2_vs_A)
+if (nrow(gsea_df) == 0) {
+    warning("GSEA V2 vs A hat keine Results. Cross-Validation übersprungen.")
+    # Skip rest of chunk oder return early
+  }
 
 # Suche nach ribosome-related pathways
 ribosome_gsea <- gsea_df |>
@@ -3441,15 +3563,22 @@ ribosome_gsea <- gsea_df |>
 cat("\n=== RIBOSOME-RELATED PATHWAYS (GSEA V2 vs A) ===\n")
 if (nrow(ribosome_gsea) > 0) {
   print(ribosome_gsea, n = 20)
-  cat("\n✓ GSEA confirms ribosome-related pathway enrichment\n")
-  cat("  → ORA extreme p-values are BIOLOGICALLY REAL, not statistical artifacts\n")
+  cat("\n✓ GSEA supports ribosome-related pathway enrichment\n")
+  cat("  → ORA signal is consistent across methods (threshold-free confirmation)\n")
 } else {
   cat("⚠ WARNING: No ribosome pathways found in GSEA!\n")
   cat("  → ORA p-values may be inflated by cutoff selection\n")
 }
 
 # --- Load KEGG ORA Results (V2_vs_A up) ---
-kegg_ora <- read.csv("../../res/functional/ora_kegg/KEGG_Wald_V2_vs_A_up_padj0.05_lfc0.50.csv")
+if (!exists("fmt2")) fmt2 <- function(x) format(x, nsmall = 2)
+padj_cutoff <- params$padj_cutoff
+lfc_min <- params$lfc_min
+kegg_ora_path <- file.path(
+  "../../res/functional/ora_kegg",
+  paste0("KEGG_Wald_V2_vs_A_up_padj", fmt2(padj_cutoff), "_lfc", fmt2(lfc_min), ".csv")
+)
+kegg_ora <- read.csv(kegg_ora_path, stringsAsFactors = FALSE)
 
 # --- Visualisierung 1: Timeline V1 → V2 (Ribosome Biogenesis) ---
 # Zeige biphasische Response: Suppression bei V1, Activation bei V2
@@ -3462,7 +3591,7 @@ gsea_V2_vs_V1 <- readRDS("../../res/functional/gsea_go/GSEA_GO_BP_V2_vs_V1.rds")
 extract_ribosome <- function(gsea_obj, contrast_name) {
   df <- as.data.frame(gsea_obj)
   df |>
-    dplyr::filter(grepl("ribosome biogenesis", Description, ignore.case = TRUE)) |>
+    dplyr::filter(grepl("ribosom.{0,20}bio", Description, ignore.case = TRUE)) |>
     dplyr::slice_head(n = 1) |>
     dplyr::mutate(Contrast = contrast_name) |>
     dplyr::select(Contrast, Description, NES, p.adjust)
@@ -3514,9 +3643,22 @@ if (nrow(ribosome_timeline) > 0) {
 
 # Mappe KEGG zu GO (nicht direkt möglich, daher nur Summary)
 cat("\n=== SUMMARY: ORA vs GSEA ===\n")
-cat(sprintf("ORA (KEGG V2 vs A up):  %d pathways (FDR < 0.05)\n", nrow(kegg_ora)))
-cat(sprintf("GSEA (GO BP V2 vs A):   %d pathways (FDR < 0.05)\n", sum(gsea_df$p.adjust < 0.05)))
+cat(sprintf("ORA (KEGG V2 vs A up):  %d pathways (FDR < %.2f)\n", nrow(kegg_ora), padj_cutoff))
+cat(sprintf("GSEA (GO BP V2 vs A):   %d pathways (FDR < %.2f)\n", sum(gsea_df$p.adjust < padj_cutoff), padj_cutoff))
 cat(sprintf("GSEA ribosome-related:  %d pathways\n", nrow(ribosome_gsea)))
-cat("\n✓ Cross-method validation confirms: extreme ORA p-values are REAL.\n")
+cat("\n✓ Cross-method validation supports ORA signal consistency across methods.\n")
 
+```
+
+## SessionInfo Export
+
+```{r}
+#| label: sessioninfo-export
+#| echo: false
+#| warning: false
+
+log_dir <- "../../res/logs"
+dir.create(log_dir, recursive = TRUE, showWarnings = FALSE)
+writeLines(capture.output(sessionInfo()), file.path(log_dir, "sessionInfo.txt"))
+message("SessionInfo saved to: ", file.path(log_dir, "sessionInfo.txt"))
 ```
