@@ -366,6 +366,24 @@ meta <- meta[match(colnames(txi_aortic$counts), rownames(meta)), , drop = FALSE]
 stopifnot(all(colnames(txi_aortic$counts) == rownames(meta)))
 
 # ------------------------------------------------------------
+# 2b) Cache: sample_meta für spätere Clinical-Integration
+# ------------------------------------------------------------
+# Lokale Absicherung: cache_dir für Meta-Export
+if (!exists("cache_dir")) {
+  cache_dir <- "../../res/cache"
+  dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
+}
+
+sample_meta_cache <- file.path(cache_dir, "sample_meta_deseq2.rds")
+
+if (!file.exists(sample_meta_cache)) {
+  saveRDS(meta, sample_meta_cache)
+  message("💾 Saved sample_meta cache: ", sample_meta_cache)
+} else {
+  message("✓ sample_meta cache already exists (no overwrite): ", sample_meta_cache)
+}
+
+# ------------------------------------------------------------
 # 3) tximport-Metainfo erhalten (falls nicht bereits gesetzt in Chunk 2)
 #    DESeqDataSetFromTximport() erwartet u.a. txi$countsFromAbundance
 # ------------------------------------------------------------

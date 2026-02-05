@@ -9,8 +9,9 @@ format:
     toc-depth: 3
     code-fold: show
     code-tools: true
-    df-print: paged
-    embed-resources: true
+    df-print: default
+    embed-resources: false
+
 ---
 
 # Übersicht
@@ -34,7 +35,6 @@ Dieses Dokument integriert klinische Variablen (Demografie, Komorbiditäten, Ech
 #| label: setup-packages
 #| echo: false
 #| warning: false
-#| message: false
 
 # Reproduzierbarkeit: Seed setzen
 set.seed(42)
@@ -43,7 +43,6 @@ message("✓ Seed set to 42 for reproducibility")
 # Pakete laden
 suppressPackageStartupMessages({
   library(tidyverse)
-  library(readr)
   library(janitor)
   library(lme4)
   library(lmerTest)     # Für df-Korrektur bei kleinen n
@@ -54,7 +53,41 @@ suppressPackageStartupMessages({
   library(RColorBrewer)
   library(knitr)
   library(kableExtra)
+  library(immunedeconv)
+  library(SummarizedExperiment)
+  library(patchwork)
+  library(immunedeconv)
+  library(org.Hs.eg.db)
+  library(digest)
 })
+
+# Erhöhe R Expression-Limit (verhindert "infinite recursion" bei komplexen Chunks)
+options(expressions = 50000)
+
+# Sichere print-Funktion (umgeht kableExtra knit_print Override)
+safe_print <- function(x, ...) {
+  if (inherits(x, c("tbl_df", "tbl", "data.frame"))) {
+    writeLines(capture.output(base::print.data.frame(as.data.frame(x), ...)))
+  } else {
+    writeLines(capture.output(base::print(x, ...)))
+  }
+}
+# === SAFETY PARAMETERS ===
+  # min_n_per_group / min_n_subgroup:
+  #   Stop-Regel gegen underpowered Subgruppenanalysen.
+  #   Bei n<20 pro Gruppe: keine separate Inferenz, nur deskriptiv.
+  #   Verhindert instabile Schätzer und falsch-positive Befunde bei kleinen Stichproben.
+  #
+  # vif_threshold:
+  #   Schwellenwert für Multikollinearität.
+  #   Modelle mit VIF>5 für einzelne Prädiktoren werden refactored.
+  #   Verhindert instabile Regressionskoeffizienten bei korrelierten Prädiktoren
+  #   (z.B. Euroscore + Komponenten, metabolisches Syndrom-Cluster).
+  #
+  # max_predictors:
+  #   Events-per-Variable Regel: Bei kontinuierlichen Outcomes ~10 Beobachtungen pro Prädiktor.
+  #   Bei n=46 sind max 4-5 Prädiktoren angemessen.
+  #   Schützt vor Overfitting bei kleiner Stichprobe ohne externe Validierung.
 
 # Parameter
 clinical_params <- list(
@@ -62,8 +95,10 @@ clinical_params <- list(
   min_n_per_group = 15,    # Minimum n für Interaktionsanalysen
   min_n_subgroup = 20,     # Minimum n für Subgruppenanalysen
   vif_threshold = 5,       # VIF-Schwellenwert für Kollinearität
-  seed = 42
-)
+  seed = 42,
+  # Power/EPV: Bei n=46, max 3-4 Prädiktoren empfohlen
+  max_predictors = 4       # Events-per-Variable Regel für kontinuierliche Outcomes
+  )
 
 # Verzeichnisse
 clinical_data_dir <- "../../../dat/info_files"
@@ -92,10 +127,6 @@ message("✓ Setup complete")
 
 **Ziel:** Clinical CSV mit korrektem Encoding/Locale importieren, Plausibilitätschecks durchführen
 
-**Kritische Checks:**
-- UTF-8/Latin-1 Encoding (prä → pr�)
-- Dezimal-Komma (79,73 → 79.73)
-- Wertebereich-Validierung
 
 ```{r}
 #| label: step1-import-clinical
@@ -106,6 +137,7 @@ message("=== SCHRITT 1: Clinical Data Import ===")
 
 # Cache-Pfad
 clinical_cache <- file.path(clinical_cache_dir, "clinical_raw.rds")
+
 
 if (file.exists(clinical_cache)) {
   message("✅ Lade Clinical Cache: ", clinical_cache)
@@ -121,13 +153,22 @@ if (file.exists(clinical_cache)) {
     show_col_types = FALSE
   ) %>%
     janitor::clean_names()
+  
+  if (!"labor_nr" %in% names(clinical_raw)) {
+  stop("Expected ID column 'labor_nr' not found after clean_names(). Check clinical CSV header.")
+}
 
-  # Encoding-Fix: Falls Umlaute fehlerhaft
-  # (Namen mit "pr�" sollten "prä" sein)
-  if (any(grepl("pr�", names(clinical_raw)))) {
-    names(clinical_raw) <- iconv(names(clinical_raw), from = "UTF-8", to = "UTF-8")
-    message("⚠️ Encoding-Issue detektiert, Namen konvertiert")
+  # Typ-Validierung: Numerische Spalten müssen numeric sein
+  numeric_vars <- c("age", "bmi", "pr_errechnete_gfr_mdrd", "log_euroscore_ii",
+                    "pr_echo_ef_percent", "pr_echo_aoef")
+  for (vname in numeric_vars) {
+    if (vname %in% names(clinical_raw)) {
+      if (!is.numeric(clinical_raw[[vname]])) {
+        stop(sprintf("Variable %s ist nicht numerisch. Dezimal-Komma-Import fehlgeschlagen?", vname))
+      }
+    }
   }
+  message("✓ Typ-Validierung: Alle numerischen Variablen korrekt importiert")
 
   saveRDS(clinical_raw, clinical_cache)
   message("💾 Gespeichert: ", clinical_cache)
@@ -137,8 +178,18 @@ if (file.exists(clinical_cache)) {
 # Plausibilitätschecks & Range-Validierung
 # ============================================================
 
-# Numerische Variablen-Ranges prüfen
-# WICHTIG: Namen nach clean_names() sind lowercase
+# === PLAUSIBILITÄTSCHECKS ===
+# Range-Definitionen basieren auf klinischer Plausibilität:
+#   - age: 50-100 Jahre (TAVI-Population älter)
+#   - bmi: 15-50 kg/m² (Untergewicht bis Adipositas Grad III)
+#   - gfr_mdrd: 10-120 ml/min (schwere Niereninsuffizienz bis Normwert)
+#   - log_euroscore_ii: 0-15% (Standard-Risiko bis Extremrisiko)
+#   - echo_ef: 10-80% (schwere Dysfunktion bis Normwert)
+#   - echo_aoef: 0.3-2 cm² (kritische bis leichte Stenose)
+#
+# Abweichungen >50% von Erwartungswert führen zu Stop (Import-Fehler vermutet),
+# moderate Abweichungen nur Warning (echte Extremwerte möglich).
+
 range_checks <- list(
   age = c(50, 100),
   bmi = c(15, 50),
@@ -148,18 +199,22 @@ range_checks <- list(
   pr_echo_aoef = c(0.3, 2)
 )
 
-
 for (vname in names(range_checks)) {
   if (vname %in% names(clinical_raw)) {
-
     val_range <- range(clinical_raw[[vname]], na.rm = TRUE)
     expected  <- range_checks[[vname]]
 
     if (val_range[1] < expected[1] | val_range[2] > expected[2]) {
-      warning(sprintf(
-        "⚠️ %s: Range [%.2f, %.2f] außerhalb erwartet [%.0f, %.0f]",
+      msg <- sprintf(
+        "%s: Range [%.2f, %.2f] außerhalb Plausibilitätsbereich [%.0f, %.0f]",
         vname, val_range[1], val_range[2], expected[1], expected[2]
-      ))
+      )
+      # Bei extremen Abweichungen: Stop, sonst Warning
+      if (val_range[1] < expected[1]*0.5 | val_range[2] > expected[2]*1.5) {
+        stop(msg, " — Kritischer Import-Fehler")
+      } else {
+        warning(msg)
+      }
     }
   }
 }
@@ -206,63 +261,250 @@ clinical_clean <- clinical_raw %>%
   # Redundanz entfernen (nach clean_names() sind alle Namen lowercase)
   dplyr::select(-any_of(c("male"))) %>%
 
-  # pid fuer Join vorbereiten (Labor_Nr entspricht RNA-seq PID)
+  # pid für Join vorbereiten (labor_nr entspricht RNA-seq pid)
   dplyr::rename(pid = labor_nr, clinical_nr = nr) %>%
 
-  # Abgeleitete Variablen
+  # Validierung: pid muss existieren und eindeutig sein
+  {
+    if (!"pid" %in% names(.)) stop("Spalte 'labor_nr' fehlt — pid-mapping nicht möglich")
+    if (any(is.na(.$pid))) stop("pid enthält NAs (n=", sum(is.na(.$pid)), ")")
+    if (any(duplicated(.$pid))) stop("pid enthält Duplikate (n=", sum(duplicated(.$pid)), ")")
+    message("✓ pid-validierung: ", length(unique(.$pid)), " eindeutige patienten-ids")
+    .
+  } %>%
+
   dplyr::mutate(
-    # GFR-Kategorien
-    GFR_impaired = ifelse(pr_errechnete_gfr_mdrd < 60, "impaired", "normal"),
-    GFR_cat = case_when(
+    # --------------------------------------------------------
+    # continuous versions (zusätzlich behalten; originale bleiben unverändert)
+    # --------------------------------------------------------
+    gfr_cont = pr_errechnete_gfr_mdrd,
+    bmi_cont = bmi,
+    euroscore_ii_percent = log_euroscore_ii,  # NOTE: nur umbenannt; siehe comment unten
+    ef_cont = pr_echo_ef_percent,
+
+    # --------------------------------------------------------
+    # gfr kategorien (kdigo 2012)
+    # --------------------------------------------------------
+    gfr_impaired = dplyr::case_when(
+      is.na(pr_errechnete_gfr_mdrd) ~ NA_character_,
+      pr_errechnete_gfr_mdrd < 60 ~ "impaired",
+      TRUE ~ "normal"
+    ),
+    gfr_cat = dplyr::case_when(
+      is.na(pr_errechnete_gfr_mdrd) ~ NA_character_,
       pr_errechnete_gfr_mdrd < 30 ~ "severe",
       pr_errechnete_gfr_mdrd < 60 ~ "moderate",
       TRUE ~ "normal"
     ),
 
-    # BMI-Kategorien
-    BMI_obese = ifelse(bmi >= 30, "obese", "non-obese"),
-    BMI_cat = case_when(
+    # --------------------------------------------------------
+    # bmi kategorien (who)
+    # --------------------------------------------------------
+    bmi_obese = dplyr::case_when(
+      is.na(bmi) ~ NA_character_,
+      bmi >= 30 ~ "obese",
+      TRUE ~ "non_obese"
+    ),
+    bmi_cat = dplyr::case_when(
+      is.na(bmi) ~ NA_character_,
       bmi < 25 ~ "normal",
       bmi < 30 ~ "overweight",
       TRUE ~ "obese"
     ),
 
-    # NYHA-Gruppierung (Klasse 4 ist selten, kombiniere 3+4)
-    NYHA_grouped = ifelse(nyha_2 >= 3, "NYHA_3-4", "NYHA_2"),
+    # --------------------------------------------------------
+    # nyha gruppierung (3+4 zusammen wegen kleiner n)
+    # --------------------------------------------------------
+    nyha_grouped = dplyr::case_when(
+      is.na(nyha_2) ~ NA_character_,
+      nyha_2 >= 3 ~ "nyha_3_4",
+      TRUE ~ "nyha_2"
+    ),
 
-    # Euroscore-Kategorien
-    Euroscore_high = ifelse(log_euroscore_ii >= 3, "high", "low"),
+    # --------------------------------------------------------
+    # euroscore kategorien (≥3% = high risk)
+    # --------------------------------------------------------
+    euroscore_high = dplyr::case_when(
+      is.na(euroscore_ii_percent) ~ NA_character_,
+      euroscore_ii_percent >= 3 ~ "high",
+      TRUE ~ "low"
+    ),
 
-    # Metabolisches Syndrom (≥2 aus: Diabetes, Dyslipidämie, Hypertonie, BMI≥30)
-    MetS_score = (diabetes == "yes") + (dyslipedemia == "yes") +
-                 (hypertension == "yes") + (bmi >= 30),
-    MetS = ifelse(MetS_score >= 2, "yes", "no"),
+    # --------------------------------------------------------
+    # cardiometabolic burden (metabolic syndrome proxy)
+    # NOTE: das ist NICHT atp-iii / ncep-mets, da waist/hdl/tg/glucose fehlen.
+    # score 0–4: diabetes, dyslipidemia, hypertension, bmi≥30
+    # missing wird als "no" behandelt, um score stabil zu halten.
+    # --------------------------------------------------------
+    metabolic_risk_score =
+      (tidyr::replace_na(diabetes == "yes", FALSE)) +
+      (tidyr::replace_na(dyslipedemia == "yes", FALSE)) +
+      (tidyr::replace_na(hypertension == "yes", FALSE)) +
+      (tidyr::replace_na(bmi >= 30, FALSE)),
 
-    # Yes/No zu Logical konvertieren (für Modelle)
-    across(
+    # binary flag nur für deskriptiv/tab1; analytisch bevorzugt score nutzen
+    metabolic_risk_high = dplyr::case_when(
+      is.na(metabolic_risk_score) ~ NA_character_,
+      metabolic_risk_score >= 2 ~ "yes",
+      TRUE ~ "no"
+    ),
+
+    # --------------------------------------------------------
+    # yes/no zu logical konvertieren (für model covariates)
+    # --------------------------------------------------------
+    dplyr::across(
       c(atrial_fibrillation_flutter, copd, diabetes, dyslipedemia, hypertension,
         p_avk, cerebrovascular_disease, significant_prior_cad, relevant_cad),
-      ~ .x == "yes"
+      ~ tidyr::replace_na(.x == "yes", FALSE)
     )
   )
 
-# Faktorisierung
+# ------------------------------------------------------------
+# faktorisierung (referenzlevel explizit gesetzt) + snake_case
+# ------------------------------------------------------------
 clinical_clean <- clinical_clean %>%
   dplyr::mutate(
     pid = as.character(pid),
+
+    # sex: ggf. input mapping nötig, falls "m/f" oder "male/female" gemischt ist
+    sex = tolower(as.character(sex)),
+    sex = dplyr::case_when(
+      sex %in% c("m", "male", "männlich", "maennlich") ~ "male",
+      sex %in% c("w", "f", "female", "weiblich") ~ "female",
+      TRUE ~ sex
+    ),
     sex = factor(sex, levels = c("male", "female")),
+
     ef_group = factor(ef_group, levels = c("preserved", "reduced")),
-    valve_type_grouped = factor(valve_type_grouped, levels = c("BEV", "SEV")),
-    GFR_impaired = factor(GFR_impaired, levels = c("normal", "impaired")),
-    GFR_cat = factor(GFR_cat, levels = c("normal", "moderate", "severe")),
-    BMI_obese = factor(BMI_obese, levels = c("non-obese", "obese")),
-    NYHA_grouped = factor(NYHA_grouped, levels = c("NYHA_2", "NYHA_3-4")),
-    Euroscore_high = factor(Euroscore_high, levels = c("low", "high")),
-    MetS = factor(MetS, levels = c("no", "yes"))
+    valve_type_grouped = factor(valve_type_grouped, levels = c("bev", "sev")),
+
+    gfr_impaired = factor(gfr_impaired, levels = c("normal", "impaired")),
+    gfr_cat = factor(gfr_cat, levels = c("normal", "moderate", "severe")),
+
+    bmi_obese = factor(bmi_obese, levels = c("non_obese", "obese")),
+    bmi_cat = factor(bmi_cat, levels = c("normal", "overweight", "obese")),
+
+    nyha_grouped = factor(nyha_grouped, levels = c("nyha_2", "nyha_3_4")),
+    euroscore_high = factor(euroscore_high, levels = c("low", "high")),
+
+    metabolic_risk_high = factor(metabolic_risk_high, levels = c("no", "yes"))
   )
 
-message("✓ Variables engineered: ", ncol(clinical_clean), " columns")
-message("  New variables: GFR_impaired, BMI_obese, NYHA_grouped, MetS")
+message("✓ variables engineered: ", ncol(clinical_clean), " columns")
+message("  new variables: gfr_cont, bmi_cont, euroscore_ii_percent, ef_cont, gfr_impaired, gfr_cat, bmi_obese, bmi_cat, nyha_grouped, euroscore_high, metabolic_risk_score, metabolic_risk_high")
+
+```
+
+
+```{r}
+#| label: step2-comorbidity-correlation
+#| echo: false
+#| warning: false
+
+message("\n=== SCHRITT 2.1: Comorbidity Correlation Matrix ===")
+
+comorbidity_vars <- c(
+  "diabetes",
+  "hypertension",
+  "dyslipedemia",
+  "atrial_fibrillation_flutter",
+  "copd",
+  "significant_prior_cad"
+)
+
+available_comorbidities <- intersect(comorbidity_vars, names(clinical_clean))
+
+if (length(available_comorbidities) >= 2) {
+
+  comorbidity_data <- clinical_clean %>%
+    dplyr::select(dplyr::all_of(available_comorbidities)) %>%
+    dplyr::mutate(
+      dplyr::across(
+        dplyr::everything(),
+        ~ dplyr::case_when(
+          is.na(.x) ~ NA_integer_,
+          is.logical(.x) ~ as.integer(.x),
+          is.numeric(.x) ~ as.integer(.x),
+          is.factor(.x)  ~ as.integer(as.character(.x)),
+          is.character(.x) ~ as.integer(.x %in% c("yes", "true", "1")),
+          TRUE ~ NA_integer_
+        )
+      )
+    )
+
+  # drop constant columns (var == 0) to avoid NA correlations
+  keep <- sapply(comorbidity_data, function(x) stats::var(x, na.rm = TRUE) > 0)
+  if (sum(keep) < 2) {
+    message("⚠️  Zu wenige variierende Komorbiditäten (Varianz=0) für Korrelationsmatrix.")
+  } else {
+
+    comorbidity_data <- comorbidity_data[, keep, drop = FALSE]
+
+    comorbidity_cor_matrix <- stats::cor(comorbidity_data, use = "pairwise.complete.obs")
+
+    message("\n--- COMORBIDITY CORRELATION MATRIX (pearson on 0/1; ~phi) ---")
+    print(round(comorbidity_cor_matrix, 2))
+
+    # identify pairs in upper triangle only (avoid duplicates)
+    upper_idx <- which(upper.tri(comorbidity_cor_matrix), arr.ind = TRUE)
+
+    cor_pairs <- tibble::tibble(
+      var1 = rownames(comorbidity_cor_matrix)[upper_idx[, 1]],
+      var2 = colnames(comorbidity_cor_matrix)[upper_idx[, 2]],
+      r = comorbidity_cor_matrix[upper_idx]
+    ) %>%
+      dplyr::filter(!is.na(r))
+
+    high_pairs <- cor_pairs %>% dplyr::filter(abs(r) >= 0.7)
+    moderate_pairs <- cor_pairs %>% dplyr::filter(abs(r) > 0.5, abs(r) < 0.7)
+
+    if (nrow(high_pairs) > 0) {
+      message("\n⚠️  Hohe Korrelationen gefunden (|r| ≥ 0.7):")
+      apply(high_pairs, 1, function(row) {
+        message(sprintf("  %s ↔ %s: r = %.2f (VIF-Monitoring erforderlich)", row["var1"], row["var2"], as.numeric(row["r"])))
+      })
+    }
+
+    if (nrow(moderate_pairs) > 0) {
+      message("\n⚠️  Moderate Korrelationen gefunden (0.5 < |r| < 0.7):")
+      apply(moderate_pairs, 1, function(row) {
+        message(sprintf("  %s ↔ %s: r = %.2f", row["var1"], row["var2"], as.numeric(row["r"])))
+      })
+    }
+
+    if (nrow(high_pairs) == 0 && nrow(moderate_pairs) == 0) {
+      message("\n✓ Keine problematischen Korrelationen (alle |r| ≤ 0.5)")
+    }
+
+    readr::write_csv(
+      as.data.frame(comorbidity_cor_matrix),
+      file.path(clinical_output_dir, "comorbidity_correlation_matrix.csv")
+    )
+    message("\n💾 Korrelationsmatrix gespeichert: comorbidity_correlation_matrix.csv")
+
+    # heatmap
+    tryCatch({
+      pdf(file.path(clinical_fig_dir, "comorbidity_correlation_heatmap.pdf"),
+          width = 8, height = 7)
+      pheatmap::pheatmap(
+        comorbidity_cor_matrix,
+        display_numbers = TRUE,
+        number_format = "%.2f",
+        cluster_rows = TRUE,
+        cluster_cols = TRUE,
+        main = "Comorbidity Correlation Matrix"
+      )
+      invisible(dev.off())
+      message("📊 Heatmap erstellt: comorbidity_correlation_heatmap.pdf")
+    }, error = function(e) {
+      message("⚠️  Heatmap konnte nicht erstellt werden: ", conditionMessage(e))
+    })
+  }
+
+} else {
+  message("⚠️  Zu wenige Komorbidität-Variablen verfügbar für Korrelationsmatrix")
+}
+
 ```
 
 ---
@@ -273,13 +515,12 @@ message("  New variables: GFR_impaired, BMI_obese, NYHA_grouped, MetS")
 
 **Kritische Checks:**
 - Patienten-ID-Matching (Nr ↔ pid)
-- Geschlecht/Alter-Abgleich (Validierung)
 - Join-Rate dokumentieren
 
 ```{r}
 #| label: step3-join-metadata
 #| echo: false
-#| warning: false
+#| warning: true
 
 message("=== SCHRITT 3: Join Clinical → RNA-seq Metadata ===")
 
@@ -303,9 +544,15 @@ if (!file.exists(deanalysis_cache)) {
 clinical_sample_meta <- readRDS(deanalysis_cache)
 message("✓ Geladen: clinical_sample_meta (n=", nrow(clinical_sample_meta), " samples)")
 
-# ============================================================
-# PRE-JOIN DIAGNOSTIK
-# ============================================================
+# === PRE-JOIN DIAGNOSTIK ===
+# Dokumentation der pid-Überlappung zwischen Clinical und RNA-seq.
+# Zweck: Frühzeitige Erkennung von Mapping-Fehlern.
+#
+#
+# Join-Strategie:
+#   - left_join auf clinical_sample_meta (behält alle RNA-seq Samples)
+#   - Clinical-Daten werden als NAs eingefügt für unmatched RNA-seq
+#   - Alternative wäre inner_join (nur matched), aber dann verlieren wir Samples
 
 # Unique PIDs in beiden Datasets
 pids_clinical <- unique(clinical_clean$pid)
@@ -349,8 +596,15 @@ stopifnot(nrow(sample_meta_clinical) == nrow(clinical_sample_meta))
 # POST-JOIN VALIDIERUNG
 # ============================================================
 
-# Anteil gemappter Samples
-n_mapped <- sum(!is.na(sample_meta_clinical$age))
+# Join-Indikator: hat dieser RNA-seq PID irgendeinen Clinical-Match?
+sample_meta_clinical <- clinical_sample_meta %>%
+  left_join(clinical_clean %>% dplyr::mutate(has_clinical = TRUE),
+            by = "pid", suffix = c("_rnaseq", "_clinical")) %>%
+  dplyr::mutate(has_clinical = dplyr::if_else(is.na(has_clinical), FALSE, has_clinical))
+
+stopifnot(nrow(sample_meta_clinical) == nrow(clinical_sample_meta))
+
+n_mapped  <- sum(sample_meta_clinical$has_clinical)
 join_rate <- n_mapped / nrow(sample_meta_clinical)
 
 message("\n--- POST-JOIN DIAGNOSTIK ---")
@@ -361,26 +615,6 @@ message("Unmapped samples: ", nrow(sample_meta_clinical) - n_mapped)
 # CRITICAL CHECK: Join-Rate sollte >90% sein
 if (join_rate < 0.9) {
   warning("⚠️ Join-Rate < 90% — prüfe Patienten-ID-Kodierung!")
-}
-
-# ============================================================
-# GESCHLECHT-ABGLEICH (Cross-Validation)
-# ============================================================
-
-# Falls Geschlecht in beiden Tabellen vorhanden: Abgleichen
-if ("sex_rnaseq" %in% names(sample_meta_clinical) &&
-    "sex_clinical" %in% names(sample_meta_clinical)) {
-
-  sex_mismatch <- sample_meta_clinical %>%
-    dplyr::filter(!is.na(sex_clinical)) %>%
-    dplyr::filter(sex_rnaseq != sex_clinical)
-
-  if (nrow(sex_mismatch) > 0) {
-    warning("⚠️ Geschlechts-Mismatch bei ", nrow(sex_mismatch), " Samples!")
-    print(sex_mismatch %>% select(sample_id, pid, sex_rnaseq, sex_clinical))
-  } else {
-    message("✓ Geschlecht: Alle Samples konsistent")
-  }
 }
 
 # ============================================================
@@ -420,9 +654,26 @@ n_per_timepoint <- sample_meta_clinical %>%
 
 print(n_per_timepoint)
 
-# ============================================================
-# Komplette Triplets (Patienten mit allen 3 Zeitpunkten)
-# ============================================================
+# === DROPOUT-ANALYSE ===
+# Dokumentation fehlender Zeitpunkte (Triplet-Completeness).
+#
+# Rationale:
+#   - Paired/Longitudinal Designs erfordern vollständige Messungen (A, V1, V2)
+#   - Dropout (fehlende Zeitpunkte) kann Bias erzeugen, falls nicht MCAR
+#   - Mixed models tolerieren unbalanced data, aber complete-case bevorzugt für Paired Tests
+#
+# Dropout-Mechanismen:
+#   - MCAR (Missing Completely At Random): Dropout unabhängig von Baseline oder Outcomes
+#   - MAR (Missing At Random): Dropout abhängig von beobachteten Baseline-Variablen
+#   - MNAR (Missing Not At Random): Dropout abhängig von nicht-beobachteten Outcomes
+#
+# Test-Strategie:
+#   - Logistic Regression: dropout ~ Baseline-Charakteristika
+#   - Falls p < 0.05 → MAR/MNAR → Complete-case biased
+#   - Falls p ≥ 0.05 → konsistent mit MCAR → Complete-case vertretbar
+#
+# Stop-Regel:
+#   - Dropout > 30% → Analysestrategie anpassen (mixed models statt complete-case)
 
 triplet_status <- sample_meta_clinical %>%
   group_by(pid) %>%
@@ -443,6 +694,9 @@ message("Total patients: ", n_total_patients)
 message("Complete triplets (A + V1 + V2): ", n_complete)
 message("Dropout rate: ", round(dropout_rate * 100, 1), "%")
 
+message("ℹ️ Hinweis: LMMs (Likelihood-basiert) sind Standard-of-Care für unbalanced longitudinale Daten und liefern unter MCAR/MAR valide Schätzer. Complete-case wird hier v.a. für Sensitivity/paired Analysen definiert.")
+
+
 # STOP-REGEL: >30% Dropout
 if (dropout_rate > 0.3) {
   warning(
@@ -461,12 +715,15 @@ if (dropout_rate > 0.1) {
 
   dropout_comparison <- clinical_clean %>%
     mutate(
-      has_complete_triplet = pid %in% triplet_status$pid[triplet_status$complete_triplet]
+      dropout = !(pid %in% triplet_status$pid[triplet_status$complete_triplet])
     ) %>%
-    group_by(has_complete_triplet) %>%
+    group_by(dropout) %>%
     summarise(
       n = n(),
       age_mean = mean(age, na.rm = TRUE),
+      bmi_mean = mean(bmi, na.rm = TRUE),
+      diabetes_rate = mean(diabetes, na.rm = TRUE),
+      hypertension_rate = mean(hypertension, na.rm = TRUE),
       euroscore_mean = mean(log_euroscore_ii, na.rm = TRUE),
       pct_female = mean(sex == "female", na.rm = TRUE) * 100,
       pct_reduced_EF = mean(ef_group == "reduced", na.rm = TRUE) * 100
@@ -474,8 +731,80 @@ if (dropout_rate > 0.1) {
 
   print(dropout_comparison)
 
-  # Test auf MCAR (Chi-Quadrat für kategoriale Variablen)
-  # Falls signifikant → MAR oder MNAR, nicht MCAR
+  # ============================================================
+  # Test auf MCAR: Logistic Regression Approach
+  # ============================================================
+  # Frage: Können Baseline-Charakteristika Dropout vorhersagen?
+  # Falls ja → MAR oder MNAR (nicht MCAR)
+
+  message("\n--- MCAR TEST (Logistic Regression) ---")
+
+  # Erstelle Dropout-Indikator (0 = complete, 1 = dropout)
+  clinical_mcar_data <- sample_meta_clinical %>%
+    filter(!is.na(age), !is.na(sex)) %>%
+    left_join(
+      triplet_status %>% dplyr::select(pid, complete_triplet),
+      by = "pid"
+    ) %>%
+    mutate(dropout = ifelse(complete_triplet, 0, 1)) %>%
+    filter(timepoint == "A") %>%  # Nur Baseline für Test
+    dplyr::select(dropout, age, sex, log_euroscore_ii, ef_group) %>%
+    filter(!is.na(log_euroscore_ii), !is.na(ef_group))
+
+  if (nrow(clinical_mcar_data) > 30 && sum(clinical_mcar_data$dropout) >= 10) {
+    tryCatch({
+      clinical_mcar_model <- glm(
+        dropout ~ age + sex + log_euroscore_ii + ef_group,
+        data = clinical_mcar_data,
+        family = binomial(link = "logit")
+      )
+
+      clinical_mcar_anova <- anova(clinical_mcar_model, test = "Chisq")
+
+      # Sicheres Extrahieren: nur wenn mehr als Intercept-Zeile
+      if (nrow(clinical_mcar_anova) > 1) {
+        clinical_mcar_pval <- min(clinical_mcar_anova$`Pr(>Chi)`[-1], na.rm = TRUE)
+
+        message("  Modell: dropout ~ age + sex + euroscore + ef_group")
+        message("  Minimum p-value: ", format.pval(clinical_mcar_pval, digits = 3))
+
+        # Zeige auch Koeffizienten (Effektstärken)
+        clinical_mcar_summary <- summary(clinical_mcar_model)
+        message("\n  Prädiktoren mit p < 0.10:")
+        coef_tbl <- as.data.frame(clinical_mcar_summary$coefficients)
+        coef_tbl$predictor <- rownames(coef_tbl)
+        sig_predictors <- coef_tbl[coef_tbl$`Pr(>|z|)` < 0.10 & coef_tbl$predictor != "(Intercept)", ]
+        if (nrow(sig_predictors) > 0) {
+          for (i in 1:nrow(sig_predictors)) {
+            message(sprintf("    %s: OR = %.2f, p = %.3f",
+                            sig_predictors$predictor[i],
+                            exp(sig_predictors$Estimate[i]),
+                            sig_predictors$`Pr(>|z|)`[i]))
+          }
+        }
+
+        if (clinical_mcar_pval < 0.05) {
+          message("\n  → WARNUNG: Dropout assoziiert mit Baseline-Charakteristika (p < 0.05)")
+          message("     Missingness ist MAR oder MNAR, NICHT MCAR")
+          message("     → Complete-case Analyse könnte biased sein")
+          message("     → Alternative: Mixed models (tolerieren unbalanced data)")
+        } else {
+          message("\n  → Dropout NICHT signifikant assoziiert mit Baseline (p ≥ 0.05)")
+          message("     Konsistent mit MCAR-Annahme")
+          message("     → Complete-case Analyse vertretbar (aber mixed models bevorzugt)")
+        }
+      } else {
+        message("  ⚠️ MCAR-Modell hat keine Prädiktoren (nur Intercept)")
+      }
+    }, error = function(e) {
+      message("  ⚠️ MCAR-Test fehlgeschlagen: ", conditionMessage(e))
+      message("     → Prüfe Dropout-Charakteristika visuell via dropout_comparison")
+    })
+  } else {
+    message("  ⚠️ Zu wenige Dropouts für MCAR-Test (n=", sum(clinical_mcar_data$dropout),
+            ", min. 10 erforderlich)")
+    message("     → Visuell prüfen via dropout_comparison")
+  }
 }
 
 # ============================================================
@@ -491,187 +820,1170 @@ message("\n✓ Complete-case dataset: ", nrow(sample_meta_clinical_complete),
 
 saveRDS(sample_meta_clinical_complete,
         file.path(clinical_cache_dir, "sample_meta_clinical_complete.rds"))
+
 ```
+
 
 ---
 
-# SCHRITT 5: Cell-type Deconvolution (Optional)
+# SCHRITT 5: Cell-type Deconvolution (Dual-Method Validation)
 
-**Ziel:** Schätze Zelltyp-Proportionen, prüfe Plausibilität
+**Ziel:** Robuste Zelltyp-Proportionen-Schätzung mit Cross-Validation
 
-**Methode:** CIBERSORTx oder MCP-counter (hier: Placeholder für Integration)
+**Methoden:**
+1. **CIBERSORT mit LM22** (primär, fraction-based)
+2. **MCP-counter** (Validierung, enrichment-based)
 
-**Entscheidung:** Als Covariate adjustieren ODER als Limitation dokumentieren
+**Literatur-Basis:**
+- Newman et al. 2015 (Nat Methods): CIBERSORT/LM22 Gold-Standard für Blut
+- Avila Cobos et al. 2020 (Nat Commun): Dual-method Validation empfohlen
+
 
 ```{r}
 #| label: step5-deconvolution
 #| echo: false
 #| warning: false
 
-message("=== SCHRITT 5: Cell-type Deconvolution ===")
+message("=== SCHRITT 5: Cell-type Deconvolution (Dual-Method) ===")
 
-# ============================================================
-# Ziel: Schätze Zelltyp-Proportionen mit MCP-counter
-# Methode: immunedeconv (signature-based, keine Referenz nötig)
-# Literatur: Becht et al. 2016 (Genome Biol), Kuppe et al. 2024
-# ============================================================
+# === METHODOLOGIE (Literatur-basiert) ===
+#
+# Strategie: Dual-Method Validation (CIBERSORT + MCP-counter)
+# Literatur:
+#   - Avila Cobos et al. 2020 (Nat Commun): "Benchmarking of deconvolution pipelines"
+#   - Nadel et al. 2021 (Brief Bioinform): "Thousands of clinical samples"
+#   - Sturm et al. 2020 (Methods Mol Biol): "immunedeconv package"
+#
+# Rationale für Dual-Method:
+#   - Einzelne Methode kann method-specific bias haben
+#   - Cross-Validation erhöht Robustheit
+#
+# === METHODE 1: CIBERSORT (primär, fraction-based) ===
+# Literatur: Newman et al. 2015, Nat Methods
+#
+# === METHODE 2: MCP-counter (Validierung, enrichment-based) ===
+# Literatur: Becht et al. 2016, Genome Biol
+#
+# → VST-Daten sind UNGEEIGNET (variance-stabilized, log-scale)
+# → Lade DESeq2 raw counts, normalisiere zu CPM
 
 # Cache-Pfad
-clinical_deconv_cache <- file.path(clinical_cache_dir, "deconvolution_mcp.rds")
+clinical_deconv_cache_cibersort <- file.path(clinical_cache_dir, "deconvolution_cibersort.rds")
+clinical_deconv_cache_mcp <- file.path(clinical_cache_dir, "deconvolution_mcp_validation.rds")
+clinical_deconv_cache_combined <- file.path(clinical_cache_dir, "deconvolution_combined.rds")
 
-if (file.exists(clinical_deconv_cache)) {
-  message("✅ Lade Deconvolution Cache: ", clinical_deconv_cache)
-  clinical_deconv_results <- readRDS(clinical_deconv_cache)
+# === CELL-TYPE DECONVOLUTION: DUAL-METHOD VALIDATION ===
+
+immunedeconv::set_cibersort_binary("../../../dat/CIBERSORT.R")
+immunedeconv::set_cibersort_mat("../../../dat/LM22.txt")
+
+# === CACHE-HANDLING ===
+if (file.exists(clinical_deconv_cache_combined)) {
+  message("✅ Lade Combined Deconvolution Cache")
+  clinical_deconv_combined <- readRDS(clinical_deconv_cache_combined)
+
 } else {
-  message("⏳ Führe Cell-type Deconvolution durch (MCP-counter)...")
+  message("⏳ Führe Dual-Method Deconvolution durch...")
 
-  # Prüfe ob immunedeconv verfügbar ist
-  if (!requireNamespace("immunedeconv", quietly = TRUE)) {
-    message("⚠️ Paket 'immunedeconv' nicht installiert.")
-    message("   Installation: devtools::install_github('omnideconv/immunedeconv')")
-    message("   → Überspringe Deconvolution (wird als Limitation dokumentiert)")
+  # ============================================================
+  # STEP 1: Lade RAW COUNTS
+  # ============================================================
+  # Literatur: Avila Cobos 2020 - "Linear scale counts or CPM, NOT TPM/log"
 
-    # Leere Placeholder-Matrix
-    clinical_deconv_results <- NULL
+  # Lade DESeq2-Objekt (enthält raw counts)
+  deanalysis_dds_cache <- "../../../res/cache/dds_DESeq_fitted.rds"
 
-  } else {
-    # VST-Daten aus DEanalysis.qmd laden
-    deanalysis_vst_cache <- "../../../res/cache/vst_matrix.rds"
-
-    if (!file.exists(deanalysis_vst_cache)) {
-      stop(
-        "❌ VST-Matrix nicht gefunden. Bitte erst DEanalysis.qmd bis 'qc-vst-pca' laufen lassen.",
-        "\n   Erwarteter Pfad: ", deanalysis_vst_cache
-      )
-    }
-
-    clinical_vst_matrix <- readRDS(deanalysis_vst_cache)
-    message("✓ VST-Matrix geladen: ", nrow(clinical_vst_matrix), " genes × ",
-            ncol(clinical_vst_matrix), " samples")
-
-    # MCP-counter Deconvolution
-    # WICHTIG: MCP-counter erwartet Gene-Symbole, nicht ENSEMBL-IDs
-    # Falls VST-Matrix ENSEMBL-IDs hat: Gene-Annotation laden
-    if (all(grepl("^ENSG", rownames(clinical_vst_matrix)[1:10]))) {
-      message("→ VST-Matrix hat ENSEMBL-IDs, konvertiere zu Gene-Symbolen...")
-
-      # Annotation aus DEanalysis.qmd laden
-      gene_anno_cache <- "../../../res/cache/gene_annotation.rds"
-      if (file.exists(gene_anno_cache)) {
-        clinical_gene_anno <- readRDS(gene_anno_cache)
-
-        # Strip Version von ENSEMBL-IDs falls nötig
-        clinical_vst_ensembl <- sub("\\..*", "", rownames(clinical_vst_matrix))
-        clinical_gene_anno$ensembl_id <- sub("\\..*", "", clinical_gene_anno$ensembl_id)
-
-        # Mapping ENSEMBL → SYMBOL
-        idx <- match(clinical_vst_ensembl, clinical_gene_anno$ensembl_id)
-        clinical_vst_symbols <- clinical_gene_anno$SYMBOL[idx]
-
-        # Entferne NAs und Duplikate (nehme ersten)
-        valid <- !is.na(clinical_vst_symbols) & clinical_vst_symbols != ""
-        clinical_vst_matrix_symbols <- clinical_vst_matrix[valid, ]
-        rownames(clinical_vst_matrix_symbols) <- clinical_vst_symbols[valid]
-
-        # Bei duplizierten Symbolen: Mittelwert
-        clinical_vst_matrix_symbols <- clinical_vst_matrix_symbols[
-          !duplicated(rownames(clinical_vst_matrix_symbols)),
-        ]
-
-        message("✓ Konvertierung: ", nrow(clinical_vst_matrix), " → ",
-                nrow(clinical_vst_matrix_symbols), " genes mit Symbolen")
-
-        clinical_vst_matrix <- clinical_vst_matrix_symbols
-      } else {
-        stop("❌ Gene-Annotation nicht gefunden: ", gene_anno_cache)
-      }
-    }
-
-    # MCP-counter ausführen
-    suppressPackageStartupMessages(library(immunedeconv))
-
-    clinical_deconv_mcp <- immunedeconv::deconvolute(
-      gene_expression = clinical_vst_matrix,
-      method = "mcp_counter"
+  if (!file.exists(deanalysis_dds_cache)) {
+    stop(
+      "❌ DESeq2-Objekt nicht gefunden.",
+      "\n   Erwarteter Pfad: ", deanalysis_dds_cache,
+      "\n   Bitte erst DEanalysis.qmd bis 'deseq2-normalization' laufen lassen."
     )
+  }
 
-    # Formatierung: Long → Wide (Samples × Cell Types)
-    clinical_deconv_results <- clinical_deconv_mcp %>%
+  clinical_dds <- readRDS(deanalysis_dds_cache)
+  clinical_raw_counts <- SummarizedExperiment::assay(clinical_dds, "counts")
+  message("✓ Raw counts geladen: ", nrow(clinical_raw_counts), " genes × ",
+          ncol(clinical_raw_counts), " samples")
+
+  # ============================================================
+  # STEP 2: CPM-Normalisierung (counts per million)
+  # ============================================================
+  # Literatur: Monaco et al. 2019 - "mRNA abundance normalization"
+
+  clinical_library_sizes <- colSums(clinical_raw_counts)
+  clinical_cpm_matrix <- sweep(clinical_raw_counts, 2, clinical_library_sizes / 1e6, "/")
+
+  message("✓ CPM-Normalisierung abgeschlossen")
+  message("  Library sizes: ", paste(round(range(clinical_library_sizes) / 1e6, 2), collapse = "–"), " Mio reads")
+
+  # ============================================================
+  # STEP 3: ENSEMBL → Gene Symbol Konvertierung
+  # ============================================================
+  # Gleiche Logik wie bei quanTIseq, aber mit CPM statt VST
+
+  if (all(grepl("^ENSG", rownames(clinical_cpm_matrix)[1:10]))) {
+    message("→ Matrix hat ENSEMBL-IDs, konvertiere zu Gene-Symbolen...")
+
+    clinical_cpm_ensembl <- sub("\\..*", "", rownames(clinical_cpm_matrix))
+
+    clinical_ensembl_to_symbol <- suppressMessages(
+      AnnotationDbi::select(
+        org.Hs.eg.db,
+        keys = clinical_cpm_ensembl,
+        columns = "SYMBOL",
+        keytype = "ENSEMBL"
+      )
+    ) %>%
+      dplyr::filter(!is.na(SYMBOL), SYMBOL != "") %>%
+      dplyr::arrange(ENSEMBL, SYMBOL) %>%
+      dplyr::distinct(ENSEMBL, .keep_all = TRUE)
+
+    message("  Mapped ", nrow(clinical_ensembl_to_symbol), " / ",
+            length(clinical_cpm_ensembl), " ENSEMBL IDs to symbols")
+
+    # Filtere Matrix auf mappbare Gene
+    clinical_cpm_matrix_symbols <- clinical_cpm_matrix[
+  clinical_cpm_ensembl %in% clinical_ensembl_to_symbol$ENSEMBL, , drop = FALSE
+]
+
+    rownames(clinical_cpm_matrix_symbols) <- clinical_ensembl_to_symbol$SYMBOL[
+      match(clinical_cpm_ensembl[clinical_cpm_ensembl %in% clinical_ensembl_to_symbol$ENSEMBL],
+            clinical_ensembl_to_symbol$ENSEMBL)
+    ]
+
+    # Duplikate: Mittelwert (robust)
+    if (any(duplicated(rownames(clinical_cpm_matrix_symbols)))) {
+      message("  → ", sum(duplicated(rownames(clinical_cpm_matrix_symbols))),
+              " duplizierte Gene-Symbole, berechne Mittelwerte...")
+
+      clinical_cpm_matrix_symbols <- as.data.frame(clinical_cpm_matrix_symbols) %>%
+        tibble::rownames_to_column("gene") %>%
+        dplyr::group_by(gene) %>%
+        dplyr::summarise(across(everything(), mean)) %>%
+        tibble::column_to_rownames("gene") %>%
+        as.matrix()
+    }
+
+    message("✓ Konvertierung: ", nrow(clinical_cpm_matrix), " → ",
+            nrow(clinical_cpm_matrix_symbols), " genes mit Symbolen")
+
+    # Validierung: Mindest-Gene
+    if (nrow(clinical_cpm_matrix_symbols) < 5000) {
+      warning("⚠️ Nur ", nrow(clinical_cpm_matrix_symbols), " Gene mit Symbolen")
+      warning("   CIBERSORT/MCP-counter empfehlen ≥8000 Gene für robuste Schätzung")
+    }
+
+    clinical_cpm_matrix <- clinical_cpm_matrix_symbols
+  }
+
+  # ============================================================
+  # STEP 4a: CIBERSORT (primär, fraction-based)
+  # ============================================================
+  # Literatur: Newman et al. 2015, Nat Methods
+
+  message("\n⏳Running CIBERSORT with LM22 signature")
+  message("   Method: fraction-based, 22 cell types")
+  message("   Reference: LM22 (547 genes, whole blood validated)")
+
+  clinical_deconv_cibersort <- tryCatch({
+    immunedeconv::deconvolute(
+      gene_expression = clinical_cpm_matrix,
+      method = "cibersort",
+      tumor = FALSE,
+      arrays = FALSE # RNA-seq (not microarray)
+    )
+  }, error = function(e) {
+    message("❌ cibersort failed: ", conditionMessage(e))
+    message("   Falls Token erforderlich: set_cibersort_binary() / set_cibersort_mat()")
+    return(NULL)
+  })
+
+  if (!is.null(clinical_deconv_cibersort)) {
+    message("✓ cibersort completed: ", nrow(clinical_deconv_cibersort),
+            " cell types × ", ncol(clinical_deconv_cibersort) - 1, " samples")
+
+    # Format: Long → Wide (samples × cell types)
+    clinical_deconv_cibersort_wide <- clinical_deconv_cibersort %>%
       tidyr::pivot_longer(
         cols = -cell_type,
         names_to = "sample_id",
-        values_to = "mcp_score"
+        values_to = "fraction"
       ) %>%
       tidyr::pivot_wider(
         names_from = cell_type,
-        values_from = mcp_score,
-        names_prefix = "celltype_"
+        values_from = fraction,
+        names_prefix = "CIBERSORT_"
       )
 
-    # Speichere Cache
-    saveRDS(clinical_deconv_results, clinical_deconv_cache)
-    message("💾 Gespeichert: ", clinical_deconv_cache)
+    # Bereinige Namen
+    colnames(clinical_deconv_cibersort_wide) <- gsub(" ", "_", colnames(clinical_deconv_cibersort_wide))
+    colnames(clinical_deconv_cibersort_wide) <- gsub("\\(", "", colnames(clinical_deconv_cibersort_wide))
+    colnames(clinical_deconv_cibersort_wide) <- gsub("\\)", "", colnames(clinical_deconv_cibersort_wide))
+    colnames(clinical_deconv_cibersort_wide) <- gsub("\\+", "plus", colnames(clinical_deconv_cibersort_wide))
+    colnames(clinical_deconv_cibersort_wide) <- gsub("-", "_", colnames(clinical_deconv_cibersort_wide))
+
+    saveRDS(clinical_deconv_cibersort_wide, clinical_deconv_cache_cibersort)
+    message("💾 Gespeichert: ", clinical_deconv_cache_cibersort)
+
+  } else {
+    message("⚠️ cibersort nicht verfügbar")
+    clinical_deconv_cibersort_wide <- NULL
   }
-}
 
-# ============================================================
-# Merge mit sample_meta_clinical
-# ============================================================
+  # ============================================================
+  # STEP 4b: MCP-counter (Validierung, enrichment-based)
+  # ============================================================
+  # Literatur: Becht et al. 2016, Genome Biol
+  # WICHTIG: Scores sind NICHT Fraktionen!
 
-if (!is.null(clinical_deconv_results)) {
+  message("\n⏳ Running MCP-counter for validation...")
+  message("   Method: enrichment-based (dimensionless scores)")
+  message("   Note: developed/validated mainly for tissue microenvironment; use in
+          blood is a limitation")
 
-  # Vor Merge: Anzahl
+  clinical_deconv_mcp <- tryCatch({
+    immunedeconv::deconvolute(
+      gene_expression = clinical_cpm_matrix,
+      method = "mcp_counter"
+    )
+  }, error = function(e) {
+    message("❌ MCP-counter failed: ", conditionMessage(e))
+    return(NULL)
+  })
+
+  if (!is.null(clinical_deconv_mcp)) {
+    message("✓ MCP-counter completed: ", nrow(clinical_deconv_mcp),
+            " cell types × ", ncol(clinical_deconv_mcp) - 1, " samples")
+
+    # Format: Long → Wide
+    clinical_deconv_mcp_wide <- clinical_deconv_mcp %>%
+      tidyr::pivot_longer(
+        cols = -cell_type,
+        names_to = "sample_id",
+        values_to = "enrichment_score"
+      ) %>%
+      tidyr::pivot_wider(
+        names_from = cell_type,
+        values_from = enrichment_score,
+        names_prefix = "MCP_"
+      )
+
+    # Bereinige Namen
+    colnames(clinical_deconv_mcp_wide) <- gsub(" ", "_", colnames(clinical_deconv_mcp_wide))
+    colnames(clinical_deconv_mcp_wide) <- gsub("\\+", "plus", colnames(clinical_deconv_mcp_wide))
+
+    saveRDS(clinical_deconv_mcp_wide, clinical_deconv_cache_mcp)
+    message("💾 Gespeichert: ", clinical_deconv_cache_mcp)
+
+  } else {
+    message("⚠️ MCP-counter nicht verfügbar")
+    clinical_deconv_mcp_wide <- NULL
+  }
+
+  # ============================================================
+  # STEP 5: Cross-Method Validation (Extended)
+  # ============================================================
+  #
+  # === LITERATURE CONTEXT (Updated) ===
+  #
+  # Key insight: There is NO universal correlation cutoff for cross-method
+  # validation. Correlation magnitudes are highly cell-type and dataset-dependent.
+  #
+  # References:
+  #   - Newman et al. 2015 (CIBERSORT): Validation against flow cytometry,
+  #     correlations vary by cell type (r = 0.3-0.9 depending on cell population)
+  #   - Avila Cobos et al. 2020 (Nat Commun): "Benchmarking of deconvolution pipelines"
+  #     → Input scale/preprocessing affects results substantially
+  #     → Evaluation via multiple metrics recommended
+  #   - Sturm et al. 2019 (Bioinformatics): immunedeconv benchmarking shows
+  #     method-specific biases, no ground truth in most clinical samples
+  #
+  # Best practice (our approach):
+  #   1. Use MULTIPLE metrics (Pearson r, Spearman rho) not single cutoffs
+  #   2. Visualize agreement via scatterplots (pattern recognition > thresholds)
+  #   3. Assess longitudinal consistency via patient-level deltas
+  #   4. Report as "screening/QC" rather than "pass/fail"
+  #   5. Use sensitivity analysis instead of binary inclusion/exclusion decisions
+  #
+  # IMPORTANT: CIBERSORT produces FRACTIONS (sum to 1, compositional constraint)
+  # while MCP-counter produces ENRICHMENT SCORES (unbounded, not fractions).
+  # Direct comparison is inherently imperfect; we assess RELATIVE agreement.
+  # ============================================================
+
+  if (!is.null(clinical_deconv_cibersort_wide) && !is.null(clinical_deconv_mcp_wide)) {
+    message("\n=== CROSS-METHOD VALIDATION (Extended QC Panel) ===")
+    message("Note: Comparing CIBERSORT fractions vs MCP-counter scores")
+    message("      No universal cutoffs; this is screening/QC, not pass/fail")
+
+    # Merge both datasets
+    clinical_deconv_merged <- clinical_deconv_cibersort_wide %>%
+      dplyr::left_join(clinical_deconv_mcp_wide, by = "sample_id")
+
+    # ----------------------------------------------------------
+    # C1: Cross-Method Mapping mit flexibler Spaltenerkennung
+    # ----------------------------------------------------------
+    # Biologisch sinnvolle Aggregation vor dem Matching:
+    # - NK: Summe aus resting + activated
+    # - B: Summe aller B-Zell-Subtypen
+    # - T: Summe aller T-Zell-Subtypen
+    # - Monocytes/Neutrophils: direkt (keine Subtypen in LM22)
+    #
+    # MCP-counter Spaltennamen variieren je nach Version/Einstellung,
+    # daher flexible Pattern-Suche statt exakter Namen.
+
+    # Verfuegbare Spalten identifizieren
+    cib_cols <- names(clinical_deconv_merged)[grepl("^CIBERSORT_", names(clinical_deconv_merged))]
+    mcp_cols <- names(clinical_deconv_merged)[grepl("^MCP_", names(clinical_deconv_merged))]
+
+    message("\n--- Verfuegbare Zelltypen ---")
+    message("  CIBERSORT (", length(cib_cols), "): ",
+            paste(gsub("CIBERSORT_", "", cib_cols), collapse = ", "))
+    message("  MCP-counter (", length(mcp_cols), "): ",
+            paste(gsub("MCP_", "", mcp_cols), collapse = ", "))
+
+    # Hilfsfunktion: Finde beste passende Spalte via Pattern
+    find_col <- function(cols, patterns, ignore_case = TRUE) {
+      for (pat in patterns) {
+        matches <- grep(pat, cols, value = TRUE, ignore.case = ignore_case)
+        if (length(matches) > 0) return(matches[1])
+      }
+      return(NA_character_)
+    }
+
+    # ============================================================
+    # CIBERSORT Aggregate erstellen (biologisch korrekt)
+    # ============================================================
+    #
+    # WICHTIG: Praezise Patterns verwenden um falsche Zuordnungen zu vermeiden!
+    # Problem: "T_cell" Pattern koennte auch "Mast_cell" matchen wenn nicht sauber.
+    # Loesung: Anchor-Patterns mit "^CIBERSORT_" Prefix fuer eindeutiges Matching.
+    #
+    # LM22 Zelltypen (nach Sanitization):
+    # - T_cells_*: CD8, CD4_naive, CD4_memory_resting, CD4_memory_activated,
+    #              follicular_helper, regulatory_Tregs, gamma_delta
+    # - B_cells_*: naive, memory
+    # - NK_cells_*: resting, activated
+    # - Mast_cells_*: resting, activated (NICHT zu T-Zellen!)
+    # - Monocytes, Neutrophils: direkt (keine Subtypen)
+
+    message("\n--- Erstelle CIBERSORT Aggregate ---")
+
+    # Hilfsfunktion: Sichere Aggregation mit explizitem Logging
+    safe_aggregate <- function(df, cols, new_col_name) {
+      if (length(cols) == 0) {
+        return(NA_real_)
+      }
+      rowSums(df[, cols, drop = FALSE], na.rm = TRUE)
+    }
+
+    # ---------------------------------------------------------------
+    # T-Zellen: NUR echte T_cells_* Spalten (NICHT Mast_cells!)
+    # ---------------------------------------------------------------
+    # Pattern: Beginnt mit "CIBERSORT_T_cells_" (nach Sanitization)
+    tcell_cib_cols <- grep("^CIBERSORT_T_cells_", cib_cols, value = TRUE)
+
+    # Fallback: Auch "T_cell_" ohne 's' pruefen (je nach Sanitization)
+    if (length(tcell_cib_cols) == 0) {
+      tcell_cib_cols <- grep("^CIBERSORT_T_cell_", cib_cols, value = TRUE)
+    }
+
+    # Sicherheitscheck: Mast_cells duerfen NICHT enthalten sein!
+    tcell_cib_cols <- tcell_cib_cols[!grepl("Mast", tcell_cib_cols, ignore.case = TRUE)]
+
+    if (length(tcell_cib_cols) > 0) {
+      clinical_deconv_merged$CIBERSORT_t_cell_total <- safe_aggregate(
+        clinical_deconv_merged, tcell_cib_cols, "t_cell_total"
+      )
+      message("  t_cell_total: Summe aus ", length(tcell_cib_cols), " Subtypen")
+      message("    -> ", paste(gsub("CIBERSORT_", "", tcell_cib_cols), collapse = ", "))
+    } else {
+      clinical_deconv_merged$CIBERSORT_t_cell_total <- NA_real_
+      message("  WARNUNG: Keine T-Zell-Spalten gefunden")
+    }
+
+    # ---------------------------------------------------------------
+    # B-Zellen: NUR B_cells_* Spalten
+    # ---------------------------------------------------------------
+    bcell_cib_cols <- grep("^CIBERSORT_B_cells_", cib_cols, value = TRUE)
+    if (length(bcell_cib_cols) == 0) {
+      bcell_cib_cols <- grep("^CIBERSORT_B_cell_", cib_cols, value = TRUE)
+    }
+
+    if (length(bcell_cib_cols) > 0) {
+      clinical_deconv_merged$CIBERSORT_b_cell_total <- safe_aggregate(
+        clinical_deconv_merged, bcell_cib_cols, "b_cell_total"
+      )
+      message("  b_cell_total: Summe aus ", length(bcell_cib_cols), " Subtypen")
+      message("    -> ", paste(gsub("CIBERSORT_", "", bcell_cib_cols), collapse = ", "))
+    } else {
+      clinical_deconv_merged$CIBERSORT_b_cell_total <- NA_real_
+      message("  WARNUNG: Keine B-Zell-Spalten gefunden")
+    }
+
+    # ---------------------------------------------------------------
+    # NK-Zellen: NUR NK_cells_* Spalten
+    # ---------------------------------------------------------------
+    nk_cib_cols <- grep("^CIBERSORT_NK_cells_", cib_cols, value = TRUE)
+    if (length(nk_cib_cols) == 0) {
+      nk_cib_cols <- grep("^CIBERSORT_NK_cell_", cib_cols, value = TRUE)
+    }
+
+    if (length(nk_cib_cols) > 0) {
+      clinical_deconv_merged$CIBERSORT_nk_cell_total <- safe_aggregate(
+        clinical_deconv_merged, nk_cib_cols, "nk_cell_total"
+      )
+      message("  nk_cell_total: Summe aus ", length(nk_cib_cols), " Subtypen")
+      message("    -> ", paste(gsub("CIBERSORT_", "", nk_cib_cols), collapse = ", "))
+    } else {
+      clinical_deconv_merged$CIBERSORT_nk_cell_total <- NA_real_
+      message("  WARNUNG: Keine NK-Zell-Spalten gefunden")
+    }
+
+    # ---------------------------------------------------------------
+    # Mastzellen: Separat aggregieren (NEU - nicht mit T-Zellen mischen!)
+    # ---------------------------------------------------------------
+    mast_cib_cols <- grep("^CIBERSORT_Mast_cells_", cib_cols, value = TRUE)
+    if (length(mast_cib_cols) == 0) {
+      mast_cib_cols <- grep("^CIBERSORT_Mast_cell_", cib_cols, value = TRUE)
+    }
+
+    if (length(mast_cib_cols) > 0) {
+      clinical_deconv_merged$CIBERSORT_mast_cell_total <- safe_aggregate(
+        clinical_deconv_merged, mast_cib_cols, "mast_cell_total"
+      )
+      message("  mast_cell_total: Summe aus ", length(mast_cib_cols), " Subtypen")
+      message("    -> ", paste(gsub("CIBERSORT_", "", mast_cib_cols), collapse = ", "))
+    } else {
+      message("  mast_cell_total: Keine Mast-Zell-Spalten gefunden (optional)")
+    }
+
+    # ---------------------------------------------------------------
+    # Monozyten: direkt (keine Subtypen in LM22)
+    # ---------------------------------------------------------------
+    mono_cib_col <- find_col(cib_cols, c("^CIBERSORT_Monocytes$", "^CIBERSORT_Monocyte$"))
+    if (!is.na(mono_cib_col)) {
+      message("  monocyte: ", gsub("CIBERSORT_", "", mono_cib_col), " (direkt)")
+    } else {
+      message("  WARNUNG: Keine Monozyten-Spalte gefunden")
+    }
+
+    # ---------------------------------------------------------------
+    # Neutrophile: direkt
+    # ---------------------------------------------------------------
+    neutro_cib_col <- find_col(cib_cols, c("^CIBERSORT_Neutrophils$", "^CIBERSORT_Neutrophil$"))
+    if (!is.na(neutro_cib_col)) {
+      message("  neutrophil: ", gsub("CIBERSORT_", "", neutro_cib_col), " (direkt)")
+    } else {
+      message("  WARNUNG: Keine Neutrophilen-Spalte gefunden")
+    }
+
+    # ---------------------------------------------------------------
+    # Validierung: Zusammenfassung der Aggregate
+    # ---------------------------------------------------------------
+    message("\n--- Aggregat-Validierung ---")
+    n_tcell <- length(tcell_cib_cols)
+    n_bcell <- length(bcell_cib_cols)
+    n_nk <- length(nk_cib_cols)
+    n_mast <- length(mast_cib_cols)
+    message("  T-Zellen: ", n_tcell, " Subtypen (erwartet: 7 in LM22)")
+    message("  B-Zellen: ", n_bcell, " Subtypen (erwartet: 2 in LM22)")
+    message("  NK-Zellen: ", n_nk, " Subtypen (erwartet: 2 in LM22)")
+    message("  Mast-Zellen: ", n_mast, " Subtypen (erwartet: 2 in LM22, separat!)")
+
+    # ============================================================
+    # MCP-counter Spalten finden (flexible Patterns)
+    # ============================================================
+
+    message("\n--- Suche MCP-counter Entsprechungen ---")
+
+    # MCP T-Zellen
+    mcp_tcell_col <- find_col(mcp_cols, c("^MCP_T_cell", "^MCP_T.cell", "^MCP_Tcell"))
+    if (!is.na(mcp_tcell_col)) message("  T cells: ", mcp_tcell_col)
+
+    # MCP B-Zellen (oft "B lineage" oder "B_lineage")
+    mcp_bcell_col <- find_col(mcp_cols, c("B_lineage", "B.lineage", "B_cell", "Blineage"))
+    if (!is.na(mcp_bcell_col)) message("  B cells: ", mcp_bcell_col)
+
+    # MCP NK-Zellen
+    mcp_nk_col <- find_col(mcp_cols, c("NK_cell", "NK.cell", "NKcell"))
+    if (!is.na(mcp_nk_col)) message("  NK cells: ", mcp_nk_col)
+
+    # MCP Monozyten (oft "Monocytic lineage")
+    mcp_mono_col <- find_col(mcp_cols, c("Monocyt", "monocyt", "Monocitic"))
+    if (!is.na(mcp_mono_col)) message("  Monocytes: ", mcp_mono_col)
+
+    # MCP Neutrophile
+    mcp_neutro_col <- find_col(mcp_cols, c("Neutrophil", "neutrophil"))
+    if (!is.na(mcp_neutro_col)) message("  Neutrophils: ", mcp_neutro_col)
+
+    # ============================================================
+    # Mapping-Tabelle dynamisch erstellen
+    # ============================================================
+    # Verwendet die neuen snake_case Aggregate-Spaltennamen
+
+    # Aktualisierte Spaltenliste nach Aggregat-Erstellung
+    all_cols <- names(clinical_deconv_merged)
+
+    # Mapping-Paare definieren (nur wenn beide Seiten existieren)
+    # snake_case fuer neue Aggregate: t_cell_total, b_cell_total, etc.
+    mapping_candidates <- list(
+      list(
+        pair_name = "t_cells",
+        cib_col = if ("CIBERSORT_t_cell_total" %in% all_cols) "CIBERSORT_t_cell_total" else NA,
+        mcp_col = mcp_tcell_col
+      ),
+      list(
+        pair_name = "b_cells",
+        cib_col = if ("CIBERSORT_b_cell_total" %in% all_cols) "CIBERSORT_b_cell_total" else NA,
+        mcp_col = mcp_bcell_col
+      ),
+      list(
+        pair_name = "nk_cells",
+        cib_col = if ("CIBERSORT_nk_cell_total" %in% all_cols) "CIBERSORT_nk_cell_total" else NA,
+        mcp_col = mcp_nk_col
+      ),
+      list(
+        pair_name = "monocytes",
+        cib_col = mono_cib_col,
+        mcp_col = mcp_mono_col
+      ),
+      list(
+        pair_name = "neutrophils",
+        cib_col = neutro_cib_col,
+        mcp_col = mcp_neutro_col
+      )
+    )
+
+    # Nur gueltige Paare behalten (beide Spalten muessen existieren)
+    valid_mappings <- lapply(mapping_candidates, function(m) {
+      if (!is.na(m$cib_col) && !is.na(m$mcp_col) &&
+          m$cib_col %in% all_cols && m$mcp_col %in% all_cols) {
+        return(tibble::tibble(
+          pair_name = m$pair_name,
+          cibersort_col = m$cib_col,
+          mcp_col = m$mcp_col
+        ))
+      }
+      return(NULL)
+    })
+
+    cross_method_mapping <- dplyr::bind_rows(valid_mappings[!sapply(valid_mappings, is.null)])
+
+    # Ausgabe mit Erwartung fuer Vollblut
+    n_pairs <- nrow(cross_method_mapping)
+    message("\n--- Cross-method pairs available: ", n_pairs, " (erwartet >=4 fuer Vollblut) ---")
+
+    if (n_pairs < 4) {
+      message("  WARNUNG: Weniger als 4 Paare gefunden!")
+      message("  Moegliche Ursachen:")
+      message("    - Unerwartete Spaltennamen nach Sanitization")
+      message("    - MCP-counter Version mit anderen Zelltyp-Namen")
+      message("  Debug: Pruefe Spaltennamen oben")
+    }
+
+    if (n_pairs > 0) {
+      for (i in seq_len(n_pairs)) {
+        message("  ", cross_method_mapping$pair_name[i], ": ",
+                cross_method_mapping$cibersort_col[i], " <-> ",
+                cross_method_mapping$mcp_col[i])
+      }
+    }
+
+    # ----------------------------------------------------------
+    # C2: Holistic QC Panel (Multi-Metric Table)
+    # ----------------------------------------------------------
+    # WICHTIG: MCP-counter liefert Enrichment-Scores, CIBERSORT liefert Fraktionen.
+    # Diese sind nicht direkt vergleichbar -> Spearman (Rang-basiert) ist primaer!
+    # Delta-QC (within-patient changes) reduziert zusaetzlich kompositionelle Artefakte.
+    #
+    # Metriken (Prioritaet):
+    #   1. spearman_rho - primaer (Rang-Agreement, skalenunabhaengig)
+    #   2. pearson_r    - sekundaer (lineares Agreement, sensitiv auf Skala)
+    #   3. delta_qc     - wichtig fuer longitudinale Konsistenz
+    #
+    # KEINE harten Cutoffs - Flags dienen nur dem Screening
+
+    # QC nur sinnvoll wenn mindestens 2 Paare verfuegbar
+    if (nrow(cross_method_mapping) >= 2) {
+
+      # Hilfsfunktion: QC-Metriken fuer ein Paar berechnen
+      compute_pair_qc <- function(df, cib_col, mcp_col, pair_name) {
+        x <- df[[cib_col]]
+        y <- df[[mcp_col]]
+        complete_idx <- complete.cases(x, y)
+        n_complete <- sum(complete_idx)
+
+        if (n_complete < 5) {
+          return(tibble::tibble(
+            pair_name = pair_name,
+            cibersort_col = cib_col,
+            mcp_col = mcp_col,
+            n_complete = n_complete,
+            spearman_rho = NA_real_,
+            pearson_r = NA_real_,
+            qc_flag = "insufficient_data"
+          ))
+        }
+
+        x_c <- x[complete_idx]
+        y_c <- y[complete_idx]
+
+        r_spearman <- cor(x_c, y_c, method = "spearman")
+        r_pearson <- cor(x_c, y_c, method = "pearson")
+
+        # Heuristisches Flagging (konservativ, nur fuer Screening)
+        # Primaer auf Spearman basiert (weil MCP scores != fractions)
+        # "discordant": Spearman klar negativ
+        # "weak": Spearman nahe Null
+        # "ok": Spearman positiv
+        qc_flag <- dplyr::case_when(
+          r_spearman < -0.1 ~ "discordant",
+          abs(r_spearman) < 0.15 ~ "weak",
+          TRUE ~ "ok"
+        )
+
+        # Spaltenreihenfolge: spearman_rho ZUERST (primaer)
+        tibble::tibble(
+          pair_name = pair_name,
+          cibersort_col = cib_col,
+          mcp_col = mcp_col,
+          n_complete = n_complete,
+          spearman_rho = round(r_spearman, 3),
+          pearson_r = round(r_pearson, 3),
+          qc_flag = qc_flag
+        )
+      }
+
+      # QC fuer alle Paare berechnen
+      cross_method_qc <- purrr::pmap_dfr(
+        list(
+          cib_col = cross_method_mapping$cibersort_col,
+          mcp_col = cross_method_mapping$mcp_col,
+          pair_name = cross_method_mapping$pair_name
+        ),
+        function(cib_col, mcp_col, pair_name) {
+          compute_pair_qc(clinical_deconv_merged, cib_col, mcp_col, pair_name)
+        }
+      )
+
+      message("\n--- CROSS-METHOD QC TABELLE ---")
+      message("MCP scores != CIBERSORT fractions -> Spearman (Rang) primaer, Pearson sekundaer")
+      message("(Flags sind heuristisch - Screening/QC, nicht pass/fail)")
+      safe_print(cross_method_qc)
+
+      # QC Tabelle speichern
+      qc_table_path <- file.path(clinical_output_dir, "deconv_cross_method_qc.csv")
+      tryCatch({
+        write.csv(cross_method_qc, qc_table_path, row.names = FALSE)
+        message("Gespeichert: ", qc_table_path)
+      }, error = function(e) {
+        message("WARNUNG: QC-Tabelle konnte nicht gespeichert werden: ", conditionMessage(e))
+      })
+
+      # ----------------------------------------------------------
+      # C3: Scatterplots fuer visuelle Bewertung
+      # ----------------------------------------------------------
+      # Facettierte Scatterplots mit Loess-Trend, gefaerbt nach Zeitpunkt
+
+      tryCatch({
+        # Prepare long-format data for plotting
+        plot_data <- clinical_deconv_merged %>%
+          dplyr::select(sample_id) %>%
+          dplyr::left_join(
+            sample_meta_clinical %>% dplyr::select(sample_id, timepoint, pid),
+            by = "sample_id"
+          )
+
+        # Add pair columns
+        scatter_data_list <- lapply(seq_len(nrow(cross_method_mapping)), function(i) {
+          pair <- cross_method_mapping[i, ]
+          tibble::tibble(
+            sample_id = clinical_deconv_merged$sample_id,
+            pair_name = pair$pair_name,
+            cibersort_value = clinical_deconv_merged[[pair$cibersort_col]],
+            mcp_value = clinical_deconv_merged[[pair$mcp_col]]
+          )
+        })
+        scatter_data <- dplyr::bind_rows(scatter_data_list) %>%
+          dplyr::left_join(plot_data, by = "sample_id") %>%
+          dplyr::filter(!is.na(cibersort_value), !is.na(mcp_value))
+
+        # QC-Info zu Facet-Labels hinzufuegen (Spearman zuerst!)
+        scatter_data <- scatter_data %>%
+          dplyr::left_join(
+            cross_method_qc %>% dplyr::select(pair_name, spearman_rho, pearson_r, qc_flag),
+            by = "pair_name"
+          ) %>%
+          dplyr::mutate(
+            facet_label = paste0(pair_name, "\nrho=", spearman_rho, ", r=", pearson_r,
+                                 " [", qc_flag, "]")
+          )
+
+        # Facettierter Scatterplot erstellen
+        p_scatter <- ggplot2::ggplot(
+          scatter_data,
+          ggplot2::aes(x = mcp_value, y = cibersort_value, color = timepoint)
+        ) +
+          ggplot2::geom_point(alpha = 0.7, size = 2) +
+          ggplot2::geom_smooth(method = "loess", se = FALSE, color = "gray40", linewidth = 0.8) +
+          ggplot2::facet_wrap(~ facet_label, scales = "free", ncol = 3) +
+          ggplot2::labs(
+            title = "Cross-Method Validation: CIBERSORT vs MCP-counter",
+            subtitle = "Screening/QC - Spearman (rho) primaer weil MCP scores != fractions",
+            x = "MCP-counter Score (Enrichment)",
+            y = "CIBERSORT Fraction",
+            color = "Zeitpunkt"
+          ) +
+          ggplot2::theme_bw(base_size = 10) +
+          ggplot2::theme(
+            strip.text = ggplot2::element_text(size = 8),
+            legend.position = "bottom"
+          )
+
+        scatter_path <- file.path(clinical_fig_dir, "deconv_cross_method_scatter.pdf")
+        ggplot2::ggsave(scatter_path, p_scatter, width = 10, height = 8)
+        message("Gespeichert: ", scatter_path)
+
+      }, error = function(e) {
+        message("WARNUNG: Scatterplots konnten nicht erstellt werden: ", conditionMessage(e))
+      })
+
+      # ----------------------------------------------------------
+      # C4: Zeit-Delta Konsistenz (Patienten-Level)
+      # ----------------------------------------------------------
+      # WICHTIG fuer longitudinale Daten!
+      # Delta-QC reduziert kompositionelle Artefakte durch Vergleich
+      # von AENDERUNGEN innerhalb von Patienten.
+      # -> Weniger anfaellig fuer Baseline-Unterschiede zwischen Methoden
+
+      message("\n--- ZEIT-DELTA KONSISTENZ ANALYSE ---")
+      message("Vergleiche Patienten-Level Deltas zwischen Methoden")
+      message("(Delta-QC ist wichtig fuer longitudinale Aussagen!)")
+
+      delta_qc <- NULL
+      tryCatch({
+        # Zeitpunkt-Info hinzufuegen
+        deconv_with_meta <- clinical_deconv_merged %>%
+          dplyr::left_join(
+            sample_meta_clinical %>% dplyr::select(sample_id, timepoint, pid),
+            by = "sample_id"
+          ) %>%
+          dplyr::filter(!is.na(timepoint), !is.na(pid))
+
+        # Hilfsfunktion: Deltas fuer ein Paar berechnen
+        compute_delta_qc <- function(df, cib_col, mcp_col, pair_name, tp1, tp2) {
+          df_wide <- df %>%
+            dplyr::filter(timepoint %in% c(tp1, tp2)) %>%
+            dplyr::select(pid, timepoint, cib_val = !!rlang::sym(cib_col),
+                          mcp_val = !!rlang::sym(mcp_col)) %>%
+            tidyr::pivot_wider(
+              names_from = timepoint,
+              values_from = c(cib_val, mcp_val)
+            )
+
+          cib_t1 <- paste0("cib_val_", tp1)
+          cib_t2 <- paste0("cib_val_", tp2)
+          mcp_t1 <- paste0("mcp_val_", tp1)
+          mcp_t2 <- paste0("mcp_val_", tp2)
+
+          if (!all(c(cib_t1, cib_t2, mcp_t1, mcp_t2) %in% names(df_wide))) {
+            return(NULL)
+          }
+
+          df_wide <- df_wide %>%
+            dplyr::mutate(
+              delta_cib = .data[[cib_t2]] - .data[[cib_t1]],
+              delta_mcp = .data[[mcp_t2]] - .data[[mcp_t1]]
+            ) %>%
+            dplyr::filter(!is.na(delta_cib), !is.na(delta_mcp))
+
+          n_patients <- nrow(df_wide)
+          if (n_patients < 5) return(NULL)
+
+          # Spearman zuerst (primaer), dann Pearson
+          r_spearman <- cor(df_wide$delta_cib, df_wide$delta_mcp, method = "spearman")
+          r_pearson <- cor(df_wide$delta_cib, df_wide$delta_mcp, method = "pearson")
+
+          # Spaltenreihenfolge: spearman zuerst!
+          tibble::tibble(
+            pair_name = pair_name,
+            comparison = paste0(tp2, "-", tp1),
+            n_patients = n_patients,
+            delta_spearman_rho = round(r_spearman, 3),
+            delta_pearson_r = round(r_pearson, 3)
+          )
+        }
+
+        # Deltas fuer alle Paare und Zeitpunkt-Vergleiche berechnen
+        delta_comparisons <- list(
+          c("A", "V1"),
+          c("V1", "V2"),
+          c("A", "V2")
+        )
+
+        delta_qc_list <- list()
+        for (i in seq_len(nrow(cross_method_mapping))) {
+          pair <- cross_method_mapping[i, ]
+          for (comp in delta_comparisons) {
+            result <- compute_delta_qc(
+              deconv_with_meta,
+              pair$cibersort_col, pair$mcp_col, pair$pair_name,
+              comp[1], comp[2]
+            )
+            if (!is.null(result)) {
+              delta_qc_list <- c(delta_qc_list, list(result))
+            }
+          }
+        }
+
+        if (length(delta_qc_list) > 0) {
+          delta_qc <- dplyr::bind_rows(delta_qc_list)
+          message("\n--- DELTA QC TABELLE (Patienten-Level Aenderungen) ---")
+          message("Spearman (delta_spearman_rho) primaer fuer longitudinale Konsistenz")
+          safe_print(delta_qc)
+
+          # Delta QC Tabelle speichern
+          delta_qc_path <- file.path(clinical_output_dir, "deconv_cross_method_delta_qc.csv")
+          write.csv(delta_qc, delta_qc_path, row.names = FALSE)
+          message("Gespeichert: ", delta_qc_path)
+
+        } else {
+          message("WARNUNG: Zu wenige gepaarte Samples fuer Delta-Analyse")
+        }
+
+      }, error = function(e) {
+        message("WARNUNG: Delta-Analyse fehlgeschlagen: ", conditionMessage(e))
+      })
+
+      # ----------------------------------------------------------
+      # C5: Summary Plot (Korrelations-Uebersicht)
+      # ----------------------------------------------------------
+      # Spearman zuerst (primaer), Pearson sekundaer
+
+      tryCatch({
+        # Korrelations-Barplot erstellen (Spearman primaer)
+        summary_data <- cross_method_qc %>%
+          tidyr::pivot_longer(
+            cols = c(spearman_rho, pearson_r),  # Spearman zuerst!
+            names_to = "metric",
+            values_to = "correlation"
+          ) %>%
+          dplyr::mutate(
+            metric = factor(
+              dplyr::case_when(
+                metric == "spearman_rho" ~ "Spearman rho (primaer)",
+                metric == "pearson_r" ~ "Pearson r (sekundaer)"
+              ),
+              levels = c("Spearman rho (primaer)", "Pearson r (sekundaer)")
+            )
+          )
+
+        p_summary <- ggplot2::ggplot(
+          summary_data,
+          ggplot2::aes(x = pair_name, y = correlation, fill = metric)
+        ) +
+          ggplot2::geom_col(position = ggplot2::position_dodge(width = 0.8), width = 0.7) +
+          ggplot2::geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+          ggplot2::coord_flip() +
+          ggplot2::scale_fill_manual(
+            values = c("Spearman rho (primaer)" = "#e74c3c",
+                       "Pearson r (sekundaer)" = "#3498db")
+          ) +
+          ggplot2::labs(
+            title = "Cross-Method Korrelation: CIBERSORT vs MCP-counter",
+            subtitle = "MCP scores != fractions -> Spearman (Rang-basiert) ist primaer",
+            x = "Zelltyp-Paar",
+            y = "Korrelationskoeffizient",
+            fill = "Metrik"
+          ) +
+          ggplot2::theme_bw(base_size = 11) +
+          ggplot2::theme(legend.position = "bottom")
+
+        summary_path <- file.path(clinical_fig_dir, "deconv_cross_method_summary.pdf")
+        ggplot2::ggsave(summary_path, p_summary, width = 8, height = 5)
+        message("Gespeichert: ", summary_path)
+
+      }, error = function(e) {
+        message("WARNUNG: Summary-Plot konnte nicht erstellt werden: ", conditionMessage(e))
+      })
+
+      # ----------------------------------------------------------
+      # C6: Cell-Type Adjustment Entscheidung (Nicht-Binaer)
+      # ----------------------------------------------------------
+      # Keine automatischen "empfohlen/nicht empfohlen" Entscheidungen.
+      # Stattdessen: qualitative Zusammenfassung fuer Sensitivity-Analyse.
+      # Flags basieren primaer auf Spearman (weil MCP scores != fractions).
+
+      message("\n=== CELL-TYPE ADJUSTMENT ENTSCHEIDUNG (Nicht-Binaer) ===")
+      message("(Flags basieren auf Spearman - primaer fuer MCP vs CIBERSORT)")
+
+      n_ok <- sum(cross_method_qc$qc_flag == "ok")
+      n_weak <- sum(cross_method_qc$qc_flag == "weak")
+      n_discordant <- sum(cross_method_qc$qc_flag == "discordant")
+      n_insufficient <- sum(cross_method_qc$qc_flag == "insufficient_data")
+      n_total <- nrow(cross_method_qc)
+
+      # Gesamt-QC-Status bestimmen (heuristisch)
+      if (n_discordant > 0) {
+        qc_overall_status <- "mixed_discordant"
+      } else if (n_ok >= n_total / 2) {
+        qc_overall_status <- "mostly_consistent"
+      } else if (n_weak >= n_total / 2) {
+        qc_overall_status <- "mixed_weak"
+      } else {
+        qc_overall_status <- "mixed"
+      }
+
+      message("QC Zusammenfassung: ", n_ok, " ok, ", n_weak, " schwach, ",
+              n_discordant, " diskordant, ", n_insufficient, " unzureichend")
+      message("Gesamt-QC-Status: ", qc_overall_status)
+
+      # Entscheidungshilfe (nicht automatisch)
+      message("\n--- EMPFEHLUNG (keine automatischen Entscheidungen) ---")
+      if (qc_overall_status == "mostly_consistent") {
+        message("  -> Methoden zeigen gute Uebereinstimmung")
+        message("  -> Cell-type adjustment KANN als Sensitivity-Analyse genutzt werden")
+        message("  -> Als zusaetzliche Modellvariante, nicht zwingend primaer")
+      } else if (qc_overall_status %in% c("mixed_weak", "mixed")) {
+        message("  -> Methoden zeigen gemischte/schwache Uebereinstimmung")
+        message("  -> Cell-type adjustment nur als EXPLORATIVE Sensitivity")
+        message("  -> Als Limitation im Methods-Abschnitt dokumentieren")
+      } else {
+        message("  -> Einige Zelltypen zeigen diskordante Muster")
+        message("  -> Cell-type adjustment NICHT als primaere Analyse empfohlen")
+        message("  -> Falls verwendet: als explorativ mit expliziten Einschraenkungen")
+      }
+
+      # QC-Ergebnisse fuer nachgelagerte Nutzung speichern
+      clinical_deconv_qc_summary <- list(
+        qc_table = cross_method_qc,
+        delta_qc = delta_qc,
+        overall_status = qc_overall_status,
+        n_ok = n_ok,
+        n_weak = n_weak,
+        n_discordant = n_discordant
+      )
+
+    } else {
+      message("WARNUNG: Weniger als 2 Cross-Method-Paare verfuegbar - QC uebersprungen")
+      clinical_deconv_qc_summary <- NULL
+    }
+
+    # Combined Daten speichern
+    clinical_deconv_combined <- clinical_deconv_merged
+    saveRDS(clinical_deconv_combined, clinical_deconv_cache_combined)
+    message("\nCombined Deconvolution gespeichert")
+
+  } else {
+    message("\nWARNUNG: Cross-Validation nicht moeglich (eine Methode fehlgeschlagen)")
+
+    # Nutze verfuegbare Methode
+    if (!is.null(clinical_deconv_cibersort_wide)) {
+      clinical_deconv_combined <- clinical_deconv_cibersort_wide
+    } else if (!is.null(clinical_deconv_mcp_wide)) {
+      clinical_deconv_combined <- clinical_deconv_mcp_wide
+    } else {
+      clinical_deconv_combined <- NULL
+    }
+
+    if (!is.null(clinical_deconv_combined)) {
+      saveRDS(clinical_deconv_combined, clinical_deconv_cache_combined)
+    }
+
+    clinical_deconv_qc_summary <- NULL
+  }
+
+  # ============================================================
+  # STEP 6: Merge mit sample_meta_clinical
+  # ============================================================
+
+if (!is.null(clinical_deconv_combined)) {
+
   n_before <- nrow(sample_meta_clinical)
 
-  sample_meta_clinical <- sample_meta_clinical %>%
-    left_join(clinical_deconv_results, by = "sample_id")
+  # Normalize join keys
+  sample_meta_clinical$sample_id <- trimws(as.character(sample_meta_clinical$sample_id))
+  clinical_deconv_combined$sample_id <- trimws(as.character(clinical_deconv_combined$sample_id))
 
-  # Validierung: Kein Row-Expansion
+  # Rerun-safety: entferne alte CIBERSORT_/MCP_ Spalten
+  if (any(grepl("^CIBERSORT_|^MCP_", names(sample_meta_clinical)))) {
+    message("⚠️ Deconvolution-Spalten existieren bereits -> entferne vor erneutem Join")
+    sample_meta_clinical <- sample_meta_clinical %>%
+      dplyr::select(-dplyr::matches("^CIBERSORT_|^MCP_"))
+  }
+
+  message("\n--- DECONV JOIN DIAGNOSTICS ---")
+  message("  sample_meta_clinical: ", n_before, " samples")
+  message("  deconv_combined: ", nrow(clinical_deconv_combined), " samples")
+  message("  Overlap: ",
+          sum(sample_meta_clinical$sample_id %in% clinical_deconv_combined$sample_id),
+          " / ", n_before)
+
+  # Join
+  sample_meta_clinical <- sample_meta_clinical %>%
+    dplyr::left_join(clinical_deconv_combined, by = "sample_id")
+
   stopifnot(nrow(sample_meta_clinical) == n_before)
 
   # Anzahl gemappter Samples
-  n_with_deconv <- sum(!is.na(sample_meta_clinical$celltype_T_cells))
-  message("✓ Deconvolution-Scores hinzugefügt: ", n_with_deconv, " / ",
-          n_before, " samples (", round(n_with_deconv/n_before*100, 1), "%)")
+  deconv_cols <- grep("^CIBERSORT_|^MCP_", names(sample_meta_clinical), value = TRUE)
 
-  # Plausibilitätsprüfung: Monozyten sollten in V1 höher sein als A
-  # (basierend auf Kuppe et al. 2024 - STEMI-Studie)
-  if ("celltype_Monocytes" %in% names(sample_meta_clinical)) {
+  if (length(deconv_cols) > 0) {
+    n_with_deconv <- sum(rowSums(!is.na(sample_meta_clinical[, deconv_cols, drop = FALSE])) > 0)
+    message("✓ Deconvolution-Features hinzugefügt: ", n_with_deconv, " / ",
+            n_before, " samples (", round(n_with_deconv/n_before*100, 1), "%)")
+  } else {
+    message("⚠️ Keine Deconvolution-Features verfügbar")
+  }
+
+  # === PLAUSIBILITÄTSPRÜFUNG ===
+  # Erwartung: Monozyten steigen akut nach TAVI (V1 > A)
+  # ABER: Inkonsistenz mit Pathway-Analyse muss geprüft werden
+
+  if ("CIBERSORT_Monocyte" %in% names(sample_meta_clinical)) {
+
     clinical_mono_check <- sample_meta_clinical %>%
-      filter(timepoint %in% c("A", "V1"), !is.na(celltype_Monocytes)) %>%
-      group_by(timepoint) %>%
-      summarise(
-        mean_mono = mean(celltype_Monocytes, na.rm = TRUE),
-        sd_mono = sd(celltype_Monocytes, na.rm = TRUE),
+      dplyr::filter(timepoint %in% c("A", "V1"), !is.na(CIBERSORT_Monocyte)) %>%
+      dplyr::group_by(timepoint) %>%
+      dplyr::summarise(
+        mean_mono = mean(CIBERSORT_Monocyte, na.rm = TRUE),
+        sd_mono   = sd(CIBERSORT_Monocyte, na.rm = TRUE),
         .groups = "drop"
       )
 
-    message("\n--- PLAUSIBILITÄTSPRÜFUNG: Monozyten ---")
-    print(clinical_mono_check)
+    message("\n--- PLAUSIBILITÄTSPRÜFUNG: Monocytes (CIBERSORT) ---")
+    safe_print(clinical_mono_check)
 
     mono_V1 <- clinical_mono_check$mean_mono[clinical_mono_check$timepoint == "V1"]
-    mono_A <- clinical_mono_check$mean_mono[clinical_mono_check$timepoint == "A"]
+    mono_A  <- clinical_mono_check$mean_mono[clinical_mono_check$timepoint == "A"]
 
-    if (mono_V1 > mono_A) {
-      message("✓ Monozyten: V1 > A (erwartet nach Kuppe 2024)")
+    clinical_monocyte_plausible <- (mono_V1 > mono_A)
+
+    if (isTRUE(clinical_monocyte_plausible)) {
+      message("✓ Monocytes: V1 > A (biologisch plausibel)")
+      message("  → CIBERSORT-Schätzungen konsistent mit Inflammation ↑")
+      message("  → Cell-type Adjustment kann verwendet werden")
     } else {
-      message("⚠️ Monozyten: V1 ≤ A (unerwartet, prüfe Methodik)")
+      message("⚠️ KRITISCH: Monocytes V1 ≤ A")
+      message("  → Inkonsistent mit Pathway-Analyse (Inflammation V1 > A)")
+      message("  → Mögliche Ursachen:")
+      message("     1. Compositional constraint (Neutrophile steigen stark → Monozyten relativ ↓)")
+      message("     2. Technisches Artefakt")
+      message("  → EMPFEHLUNG: Prüfe Neutrophile & T-Zellen für Konsistenz")
+      message("  → Cell-type Adjustment NUR verwenden wenn andere Zelltypen plausibel")
+      clinical_monocyte_plausible <- FALSE
     }
+
+    # Prüfe Neutrophile (sollten steigen nach TAVI)
+    if ("CIBERSORT_Neutrophil" %in% names(sample_meta_clinical)) {
+      clinical_neutro_check <- sample_meta_clinical %>%
+        dplyr::filter(timepoint %in% c("A", "V1"), !is.na(CIBERSORT_Neutrophil)) %>%
+        dplyr::group_by(timepoint) %>%
+        dplyr::summarise(
+          mean_neutro = mean(CIBERSORT_Neutrophil, na.rm = TRUE),
+          .groups = "drop"
+        )
+
+      neutro_V1 <- clinical_neutro_check$mean_neutro[clinical_neutro_check$timepoint == "V1"]
+      neutro_A  <- clinical_neutro_check$mean_neutro[clinical_neutro_check$timepoint == "A"]
+
+      message("\n  Neutrophils: A = ", round(neutro_A, 3), ", V1 = ", round(neutro_V1, 3))
+
+      if (neutro_V1 > neutro_A) {
+        message("  → Neutrophile steigen (V1 > A) — konsistent mit akuter Inflammation")
+        message("  → Monozyten-Reduktion könnte compositional constraint sein")
+      } else {
+        message("  → Neutrophile steigen NICHT — inkonsistent mit Inflammation")
+      }
+    }
+
+    # ============================================================
+    # ADD-ON CHECKS
+    # ============================================================
+
+    message("\n--- ADD-ON PLAUSIBILITY CHECKS: T cells & Neutrophils (A vs V1) ---")
+
+    # (1) CIBERSORT T-cell total (sum of all CIBERSORT_T_cell_* subtypes)
+    tcell_cols_cib <- grep("^CIBERSORT_T_cell", names(sample_meta_clinical), value = TRUE)
+
+    if (length(tcell_cols_cib) > 0) {
+
+      clinical_tcell_check <- sample_meta_clinical %>%
+        dplyr::filter(timepoint %in% c("A", "V1")) %>%
+        dplyr::mutate(CIBERSORT_T_cell_total = rowSums(dplyr::across(dplyr::all_of(tcell_cols_cib)), na.rm = TRUE)) %>%
+        dplyr::group_by(timepoint) %>%
+        dplyr::summarise(
+          mean_tcell = mean(CIBERSORT_T_cell_total, na.rm = TRUE),
+          sd_tcell   = sd(CIBERSORT_T_cell_total, na.rm = TRUE),
+          .groups = "drop"
+        )
+
+      message("\n--- PLAUSIBILITÄTSPRÜFUNG: T cells total (CIBERSORT) ---")
+      safe_print(clinical_tcell_check)
+
+    } else {
+      message("⚠️ Keine CIBERSORT_T_cell* Spalten gefunden → T-cell-total Check übersprungen")
+    }
+
+    # (2) CIBERSORT Neutrophil (A→V1) summary (Mean + SD; statt nur Mean)
+    if ("CIBERSORT_Neutrophil" %in% names(sample_meta_clinical)) {
+
+      clinical_neutro_check2 <- sample_meta_clinical %>%
+        dplyr::filter(timepoint %in% c("A", "V1"), !is.na(CIBERSORT_Neutrophil)) %>%
+        dplyr::group_by(timepoint) %>%
+        dplyr::summarise(
+          mean_neutro = mean(CIBERSORT_Neutrophil, na.rm = TRUE),
+          sd_neutro   = sd(CIBERSORT_Neutrophil, na.rm = TRUE),
+          .groups = "drop"
+        )
+
+      message("\n--- PLAUSIBILITÄTSPRÜFUNG: Neutrophils (CIBERSORT; mean±sd) ---")
+      safe_print(clinical_neutro_check2)
+
+    } else {
+      message("⚠️ CIBERSORT_Neutrophil nicht vorhanden → Neutrophil summary übersprungen")
+    }
+
+    # (3) OPTIONAL: MCP Monocyte (A→V1) check (score-based; no compositional constraint)
+    message("\n--- OPTIONAL CHECK: Monocytes (MCP) (A vs V1) ---")
+
+    mcp_mono_candidates <- c("MCP_Monocyte", "MCP_Monocytic_lineage", "MCP_Macrophage/Monocyte")
+    mcp_mono_col <- mcp_mono_candidates[mcp_mono_candidates %in% names(sample_meta_clinical)][1]
+
+    if (!is.na(mcp_mono_col)) {
+
+      clinical_mcp_mono_check <- sample_meta_clinical %>%
+        dplyr::filter(timepoint %in% c("A", "V1")) %>%
+        dplyr::filter(!is.na(.data[[mcp_mono_col]])) %>%
+        dplyr::group_by(timepoint) %>%
+        dplyr::summarise(
+          mean_mcp_mono = mean(.data[[mcp_mono_col]], na.rm = TRUE),
+          sd_mcp_mono   = sd(.data[[mcp_mono_col]], na.rm = TRUE),
+          .groups = "drop"
+        )
+
+      message("Using MCP monocyte column: ", mcp_mono_col)
+      safe_print(clinical_mcp_mono_check)
+
+    } else {
+      message("⚠️ Keine MCP-Monozyten-Spalte gefunden (erwartet eine von: ",
+              paste(mcp_mono_candidates, collapse = ", "), ")")
+    }
+
+  } else {
+    clinical_monocyte_plausible <- NA
+    message("⚠️ CIBERSORT_Monocyte nicht vorhanden")
   }
 
-  # Update Complete-Case Dataset
-  sample_meta_clinical_complete <- sample_meta_clinical %>%
-    filter(pid %in% unique(sample_meta_clinical$pid[
-      !is.na(sample_meta_clinical$age)
-    ]))
-
-  saveRDS(sample_meta_clinical_complete,
-          file.path(clinical_cache_dir, "sample_meta_clinical_complete.rds"))
+  message("   → Cell-type features hinzugefügt zu sample_meta_clinical")
 
 } else {
   message("⚠️ Deconvolution nicht durchgeführt → wird als Limitation dokumentiert")
-  message("   Begründung: immunedeconv nicht installiert oder VST-Daten fehlen")
+  message("   Begründung: CIBERSORT/MCP-counter nicht verfügbar oder fehlgeschlagen")
+  }
 }
+
 ```
 
 ---
@@ -734,25 +2046,47 @@ if (file.exists(clinical_gsva_composite_cache)) {
   # 1. RESULTS_STORY.md: Biphasische Ribosomen-Signatur, Inflammation, Adaptive Immunity
   # 2. Schmader 2021: Inflammation + Interferon als Composite
   # 3. Kuppe 2024: Myeloid-Lymphoid-Shift
+  # 4. CLINICAL_INTEGRATION_REVIEW.md: GO terms + MSigDB Hallmarks
 
   clinical_pathways_apriori <- list(
     inflammation = c(
+      # Hallmarks
       "HALLMARK_INFLAMMATORY_RESPONSE",
       "HALLMARK_TNFA_SIGNALING_VIA_NFKB",
-      "HALLMARK_IL6_JAK_STAT3_SIGNALING"
+      "HALLMARK_IL6_JAK_STAT3_SIGNALING",
+      # GO terms
+      "GO_INNATE_IMMUNE_RESPONSE",
+      "GO_INFLAMMATORY_RESPONSE",
+      "GO_ACUTE_INFLAMMATORY_RESPONSE"
     ),
     ribosome = c(
+      # Hallmarks
       "HALLMARK_MYC_TARGETS_V1",        # Ribosomale Biogenese
-      "HALLMARK_OXIDATIVE_PHOSPHORYLATION"  # Energiestoffwechsel
+      # KEGG
+      "KEGG_RIBOSOME",
+      # GO terms
+      "GO_RIBOSOME",
+      "GO_TRANSLATIONAL_INITIATION",
+      "GO_TRANSLATION",
+      "GO_RIBOSOME_BIOGENESIS"
     ),
     adaptive = c(
+      # Hallmarks
       "HALLMARK_IL2_STAT5_SIGNALING",
-      "HALLMARK_INTERFERON_GAMMA_RESPONSE",
-      "HALLMARK_ALLOGRAFT_REJECTION"    # T-Zell-Aktivierung
+      "HALLMARK_ALLOGRAFT_REJECTION",   # T-Zell-Aktivierung
+      # GO terms
+      "GO_T_CELL_ACTIVATION",
+      "GO_B_CELL_MEDIATED_IMMUNITY",
+      "GO_ADAPTIVE_IMMUNE_RESPONSE",
+      "GO_LYMPHOCYTE_ACTIVATION"
     ),
     interferon = c(
+      # Hallmarks (ohne Duplikate aus adaptive)
       "HALLMARK_INTERFERON_ALPHA_RESPONSE",
-      "HALLMARK_INTERFERON_GAMMA_RESPONSE"
+      "HALLMARK_INTERFERON_GAMMA_RESPONSE",
+      # GO terms
+      "GO_RESPONSE_TO_INTERFERON_GAMMA",
+      "GO_TYPE_I_INTERFERON_SIGNALING_PATHWAY"
     )
   )
 
@@ -784,9 +2118,15 @@ if (file.exists(clinical_gsva_composite_cache)) {
     }
   }
 
-  # ============================================================
-  # Composite-Scores (Mittelwert pro Gruppe)
-  # ============================================================
+  # === COMPOSITE-SCORES (Mittelwert pro Gruppe) ===
+  # Methodik: Gleichgewichteter Mittelwert aller Pathways pro Gruppe
+  # Rationale:
+  #   - PCA-basierte Composite (PC1) wäre datengetrieben und schwer interpretierbar
+  #   - Mittelwert ist transparent und in klinischer Literatur etabliert
+  #     (Schmader et al. 2021: gleichgewichteter Inflammation-Score)
+  #   - Validierung: cor(PC1, Mean) ≥ 0.8 zeigt, dass Mittelwert Hauptvarianz erfasst
+  #
+  # Alternative (falls cor < 0.8): PC1 verwenden oder Pathway-Gewichtung anpassen
 
   # Sichere Mittelwert-Funktion (handhabt fehlende Pathways)
   clinical_safe_colmeans <- function(gsva_mat, pathways) {
@@ -821,9 +2161,57 @@ if (file.exists(clinical_gsva_composite_cache)) {
     stringsAsFactors = FALSE
   )
 
+  # ============================================================
+  # PCA-COMPOSITE VALIDATION (Issue M.3)
+  # Prüfe ob PC1 ≈ Mittelwert-Score (validiert Gleichgewichtung)
+  # ============================================================
+
+  message("\n--- PCA COMPOSITE VALIDATION ---")
+
+  for (group_name in names(clinical_pathways_used)) {
+    # Extrahiere Pathways für diese Gruppe
+    group_pathways <- clinical_pathways_used[[group_name]]
+    present_pathways <- intersect(group_pathways, rownames(clinical_gsva_scores))
+
+    if (length(present_pathways) >= 2) {
+      # PCA auf Pathway-Scores
+      pathway_matrix <- t(clinical_gsva_scores[present_pathways, , drop = FALSE])
+      pca_result <- tryCatch({
+        prcomp(pathway_matrix, scale. = FALSE, center = TRUE)
+      }, error = function(e) NULL)
+
+      if (!is.null(pca_result)) {
+        pc1 <- pca_result$x[, 1]
+        # Korrelation zwischen PC1 und Mittelwert-Score
+        mean_score <- rowMeans(pathway_matrix, na.rm = TRUE)
+        cor_pc1_mean <- cor(pc1, mean_score, use = "complete.obs")
+        var_explained <- summary(pca_result)$importance[2, 1] * 100
+
+        message(sprintf("  %s: PC1 vs Mean r = %.3f, PC1 var explained = %.1f%%",
+                        group_name, cor_pc1_mean, var_explained))
+
+        if (abs(cor_pc1_mean) < 0.8) {
+          message(sprintf("    ⚠️  Niedrige Korrelation — Mittelwert könnte Information verlieren"))
+          message(sprintf("    → Erwäge PC1-Composite statt Mittelwert"))
+        } else {
+          message(sprintf("    ✓  Mittelwert ist valide Zusammenfassung (|r| ≥ 0.8)"))
+        }
+      }
+    } else {
+      message(sprintf("  %s: Nur %d Pathway(s) - PCA nicht durchgeführt",
+                      group_name, length(present_pathways)))
+    }
+  }
+
+  # Debug: Show composite scores
+  message("\n--- GSVA COMPOSITE CREATED ---")
+  message("  Samples: ", nrow(clinical_gsva_composite))
+  message("  First 3 sample_ids: ", paste(head(clinical_gsva_composite$sample_id, 3), collapse = ", "))
+  message("  First 3 inflammation scores: ", paste(round(head(clinical_gsva_composite$clinical_inflammation_score, 3), 3), collapse = ", "))
+
   # Range-Validierung
   clinical_score_ranges <- clinical_gsva_composite %>%
-    select(-sample_id) %>%
+    dplyr::select(-sample_id) %>%
     summarise(across(everything(), list(
       min = ~min(., na.rm = TRUE),
       max = ~max(., na.rm = TRUE),
@@ -832,7 +2220,7 @@ if (file.exists(clinical_gsva_composite_cache)) {
     )))
 
   message("\n--- COMPOSITE-SCORE RANGES ---")
-  print(clinical_score_ranges)
+  safe_print(clinical_score_ranges)
 
   # Warnung bei zu vielen NAs
   na_threshold <- 0.1
@@ -855,6 +2243,18 @@ if (file.exists(clinical_gsva_composite_cache)) {
 
 n_before <- nrow(sample_meta_clinical)
 
+# Debug: Check sample_id overlap
+message("\n--- GSVA JOIN DIAGNOSTICS ---")
+message("  sample_meta_clinical: ", n_before, " samples")
+message("  First 3 sample_ids: ",
+        paste(head(sample_meta_clinical$sample_id, 3), collapse = ", "))
+message("  gsva_composite: ", nrow(clinical_gsva_composite), " samples")
+message("  First 3 sample_ids: ",
+        paste(head(clinical_gsva_composite$sample_id, 3), collapse = ", "))
+message("  Overlap: ",
+        sum(sample_meta_clinical$sample_id %in% clinical_gsva_composite$sample_id),
+        " / ", n_before)
+
 sample_meta_clinical <- sample_meta_clinical %>%
   left_join(clinical_gsva_composite, by = "sample_id")
 
@@ -865,16 +2265,10 @@ n_with_gsva <- sum(!is.na(sample_meta_clinical$clinical_inflammation_score))
 message("✓ GSVA composite scores hinzugefügt: ", n_with_gsva, " / ", n_before,
         " samples (", round(n_with_gsva/n_before*100, 1), "%)")
 
-# Update Complete-Case
-sample_meta_clinical_complete <- sample_meta_clinical %>%
-  filter(!is.na(age), !is.na(clinical_inflammation_score))
-
-message("✓ Complete-case dataset: ", nrow(sample_meta_clinical_complete),
-        " samples from ", n_distinct(sample_meta_clinical_complete$pid), " patients")
+# Note: Complete-case dataset wird nach allen Joins (Step 7) final definiert
+message("   → GSVA composite scores hinzugefügt zu sample_meta_clinical")
 
 saveRDS(sample_meta_clinical, file.path(clinical_cache_dir, "sample_meta_clinical_gsva.rds"))
-saveRDS(sample_meta_clinical_complete,
-        file.path(clinical_cache_dir, "sample_meta_clinical_complete.rds"))
 ```
 
 ---
@@ -890,11 +2284,27 @@ saveRDS(sample_meta_clinical_complete,
 
 message("=== SCHRITT 7: Delta-Variablen ===")
 
-# ============================================================
-# Ziel: Patient-level Deltas für V1-A, V2-V1, V2-A berechnen
-# Verwendung: Für Patient-level Analysen (Alternative zu mixed models)
-# Entscheidung E3: Beide Ansätze (Delta als Sensitivity)
-# ============================================================
+# === DELTA-VARIABLEN (Sensitivity Analysis) ===
+# Zweck: Alternative Analyse-Strategie, NICHT primäre Methode
+#
+# Limitation von Change-Scores (Literatur):
+#   - Regression to mean → negative slope bias (Castro-Schilo & Grimm 2018)
+#   - Interpretation schwierig: Baseline auf beiden Seiten der Gleichung
+#   - Weniger Power als Mixed Models (-12% unter MCAR, Mallinckrodt 2008)
+#
+# Verwendung:
+#   - Sensitivity Check für LMM-Ergebnisse
+#   - Paired t-tests (explorativ): z.B. "Inflammation V1 vs A"
+#   - Grafische Darstellung (patient-level Trajektorien)
+#
+# NICHT verwenden für:
+#   - Primäre statistische Inferenz
+#   - Regression mit Change-Score als abhängige Variable (Bias!)
+#
+# Literatur:
+#   - Castro-Schilo & Grimm 2018 (J Soc Pers Relat)
+#   - Mallinckrodt et al. 2008 (NCBI NBK538904)
+#   - Senn et al. 2009 (PMC2678722)
 
 # Cache-Pfad
 clinical_delta_cache <- file.path(clinical_cache_dir, "delta_data_clinical.rds")
@@ -913,7 +2323,7 @@ if (file.exists(clinical_delta_cache)) {
   # Selektiere relevante Spalten
   clinical_delta_long <- sample_meta_clinical %>%
     filter(!is.na(clinical_inflammation_score)) %>%
-    select(
+    dplyr::select(
       pid, timepoint,
       clinical_inflammation_score,
       clinical_ribosome_score,
@@ -982,7 +2392,7 @@ if (file.exists(clinical_delta_cache)) {
     )
 
   message("\n--- DELTA COMPLETENESS ---")
-  print(clinical_delta_completeness)
+  safe_print(clinical_delta_completeness)
 
   if (clinical_delta_completeness$n_complete_V1_A < n_patients_delta * 0.9) {
     warning("⚠️ >10% fehlende Deltas V1-A — prüfe Dropout-Pattern")
@@ -990,7 +2400,7 @@ if (file.exists(clinical_delta_cache)) {
 
   # Range-Validierung (Deltas sollten sinnvoll sein)
   clinical_delta_ranges <- clinical_delta_data %>%
-    select(starts_with("clinical_delta_")) %>%
+    dplyr::select(starts_with("clinical_delta_")) %>%
     summarise(across(everything(), list(
       min = ~min(., na.rm = TRUE),
       max = ~max(., na.rm = TRUE),
@@ -1000,7 +2410,7 @@ if (file.exists(clinical_delta_cache)) {
 
   message("\n--- DELTA RANGES (INFLAMMATION) ---")
   clinical_delta_ranges %>%
-    select(contains("inflammation")) %>%
+    dplyr::select(contains("inflammation")) %>%
     print()
 
   # Speichere Cache
@@ -1009,6 +2419,44 @@ if (file.exists(clinical_delta_cache)) {
 }
 
 message("✓ Delta-Daten verfügbar für patient-level Analysen")
+
+# === FINAL COMPLETE-CASE DATASET ===
+# Definiere complete-case EINMALIG nach allen Feature-Joins
+# Kriterien:
+#   - Complete triplets (A + V1 + V2 vorhanden)
+#   - Klinische Basisdaten vorhanden (age nicht NA)
+#   - GSVA scores vorhanden (inflammation_score nicht NA)
+#
+# Methodische Basis (Literatur):
+#   - Complete-case ist unbiased unter MCAR (PMC3016756)
+#   - ABER: Mixed models haben +12% Power (BMC 2016)
+#   - Complete-case: "Loss of precision" (NCBI NBK538904)
+#   - MCAR-Test (Step 4) validiert dass Dropout nicht biased ist
+#
+# Verwendung:
+#   - Primary Analyses: Linear Mixed Models (nutzen alle Daten)
+#   - Complete-case: Für Paired Tests (z.B. V1 vs A)
+#   - Sensitivity: Vergleich Complete-case vs All-cases
+#
+# Literatur:
+#   - Missing Data in Longitudinal Studies (PMC3016756)
+#   - Single timepoint comparisons (BMC 2016)
+#   - Mixed Model ITT Analysis (NCBI NBK538904)
+
+sample_meta_clinical_complete <- sample_meta_clinical %>%
+  filter(
+    pid %in% triplet_status$pid[triplet_status$complete_triplet],
+    !is.na(age),
+    !is.na(clinical_inflammation_score)
+  )
+
+message("\n--- FINAL COMPLETE-CASE DATASET ---")
+message("  Samples: ", nrow(sample_meta_clinical_complete))
+message("  Patients: ", n_distinct(sample_meta_clinical_complete$pid))
+message("  Criteria: Complete triplets + age + GSVA scores")
+
+saveRDS(sample_meta_clinical_complete,
+        file.path(clinical_cache_dir, "sample_meta_clinical_complete.rds"))
 ```
 
 ---
@@ -1114,8 +2562,8 @@ message("⏳ Stratifiziere nach EF_group...")
 
 clinical_table1_ef <- clinical_clean %>%
   group_by(ef_group) %>%
-  summarise(
-    Group = paste0("EF_", cur_group_id()),
+  dplyr::summarise(
+    Group = dplyr::first(ef_group),
     N = n(),
     Age = clinical_describe_continuous(cur_data(), "age"),
     Female = clinical_describe_categorical(cur_data(), "sex", "female"),
@@ -1135,8 +2583,8 @@ clinical_table1_ef <- clinical_clean %>%
     Valve_SEV = clinical_describe_categorical(cur_data(), "valve_type_grouped", "SEV"),
     .groups = "drop"
   ) %>%
-  mutate(Group = as.character(ef_group)) %>%
-  select(-ef_group)
+  mutate(Group = paste0("LVEF ", as.character(ef_group))) %>%
+  dplyr::select(-ef_group)
 
 # ============================================================
 # STRATIFIZIERT nach CAD
@@ -1146,8 +2594,8 @@ message("⏳ Stratifiziere nach CAD...")
 
 clinical_table1_cad <- clinical_clean %>%
   group_by(relevant_cad) %>%
-  summarise(
-    Group = paste0("CAD_", ifelse(cur_group()$relevant_cad, "yes", "no")),
+  dplyr::summarise(
+    Group = dplyr::first(relevant_cad),
     N = n(),
     Age = clinical_describe_continuous(cur_data(), "age"),
     Female = clinical_describe_categorical(cur_data(), "sex", "female"),
@@ -1167,8 +2615,8 @@ clinical_table1_cad <- clinical_clean %>%
     Valve_SEV = clinical_describe_categorical(cur_data(), "valve_type_grouped", "SEV"),
     .groups = "drop"
   ) %>%
-  mutate(Group = ifelse(relevant_cad, "CAD_yes", "CAD_no")) %>%
-  select(-relevant_cad)
+  mutate(Group = ifelse(relevant_cad, "CAD present", "CAD absent")) %>%
+  dplyr::select(-relevant_cad)
 
 # ============================================================
 # KOMBINIERE alle Tabellen
@@ -1182,7 +2630,7 @@ clinical_table1_combined <- bind_rows(
 
 # Ausgabe
 message("\n=== TABLE 1: Clinical Characteristics ===")
-print(clinical_table1_combined)
+safe_print(clinical_table1_combined)
 
 # Speichern
 write.csv(clinical_table1_combined, clinical_table1_cache, row.names = FALSE)
@@ -1196,10 +2644,10 @@ message("\n=== ZELLENBESETZUNG: Timepoint × EF_group ===")
 
 clinical_cell_counts_ef <- sample_meta_clinical_complete %>%
   filter(timepoint %in% c("A", "V1")) %>%
-  count(timepoint, ef_group) %>%
+  dplyr::count(timepoint, ef_group) %>%
   arrange(timepoint, ef_group)
 
-print(clinical_cell_counts_ef)
+safe_print(clinical_cell_counts_ef)
 
 # Stop-Regel prüfen
 clinical_min_n_ef <- min(clinical_cell_counts_ef$n, na.rm = TRUE)
@@ -1216,10 +2664,10 @@ message("\n=== ZELLENBESETZUNG: Timepoint × CAD ===")
 
 clinical_cell_counts_cad <- sample_meta_clinical_complete %>%
   filter(timepoint %in% c("V1", "V2")) %>%
-  count(timepoint, relevant_cad) %>%
+  dplyr::count(timepoint, relevant_cad) %>%
   arrange(timepoint, relevant_cad)
 
-print(clinical_cell_counts_cad)
+safe_print(clinical_cell_counts_cad)
 
 clinical_min_n_cad <- min(clinical_cell_counts_cad$n, na.rm = TRUE)
 if (clinical_min_n_cad < clinical_params$min_n_per_group) {
@@ -1250,14 +2698,39 @@ message("✓ Table 1 und Zellenbesetzungs-Checks abgeschlossen")
 - Residuen-Diagnostik
 - Zellenbesetzung (n≥15 pro Interaktionszelle)
 
+
 ```{r}
 #| label: step9-primary-q1-ef-inflammation
 #| echo: false
 #| warning: false
-#| fig.width: 10
-#| fig.height: 8
+#| message: false
 
-message("=== SCHRITT 9.1: PRIMARY Q1 — EF_group × Inflammation ===")
+# Helper: sichere Plot-Outputs (optional, falls nicht schon definiert)
+if (!exists("safe_ggsave")) {
+  safe_ggsave <- function(path = NULL, plot = NULL, width, height,
+                          dpi = 300, bg = "white", filename = NULL, ...) {
+    if (is.null(path)) path <- filename
+    if (is.null(path)) stop("safe_ggsave: path/filename fehlt")
+    tryCatch({
+      ggsave(filename = path, plot = plot, width = width, height = height,
+             dpi = dpi, bg = bg, ...)
+      TRUE
+    }, error = function(e) {
+      message("⚠️ ggsave fehlgeschlagen: ", conditionMessage(e))
+      FALSE
+    })
+  }
+}
+if (!exists("safe_include_graphics")) {
+  safe_include_graphics <- function(path) {
+    if (file.exists(path)) {
+      knitr::include_graphics(path)
+    } else {
+      message("⚠️ Grafik nicht gefunden: ", path)
+      invisible(NULL)
+    }
+  }
+}
 
 # ============================================================
 # Research Question Q1 (PRIMARY):
@@ -1265,7 +2738,7 @@ message("=== SCHRITT 9.1: PRIMARY Q1 — EF_group × Inflammation ===")
 # Inflammationsantwort (V1 vs A) im Vergleich zu erhaltener EF
 #
 # Literatur-Basis: HFrEF = systemische Inflammation (Granger 2005)
-# Hypothese: EF-Gruppe moduliert Inflammations-Dynamik post-TAVI
+# Hypothese: EF-Gruppe ist assoziiert mit Inflammations-Dynamik post-TAVI
 # ============================================================
 
 # Daten: Nur A + V1, nur Patienten mit EF_group und vollständigen Daten
@@ -1274,32 +2747,19 @@ clinical_data_q1 <- sample_meta_clinical_complete %>%
   filter(!is.na(ef_group), !is.na(clinical_inflammation_score)) %>%
   droplevels()
 
-message("✓ Q1 Dataset: ", nrow(clinical_data_q1), " samples from ",
-        n_distinct(clinical_data_q1$pid), " patients")
-
 # ============================================================
 # PRE-ANALYSIS: Zellenbesetzung (KRITISCH)
 # ============================================================
 
 clinical_cell_counts_q1 <- clinical_data_q1 %>%
-  count(timepoint, ef_group) %>%
+  dplyr::count(timepoint, ef_group) %>%
   arrange(timepoint, ef_group)
-
-message("\n--- ZELLENBESETZUNG Q1 ---")
-print(clinical_cell_counts_q1)
 
 clinical_min_cell_q1 <- min(clinical_cell_counts_q1$n)
 
 if (clinical_min_cell_q1 < clinical_params$min_n_per_group) {
-  warning(sprintf(
-    "⚠️ STOP-REGEL: Minimale Zelle (%d) < Schwelle (%d)",
-    clinical_min_cell_q1, clinical_params$min_n_per_group
-  ))
-  message("   → Interaktion timepoint × ef_group NICHT empfohlen")
-  message("   → Analysiere nur Haupteffekte")
   clinical_q1_run_interaction <- FALSE
 } else {
-  message("✓ Zellenbesetzung ausreichend für Interaktionsmodell")
   clinical_q1_run_interaction <- TRUE
 }
 
@@ -1307,47 +2767,60 @@ if (clinical_min_cell_q1 < clinical_params$min_n_per_group) {
 # MODELL: Mixed-Effects mit Interaktion
 # ============================================================
 
-if (clinical_q1_run_interaction) {
-  message("\n⏳ Fitte Interaktionsmodell...")
+# Check: Cell-type Kovariaten verfügbar?
+clinical_required_celltypes <- c("celltype_Monocytes","celltype_T_cells","celltype_Neutrophils")
+clinical_available_celltypes <- clinical_required_celltypes[clinical_required_celltypes %in% names(clinical_data_q1)]
+clinical_missing_celltypes <- setdiff(clinical_required_celltypes, clinical_available_celltypes)
 
-  clinical_model_q1 <- lmerTest::lmer(
-    clinical_inflammation_score ~ timepoint * ef_group + age + sex + (1 | pid),
-    data = clinical_data_q1,
-    REML = TRUE
-  )
-
+if (length(clinical_missing_celltypes) > 0) {
+  message("⚠️ Cell composition covariates missing – model run without cell adjustment")
+  message("   Interpret results with caution (Confounder not adjusted)")
+  clinical_use_celltypes <- FALSE
 } else {
-  message("\n⏳ Fitte Haupteffekt-Modell (ohne Interaktion)...")
-
-  clinical_model_q1 <- lmerTest::lmer(
-    clinical_inflammation_score ~ timepoint + ef_group + age + sex + (1 | pid),
-    data = clinical_data_q1,
-    REML = TRUE
-  )
+  clinical_use_celltypes <- TRUE
 }
 
-# Summary
-message("\n--- MODEL SUMMARY Q1 ---")
-print(summary(clinical_model_q1))
+if (clinical_q1_run_interaction) {
+  if (clinical_use_celltypes) {
+    clinical_model_q1 <- lmerTest::lmer(
+      clinical_inflammation_score ~ timepoint * ef_group + age + sex +
+        celltype_Monocytes + celltype_T_cells + celltype_Neutrophils +
+        (1 | pid),
+      data = clinical_data_q1,
+      REML = TRUE
+    )
+  } else {
+    clinical_model_q1 <- lmerTest::lmer(
+      clinical_inflammation_score ~ timepoint * ef_group + age + sex +
+        (1 | pid),
+      data = clinical_data_q1,
+      REML = TRUE
+    )
+  }
+} else {
+  if (clinical_use_celltypes) {
+    clinical_model_q1 <- lmerTest::lmer(
+      clinical_inflammation_score ~ timepoint + ef_group + age + sex +
+        celltype_Monocytes + celltype_T_cells + celltype_Neutrophils +
+        (1 | pid),
+      data = clinical_data_q1,
+      REML = TRUE
+    )
+  } else {
+    clinical_model_q1 <- lmerTest::lmer(
+      clinical_inflammation_score ~ timepoint + ef_group + age + sex +
+        (1 | pid),
+      data = clinical_data_q1,
+      REML = TRUE
+    )
+  }
+}
 
 # ============================================================
 # VIF-Check (Kollinearität)
 # ============================================================
 
-message("\n--- VIF CHECK Q1 ---")
 clinical_vif_q1 <- car::vif(clinical_model_q1)
-print(clinical_vif_q1)
-
-if (any(clinical_vif_q1 > clinical_params$vif_threshold)) {
-  warning(sprintf(
-    "⚠️ VIF > %.1f detektiert — Kollinearität vorhanden!",
-    clinical_params$vif_threshold
-  ))
-  message("   Betroffene Variablen:")
-  print(clinical_vif_q1[clinical_vif_q1 > clinical_params$vif_threshold])
-} else {
-  message("✓ VIF < ", clinical_params$vif_threshold, " — keine Kollinearität")
-}
 
 # ============================================================
 # Koeffizienten-Extraktion
@@ -1355,7 +2828,7 @@ if (any(clinical_vif_q1 > clinical_params$vif_threshold)) {
 
 clinical_coef_q1 <- broom.mixed::tidy(clinical_model_q1, conf.int = TRUE) %>%
   filter(effect == "fixed") %>%
-  select(term, estimate, std.error, conf.low, conf.high, statistic, df, p.value) %>%
+  dplyr::select(term, estimate, std.error, conf.low, conf.high, statistic, df, p.value) %>%
   mutate(
     sig = case_when(
       p.value < 0.001 ~ "***",
@@ -1365,23 +2838,132 @@ clinical_coef_q1 <- broom.mixed::tidy(clinical_model_q1, conf.int = TRUE) %>%
     )
   )
 
-message("\n--- COEFFICIENTS Q1 ---")
-print(clinical_coef_q1, n = Inf)
+# ============================================================
+# VARIANZSTRUKTUR-TEST (Issue D.1)
+# Vergleich: Compound Symmetry (lmer) vs Heterogene Varianz (nlme)
+# ============================================================
+
+message("\n--- VARIANCE STRUCTURE COMPARISON (Q1) ---")
+
+# Baue vergleichbares nlme-Modell mit heterogener Varianz pro Zeitpunkt
+suppressWarnings({
+  if (clinical_q1_run_interaction && clinical_use_celltypes) {
+    clinical_model_q1_lme <- nlme::lme(
+      clinical_inflammation_score ~ timepoint * ef_group + age + sex +
+        celltype_Monocytes + celltype_T_cells + celltype_Neutrophils,
+      random = ~ 1 | pid,
+      weights = nlme::varIdent(form = ~ 1 | timepoint),
+      data = clinical_data_q1,
+      method = "REML",
+      control = nlme::lmeControl(opt = "optim", maxIter = 100, msMaxIter = 100)
+    )
+  } else if (clinical_q1_run_interaction && !clinical_use_celltypes) {
+    clinical_model_q1_lme <- nlme::lme(
+      clinical_inflammation_score ~ timepoint * ef_group + age + sex,
+      random = ~ 1 | pid,
+      weights = nlme::varIdent(form = ~ 1 | timepoint),
+      data = clinical_data_q1,
+      method = "REML",
+      control = nlme::lmeControl(opt = "optim", maxIter = 100, msMaxIter = 100)
+    )
+  } else if (!clinical_q1_run_interaction && clinical_use_celltypes) {
+    clinical_model_q1_lme <- nlme::lme(
+      clinical_inflammation_score ~ timepoint + ef_group + age + sex +
+        celltype_Monocytes + celltype_T_cells + celltype_Neutrophils,
+      random = ~ 1 | pid,
+      weights = nlme::varIdent(form = ~ 1 | timepoint),
+      data = clinical_data_q1,
+      method = "REML",
+      control = nlme::lmeControl(opt = "optim", maxIter = 100, msMaxIter = 100)
+    )
+  } else {
+    clinical_model_q1_lme <- nlme::lme(
+      clinical_inflammation_score ~ timepoint + ef_group + age + sex,
+      random = ~ 1 | pid,
+      weights = nlme::varIdent(form = ~ 1 | timepoint),
+      data = clinical_data_q1,
+      method = "REML",
+      control = nlme::lmeControl(opt = "optim", maxIter = 100, msMaxIter = 100)
+    )
+  }
+})
+
+# AIC/BIC Vergleich
+clinical_aic_lmer <- AIC(clinical_model_q1)
+clinical_aic_lme <- AIC(clinical_model_q1_lme)
+clinical_bic_lmer <- BIC(clinical_model_q1)
+clinical_bic_lme <- BIC(clinical_model_q1_lme)
+
+message(sprintf("  lmer (Compound Symmetry):  AIC = %.1f, BIC = %.1f",
+                clinical_aic_lmer, clinical_bic_lmer))
+message(sprintf("  lme (Heterogeneous Var):   AIC = %.1f, BIC = %.1f",
+                clinical_aic_lme, clinical_bic_lme))
+
+if (clinical_aic_lme < clinical_aic_lmer - 2) {
+  message("  → Heterogene Varianzstruktur bevorzugt (ΔAIC > 2)")
+  clinical_q1_variance_note <- "Heterogeneous variance model preferred"
+} else {
+  message("  → Compound Symmetry ausreichend (kein substanzieller Unterschied)")
+  clinical_q1_variance_note <- "Compound symmetry adequate"
+}
+
+# ============================================================
+# CROSS-VALIDATION (Issue O.1/O.3)
+# LOO-CV zur internen Validierung der Modellgeneralisierbarkeit
+# ============================================================
+
+message("\n--- CROSS-VALIDATION (Q1) ---")
+
+# Erstelle Formel basierend auf Modellkonfiguration
+if (clinical_q1_run_interaction && clinical_use_celltypes) {
+  q1_cv_formula <- as.formula(
+    "clinical_inflammation_score ~ timepoint * ef_group + age + sex + celltype_Monocytes + celltype_T_cells + celltype_Neutrophils + (1|pid)"
+  )
+} else if (clinical_q1_run_interaction && !clinical_use_celltypes) {
+  q1_cv_formula <- as.formula(
+    "clinical_inflammation_score ~ timepoint * ef_group + age + sex + (1|pid)"
+  )
+} else if (!clinical_q1_run_interaction && clinical_use_celltypes) {
+  q1_cv_formula <- as.formula(
+    "clinical_inflammation_score ~ timepoint + ef_group + age + sex + celltype_Monocytes + celltype_T_cells + celltype_Neutrophils + (1|pid)"
+  )
+} else {
+  q1_cv_formula <- as.formula(
+    "clinical_inflammation_score ~ timepoint + ef_group + age + sex + (1|pid)"
+  )
+}
+
+clinical_q1_cv <- run_loocv(
+  model_formula = q1_cv_formula,
+  data = clinical_data_q1,
+  model_type = "lmer",
+  id_col = "pid"
+)
+
+message(sprintf("  LOPO (Leave-One-Patient-Out) R² = %.3f", clinical_q1_cv$r_squared))
+message(sprintf("  LOPO RMSE = %.3f", clinical_q1_cv$rmse))
+message(sprintf("  Valid predictions: %d/%d observations",
+                clinical_q1_cv$n_valid, clinical_q1_cv$n_total))
+message(sprintf("  Valid folds: %d/%d patients",
+                clinical_q1_cv$n_folds_valid, clinical_q1_cv$n_folds_total))
 
 # ============================================================
 # Residuen-Diagnostik
 # ============================================================
 
-clinical_data_q1$residuals <- residuals(clinical_model_q1)
-clinical_data_q1$fitted <- fitted(clinical_model_q1)
+clinical_data_q1 <- clinical_data_q1 %>%
+  mutate(
+    resid_val = residuals(clinical_model_q1),
+    fitted_val = fitted(clinical_model_q1)
+  )
 
-# Plot: Residuals vs Fitted + Q-Q
+# Diagnostik-Plots direkt in Datei speichern (verhindert knitr wrapup recursion)
+png(file.path(clinical_fig_dir, "primary_q1_diagnostics.png"),
+    width = 10, height = 5, units = "in", res = 300)
 par(mfrow = c(1, 2))
-
-# Residuals vs Fitted
 plot(
-  clinical_data_q1$fitted,
-  clinical_data_q1$residuals,
+  clinical_data_q1$fitted_val,
+  clinical_data_q1$resid_val,
   xlab = "Fitted Values",
   ylab = "Residuals",
   main = "Q1: Residuals vs Fitted",
@@ -1389,21 +2971,42 @@ plot(
   col = rgb(0, 0, 0, 0.5)
 )
 abline(h = 0, col = "red", lwd = 2)
-loess_fit <- loess(residuals ~ fitted, data = clinical_data_q1)
-lines(sort(clinical_data_q1$fitted), predict(loess_fit)[order(clinical_data_q1$fitted)],
-      col = "blue", lwd = 2)
-
-# Q-Q Plot
-qqnorm(clinical_data_q1$residuals, main = "Q1: Normal Q-Q Plot", pch = 16)
-qqline(clinical_data_q1$residuals, col = "red", lwd = 2)
-
+loess_fit <- tryCatch(
+  loess(resid_val ~ fitted_val, data = clinical_data_q1),
+  error = function(e) NULL
+)
+if (!is.null(loess_fit)) {
+  lines(
+    sort(clinical_data_q1$fitted_val),
+    predict(loess_fit)[order(clinical_data_q1$fitted_val)],
+    col = "blue",
+    lwd = 2
+  )
+}
+qqnorm(clinical_data_q1$resid_val, main = "Q1: Normal Q-Q Plot", pch = 16)
+qqline(clinical_data_q1$resid_val, col = "red", lwd = 2)
 par(mfrow = c(1, 1))
+invisible(dev.off())
+
+# ============================================================
+# Heteroskedastizitäts-Tests
+# ============================================================
+
+# Levene's Test: Varianz-Homogenität über Gruppen
+# Null-Hypothese: Gleiche Varianz über alle Gruppen
+clinical_levene_q1_timepoint <- car::leveneTest(
+  resid_val ~ timepoint,
+  data = clinical_data_q1
+)
+
+clinical_levene_q1_ef <- car::leveneTest(
+  resid_val ~ ef_group,
+  data = clinical_data_q1
+)
 
 # ============================================================
 # Effect Size: Cohen's d (pro Gruppe)
 # ============================================================
-
-message("\n--- EFFECT SIZES Q1 ---")
 
 clinical_effect_q1 <- clinical_data_q1 %>%
   group_by(timepoint, ef_group) %>%
@@ -1414,11 +3017,9 @@ clinical_effect_q1 <- clinical_data_q1 %>%
     .groups = "drop"
   )
 
-print(clinical_effect_q1)
-
 # Cohen's d für V1-A Delta pro EF-Gruppe
 clinical_data_q1_wide <- clinical_data_q1 %>%
-  select(pid, timepoint, ef_group, clinical_inflammation_score) %>%
+  dplyr::select(pid, timepoint, ef_group, clinical_inflammation_score) %>%
   pivot_wider(names_from = timepoint, values_from = clinical_inflammation_score) %>%
   mutate(delta_V1_A = V1 - A)
 
@@ -1431,11 +3032,12 @@ clinical_cohens_d_q1 <- clinical_data_q1_wide %>%
     .groups = "drop"
   ) %>%
   mutate(
-    cohens_d = mean_delta / sd_delta
+    # Within-subject Cohen's d (d_z):
+    # d_z = mean(difference) / SD(difference)
+    # Geeignet für repeated measures / paired designs
+    # (SD der Differenzen berücksichtigt implizit within-subject Korrelation)
+    cohens_d = ifelse(sd_delta > 0, mean_delta / sd_delta, NA_real_)
   )
-
-message("\nCohen's d für V1-A Delta (pro EF-Gruppe):")
-print(clinical_cohens_d_q1)
 
 # ============================================================
 # Visualisierung: Interaction Plot
@@ -1460,19 +3062,15 @@ clinical_plot_q1 <- clinical_effect_q1 %>%
     legend.position = "bottom"
   )
 
-print(clinical_plot_q1)
-
-# Speichere Figure
-ggsave(
+# Plot direkt in Datei speichern (nicht via knitr rendern)
+safe_ggsave(
   file.path(clinical_fig_dir, "primary_q1_ef_inflammation.png"),
   clinical_plot_q1,
-  width = 8, height = 6, dpi = 300
+  width = 8, height = 6, dpi = 300, bg = "white"
 )
 
-message("💾 Figure gespeichert: primary_q1_ef_inflammation.png")
-
 # ============================================================
-# Speichere Ergebnisse
+# Speichere Ergebnisse (ohne Plot-Objekte)
 # ============================================================
 
 clinical_results_q1 <- list(
@@ -1482,23 +3080,18 @@ clinical_results_q1 <- list(
   effect_sizes = clinical_effect_q1,
   cohens_d = clinical_cohens_d_q1,
   cell_counts = clinical_cell_counts_q1,
-  plot = clinical_plot_q1
+  cv = clinical_q1_cv,
+  variance_note = clinical_q1_variance_note
 )
 
 saveRDS(clinical_results_q1, file.path(clinical_cache_dir, "primary_q1_results.rds"))
-message("💾 Ergebnisse gespeichert: primary_q1_results.rds")
-
-message("\n✓ PRIMARY Q1 abgeschlossen")
 ```
 
 ```{r}
 #| label: step9-primary-q2-cad-ribosome
 #| echo: false
 #| warning: false
-#| fig.width: 10
-#| fig.height: 8
-
-message("=== SCHRITT 9.2: PRIMARY Q2 — CAD × Ribosome Recovery ===")
+#| message: false
 
 # ============================================================
 # Research Question Q2 (PRIMARY):
@@ -1506,7 +3099,7 @@ message("=== SCHRITT 9.2: PRIMARY Q2 — CAD × Ribosome Recovery ===")
 # Recovery (V2 vs V1) im Vergleich zu Patienten ohne CAD
 #
 # Literatur-Basis: Ischämie → Proteinsynthese-Stress (Kimball 2002)
-# Hypothese: CAD moduliert Ribosomen-Recovery-Kinetik
+# Hypothese: CAD ist assoziiert mit Ribosomen-Recovery-Kinetik
 # Kernfinding: Biphasische Ribosomen-Signatur (RESULTS_STORY.md)
 # ============================================================
 
@@ -1516,31 +3109,19 @@ clinical_data_q2 <- sample_meta_clinical_complete %>%
   filter(!is.na(relevant_cad), !is.na(clinical_ribosome_score)) %>%
   droplevels()
 
-message("✓ Q2 Dataset: ", nrow(clinical_data_q2), " samples from ",
-        n_distinct(clinical_data_q2$pid), " patients")
-
 # ============================================================
 # PRE-ANALYSIS: Zellenbesetzung
 # ============================================================
 
 clinical_cell_counts_q2 <- clinical_data_q2 %>%
-  count(timepoint, relevant_cad) %>%
+  dplyr::count(timepoint, relevant_cad) %>%
   arrange(timepoint, relevant_cad)
-
-message("\n--- ZELLENBESETZUNG Q2 ---")
-print(clinical_cell_counts_q2)
 
 clinical_min_cell_q2 <- min(clinical_cell_counts_q2$n)
 
 if (clinical_min_cell_q2 < clinical_params$min_n_per_group) {
-  warning(sprintf(
-    "⚠️ STOP-REGEL: Minimale Zelle (%d) < Schwelle (%d)",
-    clinical_min_cell_q2, clinical_params$min_n_per_group
-  ))
-  message("   → Interaktion timepoint × relevant_cad NICHT empfohlen")
   clinical_q2_run_interaction <- FALSE
 } else {
-  message("✓ Zellenbesetzung ausreichend für Interaktionsmodell")
   clinical_q2_run_interaction <- TRUE
 }
 
@@ -1548,42 +3129,59 @@ if (clinical_min_cell_q2 < clinical_params$min_n_per_group) {
 # MODELL: Mixed-Effects mit Interaktion
 # ============================================================
 
-if (clinical_q2_run_interaction) {
-  message("\n⏳ Fitte Interaktionsmodell...")
+# Check: Cell-type Kovariaten verfügbar?
+clinical_available_celltypes_q2 <- clinical_required_celltypes[clinical_required_celltypes %in% names(clinical_data_q2)]
+clinical_missing_celltypes_q2 <- setdiff(clinical_required_celltypes, clinical_available_celltypes_q2)
 
-  clinical_model_q2 <- lmerTest::lmer(
-    clinical_ribosome_score ~ timepoint * relevant_cad + age + sex + (1 | pid),
-    data = clinical_data_q2,
-    REML = TRUE
-  )
-
+if (length(clinical_missing_celltypes_q2) > 0) {
+  message("⚠️ Cell composition covariates missing – model run without cell adjustment")
+  message("   Interpret results with caution (Confounder C.2 not adjusted)")
+  clinical_use_celltypes_q2 <- FALSE
 } else {
-  message("\n⏳ Fitte Haupteffekt-Modell (ohne Interaktion)...")
-
-  clinical_model_q2 <- lmerTest::lmer(
-    clinical_ribosome_score ~ timepoint + relevant_cad + age + sex + (1 | pid),
-    data = clinical_data_q2,
-    REML = TRUE
-  )
+  clinical_use_celltypes_q2 <- TRUE
 }
 
-# Summary
-message("\n--- MODEL SUMMARY Q2 ---")
-print(summary(clinical_model_q2))
+if (clinical_q2_run_interaction) {
+  if (clinical_use_celltypes_q2) {
+    clinical_model_q2 <- lmerTest::lmer(
+      clinical_ribosome_score ~ timepoint * relevant_cad + age + sex +
+        celltype_Monocytes + celltype_T_cells + celltype_Neutrophils +
+        (1 | pid),
+      data = clinical_data_q2,
+      REML = TRUE
+    )
+  } else {
+    clinical_model_q2 <- lmerTest::lmer(
+      clinical_ribosome_score ~ timepoint * relevant_cad + age + sex +
+        (1 | pid),
+      data = clinical_data_q2,
+      REML = TRUE
+    )
+  }
+} else {
+  if (clinical_use_celltypes_q2) {
+    clinical_model_q2 <- lmerTest::lmer(
+      clinical_ribosome_score ~ timepoint + relevant_cad + age + sex +
+        celltype_Monocytes + celltype_T_cells + celltype_Neutrophils +
+        (1 | pid),
+      data = clinical_data_q2,
+      REML = TRUE
+    )
+  } else {
+    clinical_model_q2 <- lmerTest::lmer(
+      clinical_ribosome_score ~ timepoint + relevant_cad + age + sex +
+        (1 | pid),
+      data = clinical_data_q2,
+      REML = TRUE
+    )
+  }
+}
 
 # ============================================================
 # VIF-Check
 # ============================================================
 
-message("\n--- VIF CHECK Q2 ---")
 clinical_vif_q2 <- car::vif(clinical_model_q2)
-print(clinical_vif_q2)
-
-if (any(clinical_vif_q2 > clinical_params$vif_threshold)) {
-  warning(sprintf("⚠️ VIF > %.1f detektiert", clinical_params$vif_threshold))
-} else {
-  message("✓ VIF < ", clinical_params$vif_threshold, " — keine Kollinearität")
-}
 
 # ============================================================
 # Koeffizienten
@@ -1591,7 +3189,7 @@ if (any(clinical_vif_q2 > clinical_params$vif_threshold)) {
 
 clinical_coef_q2 <- broom.mixed::tidy(clinical_model_q2, conf.int = TRUE) %>%
   filter(effect == "fixed") %>%
-  select(term, estimate, std.error, conf.low, conf.high, statistic, df, p.value) %>%
+  dplyr::select(term, estimate, std.error, conf.low, conf.high, statistic, df, p.value) %>%
   mutate(
     sig = case_when(
       p.value < 0.001 ~ "***",
@@ -1601,22 +3199,132 @@ clinical_coef_q2 <- broom.mixed::tidy(clinical_model_q2, conf.int = TRUE) %>%
     )
   )
 
-message("\n--- COEFFICIENTS Q2 ---")
-print(clinical_coef_q2, n = Inf)
+# ============================================================
+# VARIANZSTRUKTUR-TEST (Issue D.1)
+# Vergleich: Compound Symmetry (lmer) vs Heterogene Varianz (nlme)
+# ============================================================
+
+message("\n--- VARIANCE STRUCTURE COMPARISON (Q2) ---")
+
+# Baue vergleichbares nlme-Modell mit heterogener Varianz pro Zeitpunkt
+suppressWarnings({
+  if (clinical_q2_run_interaction && clinical_use_celltypes_q2) {
+    clinical_model_q2_lme <- nlme::lme(
+      clinical_ribosome_score ~ timepoint * relevant_cad + age + sex +
+        celltype_Monocytes + celltype_T_cells + celltype_Neutrophils,
+      random = ~ 1 | pid,
+      weights = nlme::varIdent(form = ~ 1 | timepoint),
+      data = clinical_data_q2,
+      method = "REML",
+      control = nlme::lmeControl(opt = "optim", maxIter = 100, msMaxIter = 100)
+    )
+  } else if (clinical_q2_run_interaction && !clinical_use_celltypes_q2) {
+    clinical_model_q2_lme <- nlme::lme(
+      clinical_ribosome_score ~ timepoint * relevant_cad + age + sex,
+      random = ~ 1 | pid,
+      weights = nlme::varIdent(form = ~ 1 | timepoint),
+      data = clinical_data_q2,
+      method = "REML",
+      control = nlme::lmeControl(opt = "optim", maxIter = 100, msMaxIter = 100)
+    )
+  } else if (!clinical_q2_run_interaction && clinical_use_celltypes_q2) {
+    clinical_model_q2_lme <- nlme::lme(
+      clinical_ribosome_score ~ timepoint + relevant_cad + age + sex +
+        celltype_Monocytes + celltype_T_cells + celltype_Neutrophils,
+      random = ~ 1 | pid,
+      weights = nlme::varIdent(form = ~ 1 | timepoint),
+      data = clinical_data_q2,
+      method = "REML",
+      control = nlme::lmeControl(opt = "optim", maxIter = 100, msMaxIter = 100)
+    )
+  } else {
+    clinical_model_q2_lme <- nlme::lme(
+      clinical_ribosome_score ~ timepoint + relevant_cad + age + sex,
+      random = ~ 1 | pid,
+      weights = nlme::varIdent(form = ~ 1 | timepoint),
+      data = clinical_data_q2,
+      method = "REML",
+      control = nlme::lmeControl(opt = "optim", maxIter = 100, msMaxIter = 100)
+    )
+  }
+})
+
+# AIC/BIC Vergleich
+clinical_aic_lmer_q2 <- AIC(clinical_model_q2)
+clinical_aic_lme_q2 <- AIC(clinical_model_q2_lme)
+clinical_bic_lmer_q2 <- BIC(clinical_model_q2)
+clinical_bic_lme_q2 <- BIC(clinical_model_q2_lme)
+
+message(sprintf("  lmer (Compound Symmetry):  AIC = %.1f, BIC = %.1f",
+                clinical_aic_lmer_q2, clinical_bic_lmer_q2))
+message(sprintf("  lme (Heterogeneous Var):   AIC = %.1f, BIC = %.1f",
+                clinical_aic_lme_q2, clinical_bic_lme_q2))
+
+if (clinical_aic_lme_q2 < clinical_aic_lmer_q2 - 2) {
+  message("  → Heterogene Varianzstruktur bevorzugt (ΔAIC > 2)")
+  clinical_q2_variance_note <- "Heterogeneous variance model preferred"
+} else {
+  message("  → Compound Symmetry ausreichend (kein substanzieller Unterschied)")
+  clinical_q2_variance_note <- "Compound symmetry adequate"
+}
+
+# ============================================================
+# CROSS-VALIDATION (Issue O.1/O.3)
+# LOO-CV zur internen Validierung der Modellgeneralisierbarkeit
+# ============================================================
+
+message("\n--- CROSS-VALIDATION (Q2) ---")
+
+# Erstelle Formel basierend auf Modellkonfiguration
+if (clinical_q2_run_interaction && clinical_use_celltypes_q2) {
+  q2_cv_formula <- as.formula(
+    "clinical_ribosome_score ~ timepoint * relevant_cad + age + sex + celltype_Monocytes + celltype_T_cells + celltype_Neutrophils + (1|pid)"
+  )
+} else if (clinical_q2_run_interaction && !clinical_use_celltypes_q2) {
+  q2_cv_formula <- as.formula(
+    "clinical_ribosome_score ~ timepoint * relevant_cad + age + sex + (1|pid)"
+  )
+} else if (!clinical_q2_run_interaction && clinical_use_celltypes_q2) {
+  q2_cv_formula <- as.formula(
+    "clinical_ribosome_score ~ timepoint + relevant_cad + age + sex + celltype_Monocytes + celltype_T_cells + celltype_Neutrophils + (1|pid)"
+  )
+} else {
+  q2_cv_formula <- as.formula(
+    "clinical_ribosome_score ~ timepoint + relevant_cad + age + sex + (1|pid)"
+  )
+}
+
+clinical_q2_cv <- run_loocv(
+  model_formula = q2_cv_formula,
+  data = clinical_data_q2,
+  model_type = "lmer",
+  id_col = "pid"
+)
+
+message(sprintf("  LOPO (Leave-One-Patient-Out) R² = %.3f", clinical_q2_cv$r_squared))
+message(sprintf("  LOPO RMSE = %.3f", clinical_q2_cv$rmse))
+message(sprintf("  Valid predictions: %d/%d observations",
+                clinical_q2_cv$n_valid, clinical_q2_cv$n_total))
+message(sprintf("  Valid folds: %d/%d patients",
+                clinical_q2_cv$n_folds_valid, clinical_q2_cv$n_folds_total))
 
 # ============================================================
 # Residuen-Diagnostik
 # ============================================================
 
-clinical_data_q2$residuals <- residuals(clinical_model_q2)
-clinical_data_q2$fitted <- fitted(clinical_model_q2)
+clinical_data_q2 <- clinical_data_q2 %>%
+  mutate(
+    resid_val = residuals(clinical_model_q2),
+    fitted_val = fitted(clinical_model_q2)
+  )
 
+# Diagnostik-Plots direkt in Datei speichern (verhindert knitr wrapup recursion)
+png(file.path(clinical_fig_dir, "primary_q2_diagnostics.png"),
+    width = 10, height = 5, units = "in", res = 300)
 par(mfrow = c(1, 2))
-
-# Residuals vs Fitted
 plot(
-  clinical_data_q2$fitted,
-  clinical_data_q2$residuals,
+  clinical_data_q2$fitted_val,
+  clinical_data_q2$resid_val,
   xlab = "Fitted Values",
   ylab = "Residuals",
   main = "Q2: Residuals vs Fitted",
@@ -1624,21 +3332,40 @@ plot(
   col = rgb(0, 0, 0, 0.5)
 )
 abline(h = 0, col = "red", lwd = 2)
-loess_fit_q2 <- loess(residuals ~ fitted, data = clinical_data_q2)
-lines(sort(clinical_data_q2$fitted), predict(loess_fit_q2)[order(clinical_data_q2$fitted)],
-      col = "blue", lwd = 2)
-
-# Q-Q Plot
-qqnorm(clinical_data_q2$residuals, main = "Q2: Normal Q-Q Plot", pch = 16)
-qqline(clinical_data_q2$residuals, col = "red", lwd = 2)
-
+loess_fit_q2 <- tryCatch(
+  loess(resid_val ~ fitted_val, data = clinical_data_q2),
+  error = function(e) NULL
+)
+if (!is.null(loess_fit_q2)) {
+  lines(
+    sort(clinical_data_q2$fitted_val),
+    predict(loess_fit_q2)[order(clinical_data_q2$fitted_val)],
+    col = "blue",
+    lwd = 2
+  )
+}
+qqnorm(clinical_data_q2$resid_val, main = "Q2: Normal Q-Q Plot", pch = 16)
+qqline(clinical_data_q2$resid_val, col = "red", lwd = 2)
 par(mfrow = c(1, 1))
+invisible(dev.off())
+
+# ============================================================
+# Heteroskedastizitäts-Tests
+# ============================================================
+
+clinical_levene_q2_timepoint <- car::leveneTest(
+  resid_val ~ timepoint,
+  data = clinical_data_q2
+)
+
+clinical_levene_q2_cad <- car::leveneTest(
+  resid_val ~ relevant_cad,
+  data = clinical_data_q2
+)
 
 # ============================================================
 # Effect Size
 # ============================================================
-
-message("\n--- EFFECT SIZES Q2 ---")
 
 clinical_effect_q2 <- clinical_data_q2 %>%
   group_by(timepoint, relevant_cad) %>%
@@ -1649,11 +3376,9 @@ clinical_effect_q2 <- clinical_data_q2 %>%
     .groups = "drop"
   )
 
-print(clinical_effect_q2)
-
 # Cohen's d für V2-V1 Recovery Delta pro CAD-Gruppe
 clinical_data_q2_wide <- clinical_data_q2 %>%
-  select(pid, timepoint, relevant_cad, clinical_ribosome_score) %>%
+  dplyr::select(pid, timepoint, relevant_cad, clinical_ribosome_score) %>%
   pivot_wider(names_from = timepoint, values_from = clinical_ribosome_score) %>%
   mutate(delta_V2_V1 = V2 - V1)
 
@@ -1666,12 +3391,9 @@ clinical_cohens_d_q2 <- clinical_data_q2_wide %>%
     .groups = "drop"
   ) %>%
   mutate(
-    cohens_d = mean_delta / sd_delta,
+    cohens_d = ifelse(sd_delta > 0, mean_delta / sd_delta, NA_real_),
     cad_label = ifelse(relevant_cad, "CAD", "No CAD")
   )
-
-message("\nCohen's d für V2-V1 Recovery Delta (pro CAD-Gruppe):")
-print(clinical_cohens_d_q2)
 
 # ============================================================
 # Visualisierung
@@ -1697,18 +3419,15 @@ clinical_plot_q2 <- clinical_effect_q2 %>%
     legend.position = "bottom"
   )
 
-print(clinical_plot_q2)
-
-ggsave(
+# Plot direkt in Datei speichern (nicht via knitr rendern)
+safe_ggsave(
   file.path(clinical_fig_dir, "primary_q2_cad_ribosome.png"),
   clinical_plot_q2,
-  width = 8, height = 6, dpi = 300
+  width = 8, height = 6, dpi = 300, bg = "white"
 )
 
-message("💾 Figure gespeichert: primary_q2_cad_ribosome.png")
-
 # ============================================================
-# Speichere Ergebnisse
+# Speichere Ergebnisse (ohne Plot-Objekte)
 # ============================================================
 
 clinical_results_q2 <- list(
@@ -1718,23 +3437,17 @@ clinical_results_q2 <- list(
   effect_sizes = clinical_effect_q2,
   cohens_d = clinical_cohens_d_q2,
   cell_counts = clinical_cell_counts_q2,
-  plot = clinical_plot_q2
+  cv = clinical_q2_cv,
+  variance_note = clinical_q2_variance_note
 )
 
 saveRDS(clinical_results_q2, file.path(clinical_cache_dir, "primary_q2_results.rds"))
-message("💾 Ergebnisse gespeichert: primary_q2_results.rds")
-
-message("\n✓ PRIMARY Q2 abgeschlossen")
 ```
 
 ```{r}
 #| label: step9-primary-lq2-myeloid-lymphoid-shift
 #| echo: false
 #| warning: false
-#| fig.width: 12
-#| fig.height: 10
-
-message("=== SCHRITT 9.3: PRIMARY LQ2 — Myeloid-Lymphoid-Shift ===")
 
 # ============================================================
 # Research Question LQ2 (PRIMARY):
@@ -1753,19 +3466,48 @@ message("\n⏳ Prüfe Deconvolution-Verfügbarkeit...")
 # Prüfe ob Deconvolution-Scores verfügbar sind
 clinical_has_deconv <- "celltype_Monocytes" %in% names(sample_meta_clinical_complete)
 
+# Prüfe Plausibilität (Flag aus Step 5)
+if (!exists("clinical_monocyte_plausible")) {
+  clinical_monocyte_plausible <- NA  # Falls Step 5 übersprungen
+}
+
 if (!clinical_has_deconv) {
   message("⚠️ Deconvolution-Scores NICHT verfügbar")
   message("   → LQ2 wird mit Pathway-basierten Surrogaten analysiert")
   message("   → Limitation: Keine direkte Zelltyp-Quantifikation")
+  clinical_lq2_mode <- "pathway"
 
-  # Alternative: Pathway-basierte Zelltyp-Signaturen
-  # (Falls GSVA mit GO-Terms verfügbar)
+} else if (isFALSE(clinical_monocyte_plausible)) {
+  message("⚠️ Deconvolution-Scores verfügbar, ABER Plausibilitätsprüfung FEHLGESCHLAGEN")
+  message("   → Monozyten-Dynamik nicht konsistent mit Literatur (Kuppe 2024)")
+  message("   → LQ2 wird mit Pathway-basierten Surrogaten analysiert (konservativer Ansatz)")
+  message("   → Limitation wird in Manuskript dokumentiert")
   clinical_lq2_mode <- "pathway"
 
 } else {
-  message("✓ Deconvolution-Scores verfügbar (MCP-counter)")
+  message("✓ Deconvolution-Scores verfügbar und plausibel (MCP-counter)")
   message("   → LQ2 wird mit direkten Zelltyp-Scores analysiert")
   clinical_lq2_mode <- "deconvolution"
+}
+
+# ============================================================
+# Robust: Zelltyp-Spalten harmonisieren & validieren
+# ============================================================
+
+# NK-Name vereinheitlichen (verhindert select-Fehler bei NK_cell vs NK_cells)
+if ("celltype_NK_cell" %in% names(sample_meta_clinical_complete) &&
+    !"celltype_NK_cells" %in% names(sample_meta_clinical_complete)) {
+  sample_meta_clinical_complete$celltype_NK_cells <- sample_meta_clinical_complete$celltype_NK_cell
+}
+if ("celltype_NK_cells" %in% names(sample_meta_clinical_complete) &&
+    !"celltype_NK_cell" %in% names(sample_meta_clinical_complete)) {
+  sample_meta_clinical_complete$celltype_NK_cell <- sample_meta_clinical_complete$celltype_NK_cells
+}
+
+clinical_required_celltypes <- c("celltype_Monocytes", "celltype_T_cells", "celltype_Neutrophils")
+clinical_missing_celltypes <- setdiff(clinical_required_celltypes, names(sample_meta_clinical_complete))
+if (length(clinical_missing_celltypes) > 0) {
+  stop("❌ Fehlende Zelltyp-Spalten: ", paste(clinical_missing_celltypes, collapse = ", "))
 }
 
 # ============================================================
@@ -1774,19 +3516,46 @@ if (!clinical_has_deconv) {
 
 if (clinical_lq2_mode == "deconvolution") {
 
-  # Daten: Alle 3 Zeitpunkte
+  # NK-Zell-Spalte robust detektieren (MCP-counter variiert: NK_cell vs NK_cells)
+  clinical_nk_col <- intersect(
+    c("celltype_NK_cells", "celltype_NK_cell"),
+    names(sample_meta_clinical_complete)
+  )
+  clinical_has_nk <- length(clinical_nk_col) > 0
+  if (!clinical_has_nk) {
+    message("  ⚠️ Keine NK-Zell-Spalte gefunden — MLR wird ohne NK-Zellen berechnet")
+  } else {
+    clinical_nk_col <- clinical_nk_col[1]
+    message("  ✓ NK-Zell-Spalte: ", clinical_nk_col)
+  }
+
+  # Daten: Alle 3 Zeitpunkte — Kern-Selektion
   clinical_data_lq2 <- sample_meta_clinical_complete %>%
     filter(!is.na(celltype_Monocytes), !is.na(celltype_T_cells)) %>%
-    select(
+    dplyr::select(
       sample_id, pid, timepoint, age, sex,
       clinical_mono = celltype_Monocytes,
       clinical_tcells = celltype_T_cells,
-      clinical_nk = celltype_NK_cells,
       clinical_neutro = celltype_Neutrophils
     ) %>%
+    ungroup() %>%
+    as.data.frame()
+
+  # NK-Zellen hinzufügen (falls verfügbar, sonst 0)
+  if (clinical_has_nk) {
+    clinical_data_lq2$clinical_nk <- sample_meta_clinical_complete[[clinical_nk_col]][
+      match(clinical_data_lq2$sample_id, sample_meta_clinical_complete$sample_id)
+    ]
+  } else {
+    clinical_data_lq2$clinical_nk <- 0
+  }
+
+  # MLR berechnen (Log-Ratio, Standard für compositional data; Aitchison, 1986)
+  clinical_data_lq2 <- clinical_data_lq2 %>%
     mutate(
-      # Myeloid-Lymphoid-Ratio (MLR) als Composite
-      clinical_mlr = (clinical_mono + clinical_neutro) / (clinical_tcells + clinical_nk + 0.01)
+      clinical_myeloid_sum = clinical_mono + clinical_neutro + 0.01,
+      clinical_lymphoid_sum = clinical_tcells + clinical_nk + 0.01,
+      clinical_mlr = log2(clinical_myeloid_sum / clinical_lymphoid_sum)
     )
 
   message("✓ LQ2 Dataset: ", nrow(clinical_data_lq2), " samples from ",
@@ -1806,10 +3575,10 @@ if (clinical_lq2_mode == "deconvolution") {
 
   clinical_coef_lq2_mono <- broom.mixed::tidy(clinical_model_lq2_mono, conf.int = TRUE) %>%
     filter(effect == "fixed") %>%
-    select(term, estimate, std.error, conf.low, conf.high, statistic, df, p.value)
+    dplyr::select(term, estimate, std.error, conf.low, conf.high, statistic, df, p.value)
 
   message("\n--- MONOCYTES: Coefficients ---")
-  print(clinical_coef_lq2_mono, n = Inf)
+  safe_print(clinical_coef_lq2_mono)
 
   # ============================================================
   # MODELL: T-Zellen über Zeit
@@ -1825,10 +3594,10 @@ if (clinical_lq2_mode == "deconvolution") {
 
   clinical_coef_lq2_tcells <- broom.mixed::tidy(clinical_model_lq2_tcells, conf.int = TRUE) %>%
     filter(effect == "fixed") %>%
-    select(term, estimate, std.error, conf.low, conf.high, statistic, df, p.value)
+    dplyr::select(term, estimate, std.error, conf.low, conf.high, statistic, df, p.value)
 
   message("\n--- T-CELLS: Coefficients ---")
-  print(clinical_coef_lq2_tcells, n = Inf)
+  safe_print(clinical_coef_lq2_tcells)
 
   # ============================================================
   # MODELL: Myeloid-Lymphoid-Ratio
@@ -1844,10 +3613,34 @@ if (clinical_lq2_mode == "deconvolution") {
 
   clinical_coef_lq2_mlr <- broom.mixed::tidy(clinical_model_lq2_mlr, conf.int = TRUE) %>%
     filter(effect == "fixed") %>%
-    select(term, estimate, std.error, conf.low, conf.high, statistic, df, p.value)
+    dplyr::select(term, estimate, std.error, conf.low, conf.high, statistic, df, p.value)
 
   message("\n--- MYELOID-LYMPHOID-RATIO: Coefficients ---")
-  print(clinical_coef_lq2_mlr, n = Inf)
+  safe_print(clinical_coef_lq2_mlr)
+
+  # ============================================================
+  # CROSS-VALIDATION (Issue O.1/O.3) - MLR als Haupt-Outcome
+  # ============================================================
+
+  message("\n--- CROSS-VALIDATION (LQ2 MLR) ---")
+
+  lq2_mlr_cv_formula <- as.formula(
+    "clinical_mlr ~ timepoint + age + sex + (1|pid)"
+  )
+
+  clinical_lq2_cv <- run_loocv(
+    model_formula = lq2_mlr_cv_formula,
+    data = clinical_data_lq2,
+    model_type = "lmer",
+    id_col = "pid"
+  )
+
+  message(sprintf("  LOPO (Leave-One-Patient-Out) R² = %.3f", clinical_lq2_cv$r_squared))
+  message(sprintf("  LOPO RMSE = %.3f", clinical_lq2_cv$rmse))
+  message(sprintf("  Valid predictions: %d/%d observations",
+                  clinical_lq2_cv$n_valid, clinical_lq2_cv$n_total))
+  message(sprintf("  Valid folds: %d/%d patients",
+                  clinical_lq2_cv$n_folds_valid, clinical_lq2_cv$n_folds_total))
 
   # ============================================================
   # Effect Sizes
@@ -1864,89 +3657,100 @@ if (clinical_lq2_mode == "deconvolution") {
       mlr_mean = mean(clinical_mlr, na.rm = TRUE),
       mlr_sd = sd(clinical_mlr, na.rm = TRUE),
       .groups = "drop"
-    )
+    ) %>%
+    as.data.frame()  # Sichere Konvertierung zu data.frame
 
   message("\n--- EFFECT SIZES LQ2 ---")
-  print(clinical_effect_lq2)
+  safe_print(clinical_effect_lq2, row.names = FALSE)
 
   # ============================================================
   # Visualisierung: Multi-Panel (Mono, T-cells, MLR)
   # ============================================================
 
-  # Panel A: Monozyten
-  clinical_plot_lq2_a <- clinical_data_lq2 %>%
-    ggplot(aes(x = timepoint, y = clinical_mono)) +
+  message("⏳ Erstelle Visualisierungen...")
+
+  # Timepoint-Faktor korrekt ordnen
+  clinical_data_lq2$timepoint <- factor(clinical_data_lq2$timepoint, levels = c("A", "V1", "V2"))
+
+  # Einzelpanels erstellen
+  clinical_plot_lq2_a <- ggplot(clinical_data_lq2, aes(x = timepoint, y = clinical_mono)) +
     geom_violin(aes(fill = timepoint), alpha = 0.5, show.legend = FALSE) +
     geom_boxplot(width = 0.2, outlier.shape = NA) +
     stat_summary(fun = mean, geom = "point", size = 3, color = "red") +
     stat_summary(fun = mean, geom = "line", aes(group = 1), color = "red", linewidth = 1) +
-    labs(
-      title = "A: Monocyte Dynamics",
-      x = "Timepoint",
-      y = "Monocyte Score (MCP-counter)"
-    ) +
+    labs(title = "A: Monocyte Dynamics", x = "Timepoint", y = "Monocyte Score (MCP-counter)") +
     theme_bw(base_size = 11)
 
-  # Panel B: T-Zellen
-  clinical_plot_lq2_b <- clinical_data_lq2 %>%
-    ggplot(aes(x = timepoint, y = clinical_tcells)) +
+  clinical_plot_lq2_b <- ggplot(clinical_data_lq2, aes(x = timepoint, y = clinical_tcells)) +
     geom_violin(aes(fill = timepoint), alpha = 0.5, show.legend = FALSE) +
     geom_boxplot(width = 0.2, outlier.shape = NA) +
     stat_summary(fun = mean, geom = "point", size = 3, color = "blue") +
     stat_summary(fun = mean, geom = "line", aes(group = 1), color = "blue", linewidth = 1) +
-    labs(
-      title = "B: T-Cell Dynamics",
-      x = "Timepoint",
-      y = "T-Cell Score (MCP-counter)"
-    ) +
+    labs(title = "B: T-Cell Dynamics", x = "Timepoint", y = "T-Cell Score (MCP-counter)") +
     theme_bw(base_size = 11)
 
-  # Panel C: Myeloid-Lymphoid-Ratio
-  clinical_plot_lq2_c <- clinical_data_lq2 %>%
-    ggplot(aes(x = timepoint, y = clinical_mlr)) +
+  clinical_plot_lq2_c <- ggplot(clinical_data_lq2, aes(x = timepoint, y = clinical_mlr)) +
     geom_violin(aes(fill = timepoint), alpha = 0.5, show.legend = FALSE) +
     geom_boxplot(width = 0.2, outlier.shape = NA) +
     stat_summary(fun = mean, geom = "point", size = 3, color = "purple") +
     stat_summary(fun = mean, geom = "line", aes(group = 1), color = "purple", linewidth = 1) +
-    labs(
-      title = "C: Myeloid-Lymphoid Ratio",
-      x = "Timepoint",
-      y = "MLR (Myeloid / Lymphoid)"
-    ) +
+    labs(title = "C: Myeloid-Lymphoid Ratio", x = "Timepoint", y = "log2(Myeloid / Lymphoid)") +
     theme_bw(base_size = 11)
 
-  # Kombiniere Panels
-  if (requireNamespace("patchwork", quietly = TRUE)) {
-    library(patchwork)
-    clinical_plot_lq2_combined <- clinical_plot_lq2_a / clinical_plot_lq2_b / clinical_plot_lq2_c +
-      plot_annotation(
-        title = "PRIMARY LQ2: Myeloid-Lymphoid Shift (Deconvolution-based)",
-        subtitle = sprintf("MCP-counter Cell-Type Scores (n=%d patients)", n_distinct(clinical_data_lq2$pid)),
-        theme = theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 14))
-      )
-  } else {
-    # Fallback: Einzelplots nebeneinander
-    par(mfrow = c(1, 3))
-    print(clinical_plot_lq2_a)
-    print(clinical_plot_lq2_b)
-    print(clinical_plot_lq2_c)
-    par(mfrow = c(1, 1))
-    clinical_plot_lq2_combined <- NULL
-  }
+  # ============================================================
+  # Plots in Dateien speichern (nicht via knitr rendern)
+  # ============================================================
 
-  if (!is.null(clinical_plot_lq2_combined)) {
-    print(clinical_plot_lq2_combined)
+  message("  Saving plots...")
 
-    ggsave(
-      file.path(clinical_fig_dir, "primary_lq2_myeloid_lymphoid_shift.png"),
-      clinical_plot_lq2_combined,
-      width = 10, height = 12, dpi = 300
+  safe_ggsave(
+    file.path(clinical_fig_dir, "primary_lq2_monocytes.png"),
+    plot = clinical_plot_lq2_a,
+    width = 8, height = 6, dpi = 300, bg = "white"
+  )
+
+  safe_ggsave(
+    file.path(clinical_fig_dir, "primary_lq2_tcells.png"),
+    plot = clinical_plot_lq2_b,
+    width = 8, height = 6, dpi = 300, bg = "white"
+  )
+
+  safe_ggsave(
+    file.path(clinical_fig_dir, "primary_lq2_mlr.png"),
+    plot = clinical_plot_lq2_c,
+    width = 8, height = 6, dpi = 300, bg = "white"
+  )
+
+  # Kombinierter Plot: direkt in PNG-Device rendern
+  clinical_lq2_combined_path <- file.path(clinical_fig_dir, "primary_lq2_combined.png")
+  combined_ok <- tryCatch({
+    png(clinical_lq2_combined_path, width = 10, height = 14, units = "in", res = 300)
+    print(
+      clinical_plot_lq2_a / clinical_plot_lq2_b / clinical_plot_lq2_c +
+        plot_annotation(
+          title = "PRIMARY LQ2: Myeloid-Lymphoid Shift nach TAVI",
+          subtitle = paste0("n = ", n_distinct(clinical_data_lq2$pid),
+                            " Patienten, 3 Zeitpunkte (A, V1, V2)"),
+          caption = "MCP-counter Deconvolution | lmer(Score ~ timepoint + age + sex + (1|pid))"
+        )
     )
-    message("💾 Figure gespeichert: primary_lq2_myeloid_lymphoid_shift.png")
+    dev.off()
+    TRUE
+  }, error = function(e) {
+    message("⚠️ Kombinierter LQ2-Plot fehlgeschlagen: ", conditionMessage(e))
+    if (dev.cur() > 1) dev.off()
+    FALSE
+  })
+
+  message("  ✓ Plots gespeichert in: ", clinical_fig_dir)
+
+  # Saved Plots im Quarto-Dokument anzeigen
+  if (isTRUE(combined_ok)) {
+    message("ℹ️ Kombinierter LQ2-Plot gespeichert (nicht eingebettet): ", clinical_lq2_combined_path)
   }
 
   # ============================================================
-  # Speichere Ergebnisse
+  # Speichere Ergebnisse (ohne Plot-Objekte)
   # ============================================================
 
   clinical_results_lq2 <- list(
@@ -1958,7 +3762,7 @@ if (clinical_lq2_mode == "deconvolution") {
     coef_tcells = clinical_coef_lq2_tcells,
     coef_mlr = clinical_coef_lq2_mlr,
     effect_sizes = clinical_effect_lq2,
-    plot = clinical_plot_lq2_combined
+    cv = clinical_lq2_cv
   )
 
   saveRDS(clinical_results_lq2, file.path(clinical_cache_dir, "primary_lq2_results.rds"))
@@ -1976,20 +3780,25 @@ if (clinical_lq2_mode == "deconvolution") {
   # Nutze Inflammation (Myeloid-Proxy) und Adaptive (Lymphoid-Proxy)
   clinical_data_lq2_pathway <- sample_meta_clinical_complete %>%
     filter(!is.na(clinical_inflammation_score), !is.na(clinical_adaptive_score)) %>%
-    select(
+    dplyr::select(
       sample_id, pid, timepoint, age, sex,
       clinical_myeloid_proxy = clinical_inflammation_score,
-      clinical_lymphoid_proxy = clinical_adaptive_score
+      clinical_lymphoid_proxy = clinical_adaptive_score,
+      celltype_Monocytes, celltype_T_cells, celltype_Neutrophils
     ) %>%
     mutate(
       clinical_mlr_proxy = clinical_myeloid_proxy - clinical_lymphoid_proxy
-    )
+    ) %>%
+    ungroup() %>%
+    as.data.frame()
 
   message("✓ LQ2 Pathway Dataset: ", nrow(clinical_data_lq2_pathway), " samples")
 
   # Modell: Myeloid-Proxy
   clinical_model_lq2_myeloid <- lmerTest::lmer(
-    clinical_myeloid_proxy ~ timepoint + age + sex + (1 | pid),
+    clinical_myeloid_proxy ~ timepoint + age + sex +
+      celltype_Monocytes + celltype_T_cells + celltype_Neutrophils +
+      (1 | pid),
     data = clinical_data_lq2_pathway,
     REML = TRUE
   )
@@ -1998,11 +3807,13 @@ if (clinical_lq2_mode == "deconvolution") {
     filter(effect == "fixed")
 
   message("\n--- MYELOID-PROXY (Inflammation): Coefficients ---")
-  print(clinical_coef_lq2_myeloid, n = Inf)
+  safe_print(clinical_coef_lq2_myeloid)
 
   # Modell: Lymphoid-Proxy
   clinical_model_lq2_lymphoid <- lmerTest::lmer(
-    clinical_lymphoid_proxy ~ timepoint + age + sex + (1 | pid),
+    clinical_lymphoid_proxy ~ timepoint + age + sex +
+      celltype_Monocytes + celltype_T_cells + celltype_Neutrophils +
+      (1 | pid),
     data = clinical_data_lq2_pathway,
     REML = TRUE
   )
@@ -2011,7 +3822,7 @@ if (clinical_lq2_mode == "deconvolution") {
     filter(effect == "fixed")
 
   message("\n--- LYMPHOID-PROXY (Adaptive): Coefficients ---")
-  print(clinical_coef_lq2_lymphoid, n = Inf)
+  safe_print(clinical_coef_lq2_lymphoid)
 
   clinical_results_lq2 <- list(
     mode = "pathway",
@@ -2044,68 +3855,66 @@ message("\n⏳ Konsolidiere Primary Results...")
 
 # ============================================================
 # Extrahiere KEY P-VALUES aus allen 3 Primary Analyses
+# Methode: Nutze anova() für robuste Effekt-Tests (Type III)
 # ============================================================
 
-# Q1: Interaktion timepoint × EF_group (falls gefittet)
-if (exists("clinical_coef_q1")) {
-  clinical_pval_q1_interaction <- clinical_coef_q1 %>%
-    filter(grepl("timepoint.*ef_group", term)) %>%
-    pull(p.value)
+# Q1: Interaktion timepoint × EF_group (oder Haupteffekt falls nicht gefittet)
+if (exists("clinical_model_q1")) {
+  clinical_anova_q1 <- anova(clinical_model_q1, type = "III")
 
-  # Falls keine Interaktion (nur Haupteffekte): nimm Haupteffekt timepoint
-  if (length(clinical_pval_q1_interaction) == 0) {
-    clinical_pval_q1_interaction <- clinical_coef_q1 %>%
-      filter(term == "timepointV1") %>%
-      pull(p.value)
+  # Prüfe ob Interaktion im Modell vorhanden
+  if ("timepoint:ef_group" %in% rownames(clinical_anova_q1)) {
+    clinical_pval_q1 <- clinical_anova_q1["timepoint:ef_group", "Pr(>F)"]
+    message("  Q1: Interaktion timepoint:ef_group p = ",
+            format.pval(clinical_pval_q1, digits = 3))
+  } else {
+    # Falls keine Interaktion: nimm Haupteffekt timepoint
+    clinical_pval_q1 <- clinical_anova_q1["timepoint", "Pr(>F)"]
+    message("  Q1: Haupteffekt timepoint p = ",
+            format.pval(clinical_pval_q1, digits = 3))
   }
-
-  clinical_pval_q1 <- ifelse(
-    length(clinical_pval_q1_interaction) > 0,
-    min(clinical_pval_q1_interaction),  # Falls mehrere Interaktions-Terms: nimm min
-    NA
-  )
 } else {
   clinical_pval_q1 <- NA
+  message("  Q1: Modell nicht vorhanden")
 }
 
-# Q2: Interaktion timepoint × CAD
-if (exists("clinical_coef_q2")) {
-  clinical_pval_q2_interaction <- clinical_coef_q2 %>%
-    filter(grepl("timepoint.*relevant_cad", term)) %>%
-    pull(p.value)
+# Q2: Interaktion timepoint × relevant_cad (oder Haupteffekt)
+if (exists("clinical_model_q2")) {
+  clinical_anova_q2 <- anova(clinical_model_q2, type = "III")
 
-  if (length(clinical_pval_q2_interaction) == 0) {
-    clinical_pval_q2_interaction <- clinical_coef_q2 %>%
-      filter(term == "timepointV2") %>%
-      pull(p.value)
+  if ("timepoint:relevant_cad" %in% rownames(clinical_anova_q2)) {
+    clinical_pval_q2 <- clinical_anova_q2["timepoint:relevant_cad", "Pr(>F)"]
+    message("  Q2: Interaktion timepoint:relevant_cad p = ",
+            format.pval(clinical_pval_q2, digits = 3))
+  } else {
+    clinical_pval_q2 <- clinical_anova_q2["timepoint", "Pr(>F)"]
+    message("  Q2: Haupteffekt timepoint p = ",
+            format.pval(clinical_pval_q2, digits = 3))
   }
-
-  clinical_pval_q2 <- ifelse(
-    length(clinical_pval_q2_interaction) > 0,
-    min(clinical_pval_q2_interaction),
-    NA
-  )
 } else {
   clinical_pval_q2 <- NA
+  message("  Q2: Modell nicht vorhanden")
 }
 
-# LQ2: Timepoint-Effekt auf Monozyten ODER MLR
-if (exists("clinical_coef_lq2_mono")) {
-  clinical_pval_lq2_mono <- clinical_coef_lq2_mono %>%
-    filter(grepl("timepoint", term)) %>%
-    pull(p.value) %>%
-    min()
-
-  clinical_pval_lq2 <- clinical_pval_lq2_mono
-} else if (exists("clinical_coef_lq2_myeloid")) {
-  clinical_pval_lq2_myeloid <- clinical_coef_lq2_myeloid %>%
-    filter(grepl("timepoint", term)) %>%
-    pull(p.value) %>%
-    min()
-
-  clinical_pval_lq2 <- clinical_pval_lq2_myeloid
+# LQ2: Timepoint-Effekt (primär MLR, sonst Monozyten- oder Proxy-Modell)
+if (exists("clinical_model_lq2_mlr")) {
+  clinical_anova_lq2 <- anova(clinical_model_lq2_mlr, type = "III")
+  clinical_pval_lq2 <- clinical_anova_lq2["timepoint", "Pr(>F)"]
+  message("  LQ2: Timepoint-Effekt (MLR) p = ",
+          format.pval(clinical_pval_lq2, digits = 3))
+} else if (exists("clinical_model_lq2_mono")) {
+  clinical_anova_lq2 <- anova(clinical_model_lq2_mono, type = "III")
+  clinical_pval_lq2 <- clinical_anova_lq2["timepoint", "Pr(>F)"]
+  message("  LQ2: Timepoint-Effekt (Monozyten) p = ",
+          format.pval(clinical_pval_lq2, digits = 3))
+} else if (exists("clinical_model_lq2_myeloid")) {
+  clinical_anova_lq2 <- anova(clinical_model_lq2_myeloid, type = "III")
+  clinical_pval_lq2 <- clinical_anova_lq2["timepoint", "Pr(>F)"]
+  message("  LQ2: Timepoint-Effekt (Myeloid-Proxy) p = ",
+          format.pval(clinical_pval_lq2, digits = 3))
 } else {
   clinical_pval_lq2 <- NA
+  message("  LQ2: Modell nicht vorhanden")
 }
 
 # ============================================================
@@ -2143,7 +3952,7 @@ clinical_primary_pvalues <- clinical_primary_pvalues %>%
   )
 
 message("\n=== PRIMARY ANALYSES: Multiple Testing Correction (Holm) ===")
-print(clinical_primary_pvalues, row.names = FALSE)
+safe_print(clinical_primary_pvalues, row.names = FALSE)
 
 # Speichere Summary
 write.csv(
@@ -2179,16 +3988,1140 @@ message("\n✓ PRIMARY ANALYSES KOMPLETT")
 
 ---
 
-# SCHRITT 10-12: Secondary, Exploratory, Validation
+# SCHRITT 10: SECONDARY ANALYSES
 
-**Status:** Primary Analyses (Schritte 1-9) vollständig implementiert.
+**Literature-driven, hypothesis-testing analyses with BH-FDR correction**
 
-**Nächste Schritte:**
-- Schritt 10: Secondary Analyses (LQ1, LQ4, LQ7, Q7)
-- Schritt 11: Exploratory Analyses (Valve-Type, Sex, mit Stop-Regeln)
-- Schritt 12: Cross-Validation & Robustheit (ORA ↔ GSEA ↔ GSVA Konsistenz)
+```{r}
+#| label: step10-prereq-check
+#| echo: false
+#| warning: false
 
-**Hinweis:** Implementierung von Schritten 10-12 erfolgt nach User-Approval der Primary Results.
+message("=== SCHRITT 10.0: Prerequisites Check ===")
+
+# ============================================================
+# Sicherheitsprüfung: Sind alle benötigten Daten verfügbar?
+# Falls Steps 1-9 übersprungen wurden (z.B. aus Cache), müssen
+# die RDS-Dateien geladen werden
+# ============================================================
+
+# Check 1: sample_meta_clinical_complete exists?
+if (!exists("sample_meta_clinical_complete")) {
+  message("⏳ Lade sample_meta_clinical_complete aus Cache...")
+  sample_meta_clinical_complete_path <- file.path(clinical_cache_dir, "sample_meta_clinical_complete.rds")
+  if (file.exists(sample_meta_clinical_complete_path)) {
+    sample_meta_clinical_complete <- readRDS(sample_meta_clinical_complete_path)
+    message("✓ Geladen: ", nrow(sample_meta_clinical_complete), " samples")
+  } else {
+    stop("❌ sample_meta_clinical_complete nicht gefunden. Bitte Steps 1-9 ausführen.")
+  }
+}
+
+# Check 2: GSVA scores vorhanden?
+if (!"clinical_inflammation_score" %in% names(sample_meta_clinical_complete)) {
+  stop("❌ GSVA-Scores fehlen in sample_meta_clinical_complete. Bitte Steps 6-7 ausführen.")
+}
+
+message("✓ Prerequisites OK: GSVA-Scores verfügbar")
+```
+
+```{r}
+#| label: step10-helper-result-extraction
+#| echo: false
+#| warning: false
+
+message("\n=== SCHRITT 10.1: Helper Functions for Result Extraction ===")
+
+# ============================================================
+# Central Helper: Extract standardized results from lm/lmer models
+# Purpose: Avoid code duplication, ensure consistent reporting
+# ============================================================
+
+extract_model_results <- function(model, term_of_interest = NULL, model_name = "Model") {
+  # Extract coefficients with CIs
+  coef_table <- broom.mixed::tidy(model, conf.int = TRUE)
+
+  # Filter for fixed effects (only for mixed models)
+  if ("effect" %in% names(coef_table)) {
+    coef_table <- coef_table %>%
+      filter(effect == "fixed")
+  }
+
+  # Select relevant columns (handle missing 'df' column in some models)
+  available_cols <- intersect(
+    c("term", "estimate", "std.error", "conf.low", "conf.high", "statistic", "df", "p.value"),
+    names(coef_table)
+  )
+  coef_table <- coef_table %>%
+    dplyr::select(all_of(available_cols))
+
+  # If specific term requested, filter
+  if (!is.null(term_of_interest)) {
+    coef_table <- coef_table %>%
+      filter(grepl(term_of_interest, term, fixed = FALSE))
+  }
+
+  # Add model diagnostics
+  n_obs <- nobs(model)
+
+  # VIF if multiple predictors
+  vif_vals <- tryCatch(car::vif(model), error = function(e) NULL)
+
+  # Return list with all relevant info
+  list(
+    coefficients = coef_table,
+    n = n_obs,
+    vif = vif_vals,
+    model_name = model_name
+  )
+}
+
+# ============================================================
+# LOPO Cross-Validation for Model Validation (Issue O.1/O.3)
+# Leave-One-Patient-Out CV: Robuste interne Validierung
+# Purpose: Echte Generalisierung auf neue Patienten testen
+# ============================================================
+
+run_loocv <- function(model_formula, data, model_type = "lmer", id_col = "pid") {
+  # Leave-One-Patient-Out Cross-Validation (LOPO)
+  # Pro Fold: Ein Patient (alle Zeitpunkte) als Testset
+  # Prediction: Fixed effects only (keine patient-spezifischen Random Effects)
+  # Returns: RMSE, R², n_valid, n_total, pred_df
+
+  # Extract response variable name from formula
+  response_var <- as.character(model_formula)[2]
+
+  # Check if id_col exists
+  if (!id_col %in% names(data)) {
+    stop(sprintf("id_col '%s' nicht in data gefunden", id_col))
+  }
+
+  # Unique patients
+  unique_patients <- unique(data[[id_col]])
+  n_patients <- length(unique_patients)
+
+  message(sprintf("  Starting LOPO CV: %d patients, %d observations",
+                  n_patients, nrow(data)))
+
+  # Initialize storage for predictions
+  all_predictions <- data.frame(
+    pid = character(),
+    row_id = integer(),
+    y_true = numeric(),
+    y_pred = numeric(),
+    fold_id = integer(),
+    stringsAsFactors = FALSE
+  )
+
+  n_folds_valid <- 0
+  n_folds_failed <- 0
+
+  # LOPO loop: iterate over patients
+  for (fold_idx in seq_along(unique_patients)) {
+    patient_id <- unique_patients[fold_idx]
+
+    # Training data: all patients except current one
+    train_data <- data[data[[id_col]] != patient_id, ]
+    test_data <- data[data[[id_col]] == patient_id, ]
+
+    # Skip if test set is empty
+    if (nrow(test_data) == 0) {
+      message(sprintf("  ⚠️  Fold %d (pid=%s): Testdaten leer, übersprungen",
+                      fold_idx, patient_id))
+      n_folds_failed <- n_folds_failed + 1
+      next
+    }
+
+    # Fit model on training data
+    fit_success <- FALSE
+    fit_model <- NULL
+
+    if (model_type == "lmer") {
+      suppressWarnings({
+        tryCatch({
+          fit_model <- lmerTest::lmer(
+            model_formula,
+            data = train_data,
+            REML = TRUE,
+            control = lme4::lmerControl(optimizer = "bobyqa", calc.derivs = FALSE)
+          )
+          fit_success <- TRUE
+        }, error = function(e) {
+          message(sprintf("  ⚠️  Fold %d (pid=%s): Modell-Fit fehlgeschlagen - %s",
+                          fold_idx, patient_id, conditionMessage(e)))
+        })
+      })
+    } else if (model_type == "lm") {
+      suppressWarnings({
+        tryCatch({
+          fit_model <- lm(model_formula, data = train_data)
+          fit_success <- TRUE
+        }, error = function(e) {
+          message(sprintf("  ⚠️  Fold %d (pid=%s): Modell-Fit fehlgeschlagen - %s",
+                          fold_idx, patient_id, conditionMessage(e)))
+        })
+      })
+    }
+
+    if (!fit_success || is.null(fit_model)) {
+      n_folds_failed <- n_folds_failed + 1
+      next
+    }
+
+    # Predict on test data (fixed effects only for lmer)
+    predictions <- NULL
+    suppressWarnings({
+      tryCatch({
+        if (model_type == "lmer") {
+          # Fixed effects only: re.form = NA
+          predictions <- predict(
+            fit_model,
+            newdata = test_data,
+            re.form = NA,  # Keine Random Effects
+            allow.new.levels = TRUE
+          )
+        } else if (model_type == "lm") {
+          predictions <- predict(fit_model, newdata = test_data)
+        }
+      }, error = function(e) {
+        message(sprintf("  ⚠️  Fold %d (pid=%s): Prediction fehlgeschlagen - %s",
+                        fold_idx, patient_id, conditionMessage(e)))
+      })
+    })
+
+    # Check if predictions succeeded
+    if (is.null(predictions) || any(is.na(predictions))) {
+      message(sprintf("  ⚠️  Fold %d (pid=%s): NA predictions, übersprungen",
+                      fold_idx, patient_id))
+      n_folds_failed <- n_folds_failed + 1
+      next
+    }
+
+    # Extract true values
+    actuals <- test_data[[response_var]]
+
+    # Store predictions
+    fold_predictions <- data.frame(
+      pid = as.character(patient_id),
+      row_id = which(data[[id_col]] == patient_id),
+      y_true = actuals,
+      y_pred = predictions,
+      fold_id = fold_idx,
+      stringsAsFactors = FALSE
+    )
+
+    all_predictions <- rbind(all_predictions, fold_predictions)
+    n_folds_valid <- n_folds_valid + 1
+  }
+
+  # Calculate metrics from all collected predictions
+  if (nrow(all_predictions) == 0) {
+    message("  ❌ LOPO CV fehlgeschlagen: Keine gültigen Vorhersagen")
+    return(list(
+      rmse = NA,
+      r_squared = NA,
+      n_valid = 0,
+      n_total = nrow(data),
+      n_folds_valid = 0,
+      n_folds_total = n_patients,
+      pred_df = all_predictions
+    ))
+  }
+
+  # RMSE
+  rmse <- sqrt(mean((all_predictions$y_true - all_predictions$y_pred)^2, na.rm = TRUE))
+
+  # R² out-of-sample
+  ss_res <- sum((all_predictions$y_true - all_predictions$y_pred)^2, na.rm = TRUE)
+  ss_tot <- sum((all_predictions$y_true - mean(all_predictions$y_true, na.rm = TRUE))^2, na.rm = TRUE)
+  r_squared <- 1 - (ss_res / ss_tot)
+
+  # Return results
+  list(
+    rmse = rmse,
+    r_squared = r_squared,
+    n_valid = nrow(all_predictions),
+    n_total = nrow(data),
+    n_folds_valid = n_folds_valid,
+    n_folds_total = n_patients,
+    pred_df = all_predictions
+  )
+}
+
+message("✓ Helper function extract_model_results() defined")
+message("✓ Helper function run_loocv() defined (LOPO: Leave-One-Patient-Out CV)")
+```
+
+```{r}
+#| label: step10-s1-baseline-inflammation-recovery
+#| echo: false
+#| warning: false
+
+message("\n=== SECONDARY S1: Baseline Inflammation → Recovery Distance ===")
+
+# ============================================================
+# Research Question S1 (SECONDARY):
+# Patienten mit erhöhter Baseline-Inflammation zeigen verzögerte/
+# unvollständige Recovery bei V2
+#
+# Literatur: Schmader et al. 2021 (BMC Cardiovasc Disord)
+# Hypothese: Baseline inflammation ist assoziiert mit recovery trajectory
+# ============================================================
+
+# Daten: Patient-level, brauchen Baseline (A) und V2
+clinical_data_s1 <- sample_meta_clinical_complete %>%
+  dplyr::filter(timepoint %in% c("A", "V2")) %>%
+  dplyr::filter(!is.na(clinical_inflammation_score)) %>%
+  dplyr::select(pid, timepoint, clinical_inflammation_score,
+                age, sex, log_euroscore_ii) %>%
+  pivot_wider(names_from = timepoint, values_from = clinical_inflammation_score,
+              names_prefix = "inflam_") %>%
+  dplyr::filter(!is.na(inflam_A), !is.na(inflam_V2)) %>%
+  mutate(
+    baseline_inflam = inflam_A,
+    recovery_distance = abs(inflam_V2 - inflam_A)
+  )
+
+message(sprintf("  n = %d patients with complete A + V2 data", nrow(clinical_data_s1)))
+
+# Stop-Regel: Mindestens 20 vollständige Fälle
+if (nrow(clinical_data_s1) < 20) {
+  message("⚠️ STOP: n < 20 → S1 wird nur deskriptiv berichtet")
+  clinical_s1_run <- FALSE
+} else {
+  clinical_s1_run <- TRUE
+}
+
+if (clinical_s1_run) {
+  # Modell: Recovery distance ~ Baseline inflammation + covariates
+  # Adjustierung: minimal (age, sex, Euroscore)
+  clinical_model_s1 <- lm(
+    recovery_distance ~ baseline_inflam + age + sex + log_euroscore_ii,
+    data = clinical_data_s1
+  )
+
+  # Extrahiere Results
+  clinical_results_s1 <- extract_model_results(
+    clinical_model_s1,
+    term_of_interest = "baseline_inflam",
+    model_name = "S1_Baseline_Inflammation_Recovery"
+  )
+
+  message("\n--- S1 MODEL SUMMARY ---")
+  message(sprintf("  n = %d", clinical_results_s1$n))
+  message("\n  Coefficients:")
+  print(clinical_results_s1$coefficients)
+
+  # VIF Check
+  if (!is.null(clinical_results_s1$vif)) {
+    max_vif <- max(clinical_results_s1$vif)
+    if (max_vif > clinical_params$vif_threshold) {
+      message(sprintf("⚠️ VIF WARNING: max VIF = %.2f (threshold = %.1f)",
+                      max_vif, clinical_params$vif_threshold))
+    } else {
+      message(sprintf("✓ VIF OK: max VIF = %.2f", max_vif))
+    }
+  }
+
+  # Effect size: Standardized coefficient
+  clinical_s1_effect <- clinical_data_s1 %>%
+    summarise(
+      cor_baseline_recovery = cor(baseline_inflam, recovery_distance, use = "complete.obs"),
+      sd_baseline = sd(baseline_inflam, na.rm = TRUE),
+      sd_recovery = sd(recovery_distance, na.rm = TRUE)
+    )
+
+  message(sprintf("\n  Effect: r = %.3f (Pearson correlation)",
+                  clinical_s1_effect$cor_baseline_recovery))
+
+  # Speichere
+  saveRDS(clinical_results_s1, file.path(clinical_cache_dir, "secondary_s1_results.rds"))
+  message("💾 S1 Results saved")
+
+} else {
+  clinical_results_s1 <- NULL
+  message("⚠️ S1 analysis skipped (insufficient n)")
+}
+```
+
+```{r}
+#| label: step10-s2-ribosome-gfr
+#| echo: false
+#| warning: false
+
+message("\n=== SECONDARY S2: Ribosome Signature × Nierenfunktion (GFR) ===")
+
+# ============================================================
+# Research Question S2 (SECONDARY):
+# Patienten mit eingeschränkter Nierenfunktion zeigen veränderte
+# ribosomale Dynamik (V1 → V2)
+#
+# Literatur: Urämie → Proteinsynthese-Störung
+# Hypothese: GFR ist assoziiert mit ribosome recovery trajectory
+# ============================================================
+
+# Prüfe ob GFR verfügbar (Variable: GFR_impaired aus Step 2)
+clinical_has_gfr <- "GFR_impaired" %in% names(sample_meta_clinical_complete)
+
+if (!clinical_has_gfr) {
+  message("⚠️ GFR nicht verfügbar → S2 übersprungen")
+  clinical_s2_run <- FALSE
+  clinical_results_s2 <- NULL
+} else {
+  # Daten: V1 + V2 (Recovery-Phase), mit GFR
+  # Nutze bereits existierende kategorische Variable GFR_impaired
+  clinical_data_s2 <- sample_meta_clinical_complete %>%
+    dplyr::filter(timepoint %in% c("V1", "V2")) %>%
+    dplyr::filter(!is.na(GFR_impaired), !is.na(clinical_ribosome_score)) %>%
+    droplevels()
+
+  message(sprintf("  n = %d samples from %d patients",
+                  nrow(clinical_data_s2), n_distinct(clinical_data_s2$pid)))
+
+  # Zellenbesetzung prüfen
+  clinical_s2_cells <- clinical_data_s2 %>%
+    dplyr::count(timepoint, GFR_impaired) %>%
+    dplyr::arrange(timepoint, GFR_impaired)
+
+  message("\n--- S2 CELL COUNTS ---")
+  print(clinical_s2_cells)
+
+  clinical_s2_min_cell <- min(clinical_s2_cells$n)
+
+  if (clinical_s2_min_cell < clinical_params$min_n_per_group) {
+    message(sprintf("⚠️ STOP: Kleinste Zelle n = %d < %d → nur Haupteffekte",
+                    clinical_s2_min_cell, clinical_params$min_n_per_group))
+    clinical_s2_interaction <- FALSE
+  } else {
+    clinical_s2_interaction <- TRUE
+  }
+
+  # Modell: Mixed-effects
+  if (clinical_s2_interaction) {
+    clinical_model_s2 <- lmerTest::lmer(
+      clinical_ribosome_score ~ timepoint * GFR_impaired + age + sex + (1 | pid),
+      data = clinical_data_s2,
+      REML = TRUE
+    )
+    message("  Model: Interaktion timepoint × GFR")
+  } else {
+    clinical_model_s2 <- lmerTest::lmer(
+      clinical_ribosome_score ~ timepoint + GFR_impaired + age + sex + (1 | pid),
+      data = clinical_data_s2,
+      REML = TRUE
+    )
+    message("  Model: Haupteffekte nur")
+  }
+
+  # Extrahiere Results
+  clinical_results_s2 <- extract_model_results(
+    clinical_model_s2,
+    term_of_interest = NULL,
+    model_name = "S2_Ribosome_GFR"
+  )
+
+  message("\n--- S2 MODEL SUMMARY ---")
+  print(clinical_results_s2$coefficients)
+
+  # VIF
+  if (!is.null(clinical_results_s2$vif)) {
+    message(sprintf("✓ VIF: max = %.2f", max(clinical_results_s2$vif)))
+  }
+
+  # Speichere
+  saveRDS(clinical_results_s2, file.path(clinical_cache_dir, "secondary_s2_results.rds"))
+  message("💾 S2 Results saved")
+
+  clinical_s2_run <- TRUE
+}
+```
+
+```{r}
+#| label: step10-s3-stress-tf-signatures
+#| echo: false
+#| warning: false
+
+message("\n=== SECONDARY S3: Stress-Response Signatures (Inflammation as Proxy) ===")
+
+# ============================================================
+# Research Question S3 (SECONDARY):
+# Stress-Response-Signaturen zeigen charakteristische zeitliche Muster
+#
+# Literatur: Kardiale Stress-Response involviert Inflammation (TNFA, NFκB)
+# Hypothese: Inflammation score (includes TNFA_SIGNALING_VIA_NFKB) shows
+#            differential dynamics by EF group (marker of myocardial stress)
+# ============================================================
+
+# Nutze clinical_inflammation_score als Proxy für Stress-Response
+# (Includes HALLMARK_TNFA_SIGNALING_VIA_NFKB, which reflects NFκB activity)
+
+clinical_has_tf_scores <- "clinical_inflammation_score" %in% names(sample_meta_clinical_complete)
+
+if (!clinical_has_tf_scores) {
+  message("⚠️ Inflammation score nicht verfügbar → S3 übersprungen")
+  clinical_s3_run <- FALSE
+  clinical_results_s3 <- NULL
+} else {
+  # Daten: Inflammation score als Stress-Response-Proxy
+  clinical_data_s3 <- sample_meta_clinical_complete %>%
+    dplyr::filter(!is.na(clinical_inflammation_score), !is.na(ef_group)) %>%
+    dplyr::rename(tf_stress_score = clinical_inflammation_score)
+
+  message(sprintf("  n = %d samples from %d patients",
+                  nrow(clinical_data_s3), n_distinct(clinical_data_s3$pid)))
+
+  # Modell: TF-Stress-Score über Zeit, moduliert durch EF-Gruppe?
+  # (EF = vorgeschädigtes Myokard → erhöhter Baseline-Stress)
+
+  # Zellenbesetzung
+  clinical_s3_cells <- clinical_data_s3 %>%
+    dplyr::count(timepoint, ef_group)
+
+  message("\n--- S3 CELL COUNTS ---")
+  print(clinical_s3_cells)
+
+  clinical_s3_min_cell <- min(clinical_s3_cells$n)
+
+  if (clinical_s3_min_cell < clinical_params$min_n_per_group) {
+    clinical_s3_interaction <- FALSE
+    message(sprintf("⚠️ Kleinste Zelle n = %d < %d → nur Haupteffekte",
+                    clinical_s3_min_cell, clinical_params$min_n_per_group))
+  } else {
+    clinical_s3_interaction <- TRUE
+  }
+
+  # Modell
+  if (clinical_s3_interaction) {
+    clinical_model_s3 <- lmerTest::lmer(
+      tf_stress_score ~ timepoint * ef_group + age + sex + (1 | pid),
+      data = clinical_data_s3,
+      REML = TRUE
+    )
+    message("  Model: Interaktion timepoint × EF_group")
+  } else {
+    clinical_model_s3 <- lmerTest::lmer(
+      tf_stress_score ~ timepoint + ef_group + age + sex + (1 | pid),
+      data = clinical_data_s3,
+      REML = TRUE
+    )
+    message("  Model: Haupteffekte nur")
+  }
+
+  # Results
+  clinical_results_s3 <- extract_model_results(
+    clinical_model_s3,
+    term_of_interest = NULL,
+    model_name = "S3_TF_Stress_Signatures"
+  )
+
+  message("\n--- S3 MODEL SUMMARY ---")
+  print(clinical_results_s3$coefficients)
+
+  # VIF
+  if (!is.null(clinical_results_s3$vif)) {
+    message(sprintf("✓ VIF: max = %.2f", max(clinical_results_s3$vif)))
+  }
+
+  # Speichere
+  saveRDS(clinical_results_s3, file.path(clinical_cache_dir, "secondary_s3_results.rds"))
+  message("💾 S3 Results saved")
+
+  clinical_s3_run <- TRUE
+}
+```
+
+```{r}
+#| label: step10-s4-af-inflammation
+#| echo: false
+#| warning: false
+
+message("\n=== SECONDARY S4: Vorhofflimmern (AF) × Inflammations-Trajektorie ===")
+
+# ============================================================
+# Research Question S4 (SECONDARY):
+# Patienten mit chronischem Vorhofflimmern zeigen veränderte
+# Inflammations-Dynamik über die 3 Zeitpunkte
+#
+# Literatur: AF = chronische low-grade Inflammation
+# Hypothese: AF ist assoziiert mit inflammation trajectory post-TAVI
+# ============================================================
+
+# Prüfe ob AF-Variable verfügbar
+clinical_has_af <- "atrial_fibrillation_flutter" %in% names(sample_meta_clinical_complete)
+
+if (!clinical_has_af) {
+  message("⚠️ AF-Variable nicht verfügbar → S4 übersprungen")
+  clinical_s4_run <- FALSE
+  clinical_results_s4 <- NULL
+} else {
+  # Daten: Alle 3 Zeitpunkte, mit AF-Status
+  clinical_data_s4 <- sample_meta_clinical_complete %>%
+    filter(!is.na(atrial_fibrillation_flutter), !is.na(clinical_inflammation_score)) %>%
+    mutate(
+      af = factor(ifelse(atrial_fibrillation_flutter == 1, "AF", "No AF"),
+                  levels = c("No AF", "AF"))
+    ) %>%
+    droplevels()
+
+  message(sprintf("  n = %d samples from %d patients",
+                  nrow(clinical_data_s4), n_distinct(clinical_data_s4$pid)))
+
+  # Zellenbesetzung
+  clinical_s4_cells <- clinical_data_s4 %>%
+    dplyr::count(timepoint, af)
+
+  message("\n--- S4 CELL COUNTS ---")
+  print(clinical_s4_cells)
+
+  clinical_s4_min_cell <- min(clinical_s4_cells$n)
+
+  if (clinical_s4_min_cell < clinical_params$min_n_per_group) {
+    clinical_s4_interaction <- FALSE
+    message(sprintf("⚠️ Kleinste Zelle n = %d < %d → nur Haupteffekte",
+                    clinical_s4_min_cell, clinical_params$min_n_per_group))
+  } else {
+    clinical_s4_interaction <- TRUE
+  }
+
+  # Modell
+  if (clinical_s4_interaction) {
+    clinical_model_s4 <- lmerTest::lmer(
+      clinical_inflammation_score ~ timepoint * af + age + sex + (1 | pid),
+      data = clinical_data_s4,
+      REML = TRUE
+    )
+    message("  Model: Interaktion timepoint × AF")
+  } else {
+    clinical_model_s4 <- lmerTest::lmer(
+      clinical_inflammation_score ~ timepoint + af + age + sex + (1 | pid),
+      data = clinical_data_s4,
+      REML = TRUE
+    )
+    message("  Model: Haupteffekte nur")
+  }
+
+  # Results
+  clinical_results_s4 <- extract_model_results(
+    clinical_model_s4,
+    term_of_interest = NULL,
+    model_name = "S4_AF_Inflammation"
+  )
+
+  message("\n--- S4 MODEL SUMMARY ---")
+  print(clinical_results_s4$coefficients)
+
+  # VIF
+  if (!is.null(clinical_results_s4$vif)) {
+    message(sprintf("✓ VIF: max = %.2f", max(clinical_results_s4$vif)))
+  }
+
+  # Speichere
+  saveRDS(clinical_results_s4, file.path(clinical_cache_dir, "secondary_s4_results.rds"))
+  message("💾 S4 Results saved")
+
+  clinical_s4_run <- TRUE
+}
+```
+
+```{r}
+#| label: step10-secondary-summary-multiple-testing
+#| echo: false
+#| warning: false
+
+message("\n=== SECONDARY ANALYSES: Summary & Multiple Testing Correction (BH-FDR) ===")
+
+# ============================================================
+# Konsolidiere alle Secondary Results
+# Appliziere Benjamini-Hochberg FDR über gesamtes Secondary-Set
+# Entscheidung: BH-FDR (weniger konservativ als Holm, angemessen für Secondary)
+# ============================================================
+
+# Extrahiere Key P-Values aus allen Secondary Analyses
+clinical_secondary_tests <- list()
+
+# S1: Baseline Inflammation → Recovery (linear model, key term: baseline_inflam)
+if (!is.null(clinical_results_s1)) {
+  s1_pval <- clinical_results_s1$coefficients %>%
+    filter(term == "baseline_inflam") %>%
+    pull(p.value)
+  if (length(s1_pval) > 0) {
+    clinical_secondary_tests$S1 <- list(
+      name = "S1_Baseline_Inflammation_Recovery",
+      description = "Baseline inflammation is associated with recovery distance (V2-A)",
+      p_value = s1_pval
+    )
+  }
+}
+
+# S2: Ribosome × GFR (mixed model, key term: interaction or main effect)
+if (!is.null(clinical_results_s2)) {
+  # Prüfe ob Interaktion vorhanden
+  s2_coefs <- clinical_results_s2$coefficients
+  if ("timepointV2:GFR_impairedimpaired" %in% s2_coefs$term) {
+    s2_pval <- s2_coefs %>%
+      filter(term == "timepointV2:GFR_impairedimpaired") %>%
+      pull(p.value)
+    s2_term <- "Interaction timepoint × GFR"
+  } else if ("GFR_impairedimpaired" %in% s2_coefs$term) {
+    s2_pval <- s2_coefs %>%
+      filter(term == "GFR_impairedimpaired") %>%
+      pull(p.value)
+    s2_term <- "Main effect GFR"
+  } else {
+    s2_pval <- NA
+    s2_term <- "N/A"
+  }
+
+  if (!is.na(s2_pval)) {
+    clinical_secondary_tests$S2 <- list(
+      name = "S2_Ribosome_GFR",
+      description = paste0("Ribosome recovery × GFR (", s2_term, ")"),
+      p_value = s2_pval
+    )
+  }
+}
+
+# S3: TF Stress Signatures (mixed model, test timepoint effect)
+if (!is.null(clinical_results_s3)) {
+  # Key test: Zeitverlauf (timepointV1 oder timepointV2)
+  s3_coefs <- clinical_results_s3$coefficients
+  s3_timepoint_terms <- s3_coefs %>%
+    filter(grepl("^timepoint", term))
+
+  if (nrow(s3_timepoint_terms) > 0) {
+    # Nimm kleinsten p-Wert der Zeitpunkt-Terms (konservativ: würde Bonferroni rechtfertigen)
+    s3_pval <- min(s3_timepoint_terms$p.value, na.rm = TRUE)
+    clinical_secondary_tests$S3 <- list(
+      name = "S3_TF_Stress_Signatures",
+      description = "TF stress score temporal dynamics",
+      p_value = s3_pval
+    )
+  }
+}
+
+# S4: AF × Inflammation (mixed model)
+if (!is.null(clinical_results_s4)) {
+  s4_coefs <- clinical_results_s4$coefficients
+  # Prüfe Interaktion, sonst Haupteffekt
+  if (any(grepl(":af", s4_coefs$term))) {
+    s4_interaction_terms <- s4_coefs %>%
+      filter(grepl(":af", term))
+    s4_pval <- min(s4_interaction_terms$p.value, na.rm = TRUE)
+    s4_term <- "Interaction timepoint × AF"
+  } else if ("afAF" %in% s4_coefs$term) {
+    s4_pval <- s4_coefs %>%
+      filter(term == "afAF") %>%
+      pull(p.value)
+    s4_term <- "Main effect AF"
+  } else {
+    s4_pval <- NA
+    s4_term <- "N/A"
+  }
+
+  if (!is.na(s4_pval)) {
+    clinical_secondary_tests$S4 <- list(
+      name = "S4_AF_Inflammation",
+      description = paste0("AF × Inflammation trajectory (", s4_term, ")"),
+      p_value = s4_pval
+    )
+  }
+}
+
+# Erstelle Summary-Tabelle
+if (length(clinical_secondary_tests) > 0) {
+  clinical_secondary_summary <- data.frame(
+    Analysis = sapply(clinical_secondary_tests, function(x) x$name),
+    Description = sapply(clinical_secondary_tests, function(x) x$description),
+    raw_p = sapply(clinical_secondary_tests, function(x) x$p_value),
+    stringsAsFactors = FALSE
+  )
+
+  # BH-FDR Korrektur
+  clinical_secondary_summary <- clinical_secondary_summary %>%
+    mutate(
+      fdr_bh = p.adjust(raw_p, method = "BH"),
+      sig_raw = case_when(
+        raw_p < 0.001 ~ "***",
+        raw_p < 0.01 ~ "**",
+        raw_p < 0.05 ~ "*",
+        TRUE ~ ""
+      ),
+      sig_fdr = case_when(
+        fdr_bh < 0.001 ~ "***",
+        fdr_bh < 0.01 ~ "**",
+        fdr_bh < 0.05 ~ "*",
+        TRUE ~ ""
+      )
+    )
+
+  message("\n=== SECONDARY ANALYSES: Summary (BH-FDR Corrected) ===")
+  safe_print(clinical_secondary_summary, row.names = FALSE)
+
+  # Speichere
+  write.csv(
+    clinical_secondary_summary,
+    file.path(clinical_output_dir, "secondary_analyses_summary.csv"),
+    row.names = FALSE
+  )
+
+  message("\n💾 Secondary Summary saved")
+
+  # Interpretation
+  n_sig_raw <- sum(clinical_secondary_summary$raw_p < 0.05, na.rm = TRUE)
+  n_sig_fdr <- sum(clinical_secondary_summary$fdr_bh < 0.05, na.rm = TRUE)
+
+  message(sprintf(
+    "\n✓ SIGNIFIKANTE BEFUNDE (Secondary): %d/%d (raw), %d/%d (FDR-corrected)",
+    n_sig_raw, nrow(clinical_secondary_summary),
+    n_sig_fdr, nrow(clinical_secondary_summary)
+  ))
+
+} else {
+  message("⚠️ Keine Secondary Analyses durchgeführt (Daten nicht verfügbar)")
+  clinical_secondary_summary <- NULL
+}
+
+message("\n✓ SECONDARY ANALYSES (Schritt 10) KOMPLETT")
+```
+
+---
+
+# SCHRITT 11: EXPLORATORY ANALYSES
+
+**Hypothesis-generating analyses - NO multiple testing correction, explicitly exploratory**
+
+```{r}
+#| label: step11-e1-valve-type-acute-inflammation
+#| echo: false
+#| warning: false
+
+message("\n=== EXPLORATORY E1: Valve Type × Acute Inflammation (V1-A) ===")
+
+# ============================================================
+# Research Question E1 (EXPLORATORY):
+# Unterscheiden sich SEV vs BEV in der akuten Inflammationsantwort?
+#
+# WICHTIG: Nicht randomisiert → Selection Bias (Anatomie, Risiko)
+# Klassifikation: EXPLORATORY (Confounding-Risiko hoch)
+# ============================================================
+
+# Prüfe ob Valve-Type verfügbar
+clinical_has_valve <- "valve_type_grouped" %in% names(sample_meta_clinical_complete)
+
+if (!clinical_has_valve) {
+  message("⚠️ Valve Type nicht verfügbar → E1 übersprungen")
+  clinical_e1_run <- FALSE
+  clinical_results_e1 <- NULL
+} else {
+  # Delta-Analyse: V1-A für Inflammation
+  # (Vermeidet longitudinales Modell, einfacher bei kleinen n)
+
+  clinical_data_e1_wide <- sample_meta_clinical_complete %>%
+    filter(!is.na(valve_type_grouped), !is.na(clinical_inflammation_score)) %>%
+    dplyr::select(pid, timepoint, valve_type_grouped, clinical_inflammation_score,
+                  age, sex, log_euroscore_ii) %>%
+    pivot_wider(names_from = timepoint, values_from = clinical_inflammation_score,
+                names_prefix = "inflam_") %>%
+    filter(!is.na(inflam_A), !is.na(inflam_V1)) %>%
+    mutate(
+      delta_V1_A = inflam_V1 - inflam_A
+    )
+
+  message(sprintf("  n = %d patients with complete data", nrow(clinical_data_e1_wide)))
+
+  # Zellenbesetzung
+  clinical_e1_n_by_valve <- table(clinical_data_e1_wide$valve_type_grouped)
+  message("\n--- E1 GROUP SIZES ---")
+  print(clinical_e1_n_by_valve)
+
+  # Stop-Regel: Kleinste Gruppe < min_n_subgroup (konsistent mit anderen Analysen)
+  if (min(clinical_e1_n_by_valve) < clinical_params$min_n_subgroup) {
+    message(sprintf("⚠️ STOP: Kleinste Gruppe n = %d < %d → nur deskriptiv",
+                    min(clinical_e1_n_by_valve), clinical_params$min_n_subgroup))
+    clinical_e1_run <- FALSE
+  } else {
+    # Modell: Delta ~ Valve Type + Confounder
+    # WICHTIG: Dokumentiere als explorativ, nicht adjustiert für alle Confounder
+    clinical_model_e1 <- lm(
+      delta_V1_A ~ valve_type_grouped + age + sex + log_euroscore_ii,
+      data = clinical_data_e1_wide
+    )
+
+    clinical_results_e1 <- extract_model_results(
+      clinical_model_e1,
+      term_of_interest = "valve_type",
+      model_name = "E1_Valve_Type_Acute_Inflammation"
+    )
+
+    message("\n--- E1 MODEL SUMMARY (EXPLORATORY) ---")
+    message("⚠️ CAUTION: Non-randomized comparison → potential confounding")
+    print(clinical_results_e1$coefficients)
+
+    # VIF
+    if (!is.null(clinical_results_e1$vif)) {
+      message(sprintf("  VIF: max = %.2f", max(clinical_results_e1$vif)))
+    }
+
+    # Deskriptiv
+    clinical_e1_descriptive <- clinical_data_e1_wide %>%
+      group_by(valve_type_grouped) %>%
+      summarise(
+        n = n(),
+        mean_delta = mean(delta_V1_A, na.rm = TRUE),
+        sd_delta = sd(delta_V1_A, na.rm = TRUE),
+        .groups = "drop"
+      )
+
+    message("\n  Descriptive Stats:")
+    print(clinical_e1_descriptive)
+
+    # Speichere
+    saveRDS(clinical_results_e1, file.path(clinical_cache_dir, "exploratory_e1_results.rds"))
+    message("💾 E1 Results saved (EXPLORATORY)")
+
+    clinical_e1_run <- TRUE
+  }
+
+  if (!clinical_e1_run) {
+    clinical_results_e1 <- NULL
+  }
+}
+```
+
+```{r}
+#| label: step11-e2-sex-recovery
+#| echo: false
+#| warning: false
+
+message("\n=== EXPLORATORY E2: Sex × Recovery Normalization (V2-V1) ===")
+
+# ============================================================
+# Research Question E2 (EXPLORATORY):
+# Geschlechtsunterschiede in der Inflammations-Recovery
+#
+# Literatur: Bekannte Sex-Unterschiede in Immunantworten
+# Klassifikation: EXPLORATORY (interessant, aber Stichprobe ggf. unbalanciert)
+# ============================================================
+
+# Delta-Analyse: V2-V1 für Inflammation (Recovery-Phase)
+clinical_data_e2_wide <- sample_meta_clinical_complete %>%
+  filter(!is.na(sex), !is.na(clinical_inflammation_score)) %>%
+  dplyr::select(pid, timepoint, sex, clinical_inflammation_score, age, log_euroscore_ii) %>%
+  pivot_wider(names_from = timepoint, values_from = clinical_inflammation_score,
+              names_prefix = "inflam_") %>%
+  filter(!is.na(inflam_V1), !is.na(inflam_V2)) %>%
+  mutate(
+    delta_V2_V1 = inflam_V2 - inflam_V1
+  )
+
+message(sprintf("  n = %d patients with complete V1+V2 data", nrow(clinical_data_e2_wide)))
+
+# Zellenbesetzung
+clinical_e2_n_by_sex <- table(clinical_data_e2_wide$sex)
+message("\n--- E2 GROUP SIZES ---")
+print(clinical_e2_n_by_sex)
+
+# Stop-Regel: Kleinste Gruppe < 10
+if (min(clinical_e2_n_by_sex) < 10) {
+  message(sprintf("⚠️ STOP: Kleinste Gruppe n = %d < 10 → nur deskriptiv",
+                  min(clinical_e2_n_by_sex)))
+  clinical_e2_run <- FALSE
+  clinical_results_e2 <- NULL
+} else {
+  # Modell: Delta ~ Sex + Age + Euroscore
+  clinical_model_e2 <- lm(
+    delta_V2_V1 ~ sex + age + log_euroscore_ii,
+    data = clinical_data_e2_wide
+  )
+
+  clinical_results_e2 <- extract_model_results(
+    clinical_model_e2,
+    term_of_interest = "sex",
+    model_name = "E2_Sex_Recovery"
+  )
+
+  message("\n--- E2 MODEL SUMMARY (EXPLORATORY) ---")
+  print(clinical_results_e2$coefficients)
+
+  # Deskriptiv
+  clinical_e2_descriptive <- clinical_data_e2_wide %>%
+    group_by(sex) %>%
+    summarise(
+      n = n(),
+      mean_delta = mean(delta_V2_V1, na.rm = TRUE),
+      sd_delta = sd(delta_V2_V1, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  message("\n  Descriptive Stats:")
+  print(clinical_e2_descriptive)
+
+  # Speichere
+  saveRDS(clinical_results_e2, file.path(clinical_cache_dir, "exploratory_e2_results.rds"))
+  message("💾 E2 Results saved (EXPLORATORY)")
+
+  clinical_e2_run <- TRUE
+}
+```
+
+```{r}
+#| label: step11-e3-ifn-signatures
+#| echo: false
+#| warning: false
+
+message("\n=== EXPLORATORY E3: Interferon Signatures × Clinical Status ===")
+
+# ============================================================
+# Research Question E3 (EXPLORATORY):
+# IFN-Response-Signaturen bei Baseline (A) und klinische Charakteristika
+#
+# Literatur: Schmader et al. 2021 (IFN-Composite-Score)
+# Klassifikation: EXPLORATORY (Cross-sectional, nur Baseline)
+# ============================================================
+
+# Prüfe ob IFN-Composite-Score verfügbar (aus Step 6 GSVA)
+clinical_has_ifn <- "clinical_interferon_score" %in% names(sample_meta_clinical_complete)
+
+if (!clinical_has_ifn) {
+  message("⚠️ IFN-Composite-Score nicht verfügbar → E3 übersprungen")
+  clinical_e3_run <- FALSE
+  clinical_results_e3 <- NULL
+} else {
+  # Nutze clinical_interferon_score (Composite aus IFN-α + IFN-γ Hallmarks)
+  clinical_data_e3 <- sample_meta_clinical_complete %>%
+    dplyr::filter(timepoint == "A") %>%  # Nur Baseline
+    dplyr::rename(ifn_composite = clinical_interferon_score) %>%
+    dplyr::filter(!is.na(ifn_composite), !is.na(atrial_fibrillation_flutter), !is.na(diabetes))
+
+  message(sprintf("  n = %d patients at Baseline (A)", nrow(clinical_data_e3)))
+
+  # Modell: IFN-Score ~ AF + Diabetes + Age + Sex
+  # (AF und Diabetes = chronische Inflammationszustände)
+  clinical_model_e3 <- lm(
+    ifn_composite ~ atrial_fibrillation_flutter + diabetes + age + sex,
+    data = clinical_data_e3
+  )
+
+  clinical_results_e3 <- extract_model_results(
+    clinical_model_e3,
+    term_of_interest = NULL,
+    model_name = "E3_IFN_Signatures_Baseline"
+  )
+
+  message("\n--- E3 MODEL SUMMARY (EXPLORATORY) ---")
+  message("⚠️ Cross-sectional Baseline only → limited temporal inference")
+  print(clinical_results_e3$coefficients)
+
+  # VIF
+  if (!is.null(clinical_results_e3$vif)) {
+    message(sprintf("  VIF: max = %.2f", max(clinical_results_e3$vif)))
+  }
+
+  # Speichere
+  saveRDS(clinical_results_e3, file.path(clinical_cache_dir, "exploratory_e3_results.rds"))
+  message("💾 E3 Results saved (EXPLORATORY)")
+
+  clinical_e3_run <- TRUE
+}
+```
+
+```{r}
+#| label: step11-exploratory-summary
+#| echo: false
+#| warning: false
+
+message("\n=== EXPLORATORY ANALYSES: Summary ===")
+
+# ============================================================
+# Konsolidiere alle Exploratory Results
+# KEINE Multiple Testing Correction (hypothesis-generating)
+# ============================================================
+
+clinical_exploratory_tests <- list()
+
+# E1: Valve Type
+if (!is.null(clinical_results_e1)) {
+  e1_coef <- clinical_results_e1$coefficients %>%
+    filter(grepl("valve_type", term))
+  if (nrow(e1_coef) > 0) {
+    clinical_exploratory_tests$E1 <- list(
+      name = "E1_Valve_Type",
+      description = "Valve Type × Acute Inflammation (non-randomized)",
+      p_value = min(e1_coef$p.value, na.rm = TRUE),
+      caution = "Selection bias possible"
+    )
+  }
+}
+
+# E2: Sex
+if (!is.null(clinical_results_e2)) {
+  e2_coef <- clinical_results_e2$coefficients %>%
+    filter(term == "sexmale")
+  if (nrow(e2_coef) > 0) {
+    clinical_exploratory_tests$E2 <- list(
+      name = "E2_Sex_Recovery",
+      description = "Sex differences in inflammation recovery (V2-V1)",
+      p_value = e2_coef$p.value,
+      caution = "Hormone status not captured"
+    )
+  }
+}
+
+# E3: IFN
+if (!is.null(clinical_results_e3)) {
+  e3_coefs <- clinical_results_e3$coefficients %>%
+    filter(term %in% c("atrial_fibrillation_flutter", "diabetes"))
+  if (nrow(e3_coefs) > 0) {
+    clinical_exploratory_tests$E3 <- list(
+      name = "E3_IFN_Baseline",
+      description = "IFN signatures × clinical status (Baseline only)",
+      p_value = min(e3_coefs$p.value, na.rm = TRUE),
+      caution = "Cross-sectional, no temporal dynamics"
+    )
+  }
+}
+
+# Summary-Tabelle
+if (length(clinical_exploratory_tests) > 0) {
+  clinical_exploratory_summary <- data.frame(
+    Analysis = sapply(clinical_exploratory_tests, function(x) x$name),
+    Description = sapply(clinical_exploratory_tests, function(x) x$description),
+    raw_p = sapply(clinical_exploratory_tests, function(x) x$p_value),
+    Caution = sapply(clinical_exploratory_tests, function(x) x$caution),
+    stringsAsFactors = FALSE
+  )
+
+  # Signifikanz-Symbole (NUR für Orientation, KEINE adjustierte p-Werte)
+  clinical_exploratory_summary <- clinical_exploratory_summary %>%
+    mutate(
+      sig_raw = case_when(
+        raw_p < 0.001 ~ "***",
+        raw_p < 0.01 ~ "**",
+        raw_p < 0.05 ~ "*",
+        TRUE ~ ""
+      )
+    )
+
+  message("\n=== EXPLORATORY ANALYSES: Summary (NO Multiple Testing Correction) ===")
+  message("⚠️ INTERPRETATION: Hypothesis-generating only, requires replication")
+  safe_print(clinical_exploratory_summary, row.names = FALSE)
+
+  # Speichere
+  write.csv(
+    clinical_exploratory_summary,
+    file.path(clinical_output_dir, "exploratory_analyses_summary.csv"),
+    row.names = FALSE
+  )
+
+  message("\n💾 Exploratory Summary saved")
+
+} else {
+  message("⚠️ Keine Exploratory Analyses durchgeführt (Daten nicht verfügbar)")
+  clinical_exploratory_summary <- NULL
+}
+
+message("\n✓ EXPLORATORY ANALYSES (Schritt 11) KOMPLETT")
+```
 
 ---
 
@@ -2241,6 +5174,10 @@ message("\n=== NEXT STEPS ===")
 message("1. Review Primary Results (Q1, Q2, LQ2)")
 message("2. Check Figures in: ", clinical_fig_dir)
 message("3. Approve for Secondary Analyses (Schritte 10-12)")
+
+message("\n⚠️  IMPORTANT NOTE ⚠️")
+message("Note: Observational study – associations do not imply causality.")
+message("All findings require external validation before clinical application.")
 
 message("\n✓ CLINICAL INTEGRATION abgeschlossen (Schritte 1-9)")
 ```
