@@ -2326,405 +2326,426 @@ Gene Set Variation Analysis (GSVA) berechnet Pathway-Enrichment-Scores pro Sampl
 #| fig-width: 14
 #| fig-height: 10
 
-# --- Setup ---
-# Input-Validierung
-if (!exists("vst_mat") || !is.matrix(vst_mat) || nrow(vst_mat) == 0) {
-  stop("vst_mat nicht gefunden oder leer. VST-Chunk muss vorher laufen.")
-}
-if (!exists("meta") || !is.data.frame(meta)) {
-  stop("meta nicht gefunden. Metadata muss geladen sein.")
-}
+  # --- Setup ---
+  # Input-Validierung
+  if (!exists("vst_mat") || !is.matrix(vst_mat) || nrow(vst_mat) == 0) {
+    stop("vst_mat nicht gefunden oder leer. VST-Chunk muss vorher laufen.")
+  }
+  if (!exists("meta") || !is.data.frame(meta)) {
+    stop("meta nicht gefunden. Metadata muss geladen sein.")
+  }
 
-gsva_cache <- file.path(
-  "../../res/cache",
-  paste0("gsva_hallmark_scores_", cache_key(msigdb_file, file.info(msigdb_file)$mtime, nrow(vst_mat), ncol(vst_mat)), ".rds")
-)
-msigdb_file <- "../../dat/h.all.v2023.2.Hs.symbols.gmt"
-msigdb_dir <- dirname(msigdb_file)
+  msigdb_file <- "../../dat/h.all.v2023.2.Hs.symbols.gmt"
+  msigdb_dir <- dirname(msigdb_file)
 
-# --- MSigDB Hallmark laden oder herunterladen ---
-if (!file.exists(msigdb_file)) {
-  message("MSigDB Hallmark file not found. Downloading...")
-  dir.create(msigdb_dir, recursive = TRUE, showWarnings = FALSE)
+  gsva_cache <- file.path(
+    "../../res/cache",
+    paste0("gsva_hallmark_scores_", cache_key(msigdb_file, file.info(msigdb_file)$mtime, nrow(vst_mat), ncol(vst_mat)), ".rds")
+  )
 
-  # Download von MSigDB (direkter Link zur GMT-Datei)
-  msigdb_url <- "https://data.broadinstitute.org/gsea-msigdb/msigdb/release/2023.2.Hs/h.all.v2023.2.Hs.symbols.gmt"
+  # --- MSigDB Hallmark laden oder herunterladen ---
+  if (!file.exists(msigdb_file)) {
+    message("MSigDB Hallmark file not found. Downloading...")
+    dir.create(msigdb_dir, recursive = TRUE, showWarnings = FALSE)
 
-  tryCatch({
-    download.file(msigdb_url, msigdb_file, mode = "wb", quiet = FALSE, timeout = 300)
-    message("Successfully downloaded MSigDB Hallmark gene sets (", date(), ") to: ", msigdb_file)
-  }, error = function(e) {
-    message("Automatic download failed. Please manually download from:")
-    message("https://www.gsea-msigdb.org/gsea/msigdb/human/collections.jsp")
-    message("Save as: ", msigdb_file)
-    stop("MSigDB file missing and download failed: ", e$message)
+    # Download von MSigDB (direkter Link zur GMT-Datei)
+    msigdb_url <- "https://data.broadinstitute.org/gsea-msigdb/msigdb/release/2023.2.Hs/h.all.v2023.2.Hs.symbols.gmt"
+
+    tryCatch({
+      download.file(msigdb_url, msigdb_file, mode = "wb", quiet = FALSE, timeout = 300)
+      message("Successfully downloaded MSigDB Hallmark gene sets (", date(), ") to: ", msigdb_file)
+    }, error = function(e) {
+      message("Automatic download failed. Please manually download from:")
+      message("https://www.gsea-msigdb.org/gsea/msigdb/human/collections.jsp")
+      message("Save as: ", msigdb_file)
+      stop("MSigDB file missing and download failed: ", e$message)
+    })
+  }
+
+  hallmark <- getGmt(msigdb_file)
+  message("Loaded ", length(hallmark), " Hallmark pathways from MSigDB")
+
+  log_dir <- "../../res/logs"
+  dir.create(log_dir, recursive = TRUE, showWarnings = FALSE)
+  writeLines(c(
+    paste("MSigDB file:", msigdb_file),
+    paste("MSigDB mtime:", file.info(msigdb_file)$mtime)
+  ), file.path(log_dir, "msigdb_version.txt"))
+
+  # --- Konvertiere vst_mat zu Gene-Symbolen ---
+  # vst_mat hat ENSEMBL IDs als rownames, GSVA benötigt Symbole
+  vst_symbols <- vst_mat
+  rownames(vst_symbols) <- sub("\\..*$", "", rownames(vst_symbols))  # Entferne Versionen
+
+  # Mappe zu Symbolen
+  ensembl_to_symbol <- suppressMessages(
+    AnnotationDbi::select(org.Hs.eg.db, keys = rownames(vst_symbols),
+                         columns = "SYMBOL", keytype = "ENSEMBL")
+  ) |>
+    dplyr::filter(!is.na(SYMBOL)) |>
+    # Bei 1:many ENSEMBL→SYMBOL: nimm erstes SYMBOL (alphabetisch = deterministisch)
+    dplyr::arrange(ENSEMBL, SYMBOL) |>
+    dplyr::distinct(ENSEMBL, .keep_all = TRUE)
+
+  # Filtere Matrix auf mappbare Gene
+  vst_symbols <- vst_symbols[ensembl_to_symbol$ENSEMBL, ]
+  rownames(vst_symbols) <- ensembl_to_symbol$SYMBOL
+
+  # Aggregiere SYMBOL-Duplikate (mehrere ENSEMBL IDs → ein SYMBOL)
+  # Methode: Mittelwert der VST-Werte über alle ENSEMBL IDs mit gleichem SYMBOL
+  symbol_duplicated <- duplicated(rownames(vst_symbols)) | duplicated(rownames(vst_symbols), fromLast = TRUE)
+  if (any(symbol_duplicated)) {
+    # Splitte in unique und duplicate
+    vst_unique <- vst_symbols[!symbol_duplicated, , drop = FALSE]
+    vst_dups <- vst_symbols[symbol_duplicated, , drop = FALSE]
+
+    # Aggregiere Duplikate: rowMeans pro SYMBOL
+    dup_symbols <- unique(rownames(vst_dups))
+    vst_dups_agg <- do.call(rbind, lapply(sort(dup_symbols), function(sym) {
+      rows <- vst_dups[rownames(vst_dups) == sym, , drop = FALSE]
+      colMeans(rows)
+    }))
+    rownames(vst_dups_agg) <- sort(dup_symbols)
+
+    # Kombiniere
+    vst_symbols <- rbind(vst_unique, vst_dups_agg)
+    message("Aggregated ", sum(symbol_duplicated), " duplicate SYMBOLs (", length(dup_symbols), " unique) via rowMeans")
+  } else {
+    message("No SYMBOL duplicates found")
+  }
+
+  message("Converted ", nrow(vst_symbols), " genes to symbols for GSVA")
+
+  # --- GSVA Berechnung (mit Caching, da rechenintensiv) ---
+  gsva_scores <- load_or_compute(gsva_cache, function() {
+    message("Running GSVA on ", nrow(vst_symbols), " genes × ", ncol(vst_symbols), " samples...")
+    message("This may take several minutes...")
+
+    # Neue GSVA API (v1.40+) verwendet Parameter-Objekte
+    gsva_version <- packageVersion("GSVA")
+    message("GSVA version: ", gsva_version)
+
+    # Adaptive Parallelisierung (max 4 cores, min 1)
+    n_workers <- max(1, min(4, parallel::detectCores() - 1))
+    message("Using ", n_workers, " cores for GSVA")
+
+    # GSVA kcdf Parameter (Hänzelmann et al., 2013)
+    # kcdf (kernel cumulative distribution function) bestimmt, wie GSVA
+    # Gen-Expressionsverteilungen für Enrichment-Scoring schätzt.
+    # Optionen:
+    #   "Gaussian":   Für kontinuierliche, normalverteilte Daten
+    #   "Poisson":    Für Count-Daten (raw counts)
+    # Unsere Wahl: "Gaussian"
+    #   Begründung: Input ist VST-transformierte Daten (varianzstabilisiert, ~normalverteilt)
+    #   VST transformiert Counts → kontinuierliche Skala mit homoskedastischer Varianz
+    #   Geeignet für Gaussian Kernel Density Estimation
+    # Referenz: Hänzelmann et al., 2013 (DOI:10.1186/1471-2105-14-7)
+
+    if (gsva_version >= "1.40") {
+      # Neue API mit GsvaParam
+      message("Using new GSVA API (>= 1.40)")
+      param <- gsvaParam(
+        exprData = as.matrix(vst_symbols),
+        geneSets = hallmark,
+        minSize = 10,
+        maxSize = 500,
+        kcdf = "Gaussian"  # Geeignet für VST-transformierte Daten
+      )
+      is_win <- .Platform$OS.type == "windows"
+      bp <- if (is_win) BiocParallel::SnowParam(workers = n_workers) else BiocParallel::MulticoreParam(workers = n_workers)
+      gsva(param, verbose = TRUE, BPPARAM = bp)
+    } else {
+      # Alte API (< 1.40)
+      message("Using legacy GSVA API (< 1.40)")
+      gsva(
+        expr = as.matrix(vst_symbols),
+        gset.idx.list = hallmark,
+        method = "gsva",
+        kcdf = "Gaussian",  # Geeignet für VST-transformierte Daten
+        min.sz = 10,
+        max.sz = 500,
+        parallel.sz = n_workers,
+        verbose = TRUE
+      )
+    }
   })
-}
 
-hallmark <- getGmt(msigdb_file)
-message("Loaded ", length(hallmark), " Hallmark pathways from MSigDB")
+  message("GSVA complete: ", nrow(gsva_scores), " pathways × ", ncol(gsva_scores), " samples")
 
-log_dir <- "../../res/logs"
-dir.create(log_dir, recursive = TRUE, showWarnings = FALSE)
-writeLines(c(
-  paste("MSigDB file:", msigdb_file),
-  paste("MSigDB mtime:", file.info(msigdb_file)$mtime)
-), file.path(log_dir, "msigdb_version.txt"))
+  # --- Heatmap: Alle Pathways ---
+  # Bereinige Pathway-Namen (entferne "HALLMARK_")
+  rownames_clean <- sub("^HALLMARK_", "", rownames(gsva_scores))
+  rownames_clean <- gsub("_", " ", rownames_clean)
 
-# --- Konvertiere vst_mat zu Gene-Symbolen ---
-# vst_mat hat ENSEMBL IDs als rownames, GSVA benötigt Symbole
-vst_symbols <- vst_mat
-rownames(vst_symbols) <- sub("\\..*$", "", rownames(vst_symbols))  # Entferne Versionen
+  gsva_mat <- gsva_scores
+  rownames(gsva_mat) <- rownames_clean
 
-# Mappe zu Symbolen
-ensembl_to_symbol <- suppressMessages(
-  AnnotationDbi::select(org.Hs.eg.db, keys = rownames(vst_symbols),
-                       columns = "SYMBOL", keytype = "ENSEMBL")
-) |>
-  dplyr::filter(!is.na(SYMBOL)) |>
-  # Bei 1:many ENSEMBL→SYMBOL: nimm erstes SYMBOL (alphabetisch = deterministisch)
-  dplyr::arrange(ENSEMBL, SYMBOL) |>
-  dplyr::distinct(ENSEMBL, .keep_all = TRUE)
-
-# Filtere Matrix auf mappbare Gene
-vst_symbols <- vst_symbols[ensembl_to_symbol$ENSEMBL, ]
-rownames(vst_symbols) <- ensembl_to_symbol$SYMBOL
-
-# Entferne Duplikate (falls ein Symbol mehreren ENSEMBL IDs zugeordnet ist)
-vst_symbols <- vst_symbols[!duplicated(rownames(vst_symbols)), ]
-
-message("Converted ", nrow(vst_symbols), " genes to symbols for GSVA")
-
-# --- GSVA Berechnung (mit Caching, da rechenintensiv) ---
-gsva_scores <- load_or_compute(gsva_cache, function() {
-  message("Running GSVA on ", nrow(vst_symbols), " genes × ", ncol(vst_symbols), " samples...")
-  message("This may take several minutes...")
-
-  # Neue GSVA API (v1.40+) verwendet Parameter-Objekte
-  gsva_version <- packageVersion("GSVA")
-  message("GSVA version: ", gsva_version)
-
-  # Adaptive Parallelisierung (max 4 cores, min 1)
-  n_workers <- max(1, min(4, parallel::detectCores() - 1))
-  message("Using ", n_workers, " cores for GSVA")
-
-  # GSVA kcdf Parameter (Hänzelmann et al., 2013)
-  # kcdf (kernel cumulative distribution function) bestimmt, wie GSVA
-  # Gen-Expressionsverteilungen für Enrichment-Scoring schätzt.
-  # Optionen:
-  #   "Gaussian":   Für kontinuierliche, normalverteilte Daten
-  #   "Poisson":    Für Count-Daten (raw counts)
-  # Unsere Wahl: "Gaussian"
-  #   Begründung: Input ist VST-transformierte Daten (varianzstabilisiert, ~normalverteilt)
-  #   VST transformiert Counts → kontinuierliche Skala mit homoskedastischer Varianz
-  #   Geeignet für Gaussian Kernel Density Estimation
-  # Referenz: Hänzelmann et al., 2013 (DOI:10.1186/1471-2105-14-7)
-
-  if (gsva_version >= "1.40") {
-    # Neue API mit GsvaParam
-    message("Using new GSVA API (>= 1.40)")
-    param <- gsvaParam(
-      exprData = as.matrix(vst_symbols),
-      geneSets = hallmark,
-      minSize = 10,
-      maxSize = 500,
-      kcdf = "Gaussian"  # Geeignet für VST-transformierte Daten
-    )
-    is_win <- .Platform$OS.type == "windows"
-    bp <- if (is_win) BiocParallel::SnowParam(workers = n_workers) else BiocParallel::MulticoreParam(workers = n_workers)
-    gsva(param, verbose = TRUE, BPPARAM = bp)
-  } else {
-    # Alte API (< 1.40)
-    message("Using legacy GSVA API (< 1.40)")
-    gsva(
-      expr = as.matrix(vst_symbols),
-      gset.idx.list = hallmark,
-      method = "gsva",
-      kcdf = "Gaussian",  # Geeignet für VST-transformierte Daten
-      min.sz = 10,
-      max.sz = 500,
-      parallel.sz = n_workers,
-      verbose = TRUE
-    )
-  }
-})
-
-message("GSVA complete: ", nrow(gsva_scores), " pathways × ", ncol(gsva_scores), " samples")
-
-# --- Heatmap: Alle Pathways ---
-# Bereinige Pathway-Namen (entferne "HALLMARK_")
-rownames_clean <- sub("^HALLMARK_", "", rownames(gsva_scores))
-rownames_clean <- gsub("_", " ", rownames_clean)
-
-gsva_mat <- gsva_scores
-rownames(gsva_mat) <- rownames_clean
-
-# Annotation für Samples
-anno_col <- data.frame(
-  Timepoint = meta$timepoint,
-  Patient = meta$pid,
-  row.names = colnames(gsva_mat)
-)
-
-# Sortiere Samples nach Patient und Timepoint
-sample_order <- order(meta$pid, factor(meta$timepoint, levels = c("A", "V1", "V2")))
-
-p_gsva_heatmap <- pheatmap(
-  gsva_mat[, sample_order],
-  scale = "row",
-  annotation_col = anno_col[sample_order, , drop = FALSE],
-  annotation_colors = list(
-    Timepoint = c(A = "#66c2a5", V1 = "#fc8d62", V2 = "#8da0cb"),
-    Patient = setNames(
-      viridis::viridis(length(unique(meta$pid)), option = "D"),
-      sort(unique(meta$pid))  # Sortiert für Determinismus
-    )
-  ),
-  cluster_cols = FALSE,
-  show_colnames = FALSE,
-  fontsize_row = 8,
-  fontsize = 9,
-  color = colorRampPalette(c("#2166ac", "#f7f7f7", "#b2182b"))(100),
-  border_color = NA,
-  main = "GSVA: Hallmark Pathways (Patient Trajectories A → V1 → V2)",
-  silent = TRUE
-)
-
-print(p_gsva_heatmap)
-
-# --- Trajektorien-Plots für Key-Pathways ---
-
-# Konvertiere zu Long-Format für ggplot
-gsva_long <- as.data.frame(t(gsva_scores)) |>
-  tibble::rownames_to_column("sample") |>
-  dplyr::left_join(
-    sample_meta |> dplyr::select(samplename, timepoint, pid),
-    by = c("sample" = "samplename")
-  ) |>
-  tidyr::pivot_longer(
-    cols = dplyr::starts_with("HALLMARK_"),
-    names_to = "pathway",
-    values_to = "gsva_score"
-  ) |>
-  dplyr::mutate(
-    pathway_clean = sub("^HALLMARK_", "", pathway),
-    pathway_clean = gsub("_", " ", pathway_clean),
-    timepoint = factor(timepoint, levels = c("A", "V1", "V2"))
+  # Annotation für Samples
+  anno_col <- data.frame(
+    Timepoint = meta$timepoint,
+    Patient = meta$pid,
+    row.names = colnames(gsva_mat)
   )
 
-# Identifiziere Pathways mit höchster Varianz über Zeit
-# Fix: Berechne Varianz ZWISCHEN Zeitpunkten (biologischer Effekt),
-#      nicht über alle Samples (inkl. within-patient noise)
-# Methode: Mittelwert pro Pathway & Zeitpunkt → var(Mittelwerte)
-pathway_time_variance <- gsva_long |>
-  dplyr::group_by(pathway, timepoint) |>
-  dplyr::summarise(mean_score = mean(gsva_score, na.rm = TRUE), .groups = "drop") |>
-  dplyr::group_by(pathway) |>
-  dplyr::summarise(time_variance = var(mean_score), .groups = "drop")
+  # Sortiere Samples nach Patient und Timepoint
+  sample_order <- order(meta$pid, factor(meta$timepoint, levels = c("A", "V1", "V2")))
 
-top_pathways <- pathway_time_variance |>
-  dplyr::slice_max(time_variance, n = 12) |>
-  dplyr::pull(pathway)
-
-
-# Plot Top-12 Pathways
-
-p_trajectories <- gsva_long |>
-  dplyr::filter(pathway %in% top_pathways) |>
-  ggplot(aes(x = timepoint, y = gsva_score, group = pid)) +
-  geom_line(aes(color = pid), alpha = 0.4, linewidth = 0.6) +
-  geom_point(aes(color = pid), size = 1.5, alpha = 0.6) +
-  stat_summary(aes(group = 1), fun = mean, geom = "line",
-               color = "black", linewidth = 1.5, linetype = "solid") +
-  stat_summary(aes(group = 1), fun = mean, geom = "point",
-               color = "black", size = 3, shape = 18) +
-  facet_wrap(~ pathway_clean, scales = "free_y", ncol = 4) +
-  labs(
-    x = "Timepoint",
-    y = "GSVA Enrichment Score",
-    title = "Pathway Trajectories: Individual Patients (colored) vs. Mean (black)",
-    subtitle = "Top 12 pathways by temporal variance"
-  ) +
-  theme_bw(base_size = 10) +
-  theme(
-    legend.position = "none",
-    strip.background = element_rect(fill = "grey90"),
-    strip.text = element_text(face = "bold", size = 9),
-    panel.grid.minor = element_blank()
+  p_gsva_heatmap <- pheatmap(
+    gsva_mat[, sample_order],
+    scale = "row",
+    annotation_col = anno_col[sample_order, , drop = FALSE],
+    annotation_colors = list(
+      Timepoint = c(A = "#66c2a5", V1 = "#fc8d62", V2 = "#8da0cb"),
+      Patient = setNames(
+        viridis::viridis(length(unique(meta$pid)), option = "D"),
+        sort(unique(meta$pid))  # Sortiert für Determinismus
+      )
+    ),
+    cluster_cols = FALSE,
+    show_colnames = FALSE,
+    fontsize_row = 8,
+    fontsize = 9,
+    color = colorRampPalette(c("#2166ac", "#f7f7f7", "#b2182b"))(100),
+    border_color = NA,
+    main = "GSVA: Hallmark Pathways (Patient Trajectories A → V1 → V2)",
+    silent = TRUE
   )
 
-print(p_trajectories)
+  print(p_gsva_heatmap)
 
-# --- Fokus-Plot: Inflammation & Immunity ---
-key_pathways <- c(
-  "HALLMARK_INFLAMMATORY_RESPONSE",
-  "HALLMARK_TNFA_SIGNALING_VIA_NFKB",
-  "HALLMARK_INTERFERON_GAMMA_RESPONSE",
-  "HALLMARK_IL6_JAK_STAT3_SIGNALING"
-)
+  # --- Trajektorien-Plots für Key-Pathways ---
 
-p_inflammation <- gsva_long |>
-  dplyr::filter(pathway %in% key_pathways) |>
-  ggplot(aes(x = timepoint, y = gsva_score, group = pid)) +
-  geom_line(alpha = 0.3, color = "grey60") +
-  geom_point(aes(color = timepoint), size = 2.5, alpha = 0.7) +
-  stat_summary(aes(group = 1), fun = mean, geom = "line",
-               color = "#d73027", linewidth = 2) +
-  stat_summary(aes(group = 1), fun = mean, geom = "point",
-               color = "#d73027", size = 4) +
-  stat_summary(aes(group = 1), fun.data = mean_se, geom = "errorbar",
-               color = "#d73027", width = 0.2, linewidth = 1) +
-  facet_wrap(~ pathway_clean, scales = "free_y", ncol = 2) +
-  scale_color_manual(values = c(A = "#66c2a5", V1 = "#fc8d62", V2 = "#8da0cb")) +
-  labs(
-    x = "Timepoint",
-    y = "GSVA Enrichment Score",
-    title = "Inflammatory Pathway Dynamics Post-TAVI",
-    subtitle = "Individual trajectories (grey) and mean ± SE (red)",
-    color = "Timepoint"
-  ) +
-  theme_bw(base_size = 11) +
-  theme(
-    legend.position = "bottom",
-    strip.background = element_rect(fill = "#fee0d2"),
-    strip.text = element_text(face = "bold"),
-    panel.grid.minor = element_blank()
-  )
-
-print(p_inflammation)
-
-# --- Export ---
-gsva_out_dir <- "../../res/figures/gsva"
-dir.create(gsva_out_dir, recursive = TRUE, showWarnings = FALSE)
-
-# Heatmap
-ggsave(
-  file.path(gsva_out_dir, "GSVA_hallmark_heatmap.pdf"),
-  plot = patchwork::wrap_elements(grid::grid.grabExpr(print(p_gsva_heatmap))),
-  width = 14, height = 10, device = cairo_pdf
-)
-
-ggsave(
-  file.path(gsva_out_dir, "GSVA_hallmark_heatmap.png"),
-  plot = patchwork::wrap_elements(grid::grid.grabExpr(print(p_gsva_heatmap))),
-  width = 14, height = 10, dpi = 300
-)
-
-# Trajektorien (Top 12)
-ggsave(
-  file.path(gsva_out_dir, "GSVA_trajectories_top12.pdf"),
-  plot = p_trajectories,
-  width = 14, height = 10, device = cairo_pdf
-)
-
-ggsave(
-  file.path(gsva_out_dir, "GSVA_trajectories_top12.png"),
-  plot = p_trajectories,
-  width = 14, height = 10, dpi = 300
-)
-
-# Inflammation Focus
-ggsave(
-  file.path(gsva_out_dir, "GSVA_inflammation_focus.pdf"),
-  plot = p_inflammation,
-  width = 12, height = 8, device = cairo_pdf
-)
-
-ggsave(
-  file.path(gsva_out_dir, "GSVA_inflammation_focus.png"),
-  plot = p_inflammation,
-  width = 12, height = 8, dpi = 300
-)
-
-# --- GSVA Statistik: Mixed Models für formale Zeitpunkt-Effekte ---
-# Ziel: Quantifiziere Zeitpunkt-Effekte auf Pathway-Ebene unter Berücksichtigung
-#       der paired-design Struktur (~ timepoint + (1|pid))
-# Grund: GSVA-Plots zeigen nur deskriptive Statistik (mean ± SE)
-#       → Mixed models liefern formale Signifikanz-Tests
-# Methode: Linear Mixed Model (lme4::lmer) mit Random Intercept pro Patient
-
-# --- GSVA Mixed Models (Long format) ---
-if (!requireNamespace("lme4", quietly = TRUE)) {
-  message("⚠ Package 'lme4' not available. Skipping GSVA statistics.")
-} else if (!requireNamespace("lmerTest", quietly = TRUE)) {
-  message("⚠ Package 'lmerTest' not available. Skipping GSVA statistics.")
-} else if (!requireNamespace("broom.mixed", quietly = TRUE)) {
-  message("⚠ Package 'broom.mixed' not available. Skipping GSVA statistics.")
-} else {
-  message("\n=== Running Mixed Models for GSVA Pathways (gsva_long already long) ===")
-
-  # Safety checks
-  required_cols <- c("pid", "timepoint", "pathway", "gsva_score")
-  missing <- setdiff(required_cols, names(gsva_long))
-  if (length(missing) > 0) stop("gsva_long fehlt Spalten: ", paste(missing, collapse = ", "))
-
-  gsva_long2 <- gsva_long %>%
+  # Konvertiere zu Long-Format für ggplot
+  gsva_long <- as.data.frame(t(gsva_scores)) |>
+    tibble::rownames_to_column("sample") |>
+    dplyr::left_join(
+      sample_meta |> dplyr::select(samplename, timepoint, pid),
+      by = c("sample" = "samplename")
+    ) |>
+    tidyr::pivot_longer(
+      cols = dplyr::starts_with("HALLMARK_"),
+      names_to = "pathway",
+      values_to = "gsva_score"
+    ) |>
     dplyr::mutate(
-      timepoint = factor(timepoint, levels = c("A", "V1", "V2")),
-      pid = as.factor(pid)
+      pathway_clean = sub("^HALLMARK_", "", pathway),
+      pathway_clean = gsub("_", " ", pathway_clean),
+      timepoint = factor(timepoint, levels = c("A", "V1", "V2"))
     )
 
-  # Fit per pathway
-  gsva_stats <- gsva_long2 %>%
-    dplyr::group_by(pathway) %>%
-    dplyr::group_modify(~{
-      df <- .x
-      # falls pathway_clean nicht vorhanden wäre:
-      pathway_clean <- if ("pathway_clean" %in% names(df)) df$pathway_clean[1] else gsub("_", " ", sub("^HALLMARK_", "", df$pathway[1]))
+  # Identifiziere Pathways mit höchster Varianz über Zeit
+  # Fix: Berechne Varianz ZWISCHEN Zeitpunkten (biologischer Effekt),
+  #      nicht über alle Samples (inkl. within-patient noise)
+  # Methode: Mittelwert pro Pathway & Zeitpunkt → var(Mittelwerte)
+  pathway_time_variance <- gsva_long |>
+    dplyr::group_by(pathway, timepoint) |>
+    dplyr::summarise(mean_score = mean(gsva_score, na.rm = TRUE), .groups = "drop") |>
+    dplyr::group_by(pathway) |>
+    dplyr::summarise(time_variance = var(mean_score), .groups = "drop")
 
-      tryCatch({
-        mod <- lmerTest::lmer(gsva_score ~ timepoint + (1|pid), data = df)
+  top_pathways <- pathway_time_variance |>
+    dplyr::slice_max(time_variance, n = 12) |>
+    dplyr::pull(pathway)
 
-        broom.mixed::tidy(mod, effects = "fixed") %>%
-          dplyr::filter(term != "(Intercept)") %>%
-          dplyr::mutate(pathway_clean = pathway_clean)
-      }, error = function(e) {
-        tibble::tibble(
-          term = NA_character_,
-          estimate = NA_real_,
-          std.error = NA_real_,
-          statistic = NA_real_,
-          p.value = NA_real_,
-          pathway_clean = pathway_clean
-        )
-      })
-    }) %>%
-    dplyr::ungroup() %>%
-    dplyr::mutate(
-      padj = p.adjust(p.value, method = "BH")
-    ) %>%
-    dplyr::select(pathway, pathway_clean, term, estimate, std.error, statistic, p.value, padj)
 
-  # Export
-  out_path <- file.path(gsva_out_dir, "GSVA_hallmark_mixedmodel_fixed_effects.csv")
-  write.csv(gsva_stats, out_path, row.names = FALSE)
-  message("✓ GSVA mixed model stats saved to: ", out_path)
+  # Plot Top-12 Pathways
 
-  # Show significant (BH)
-  sig_pathways <- gsva_stats %>%
-    dplyr::filter(!is.na(padj), padj < padj_cutoff) %>%
-    dplyr::arrange(padj)
+  p_trajectories <- gsva_long |>
+    dplyr::filter(pathway %in% top_pathways) |>
+    ggplot(aes(x = timepoint, y = gsva_score, group = pid)) +
+    geom_line(aes(color = pid), alpha = 0.4, linewidth = 0.6) +
+    geom_point(aes(color = pid), size = 1.5, alpha = 0.6) +
+    stat_summary(aes(group = 1), fun = mean, geom = "line",
+                 color = "black", linewidth = 1.5, linetype = "solid") +
+    stat_summary(aes(group = 1), fun = mean, geom = "point",
+                 color = "black", size = 3, shape = 18) +
+    facet_wrap(~ pathway_clean, scales = "free_y", ncol = 4) +
+    labs(
+      x = "Timepoint",
+      y = "GSVA Enrichment Score",
+      title = "Pathway Trajectories: Individual Patients (colored) vs. Mean (black)",
+      subtitle = "Top 12 pathways by temporal variance"
+    ) +
+    theme_bw(base_size = 10) +
+    theme(
+      legend.position = "none",
+      strip.background = element_rect(fill = "grey90"),
+      strip.text = element_text(face = "bold", size = 9),
+      panel.grid.minor = element_blank()
+    )
 
-  if (nrow(sig_pathways) > 0) {
-    cat("\n=== GSVA: Signifikante Zeitpunkt-Effekte (BH padj < ", padj_cutoff, ") ===\n")
-    cat(sprintf("Gefunden: %d signifikante Fixed-Effects\n\n", nrow(sig_pathways)))
-    print(sig_pathways %>%
-            dplyr::select(pathway_clean, term, estimate, padj) %>%
-            dplyr::slice_head(n = 50),
-          n = 50)
+  print(p_trajectories)
+
+  # --- Fokus-Plot: Inflammation & Immunity ---
+  key_pathways <- c(
+    "HALLMARK_INFLAMMATORY_RESPONSE",
+    "HALLMARK_TNFA_SIGNALING_VIA_NFKB",
+    "HALLMARK_INTERFERON_GAMMA_RESPONSE",
+    "HALLMARK_IL6_JAK_STAT3_SIGNALING"
+  )
+
+  p_inflammation <- gsva_long |>
+    dplyr::filter(pathway %in% key_pathways) |>
+    ggplot(aes(x = timepoint, y = gsva_score, group = pid)) +
+    geom_line(alpha = 0.3, color = "grey60") +
+    geom_point(aes(color = timepoint), size = 2.5, alpha = 0.7) +
+    stat_summary(aes(group = 1), fun = mean, geom = "line",
+                 color = "#d73027", linewidth = 2) +
+    stat_summary(aes(group = 1), fun = mean, geom = "point",
+                 color = "#d73027", size = 4) +
+    stat_summary(aes(group = 1), fun.data = mean_se, geom = "errorbar",
+                 color = "#d73027", width = 0.2, linewidth = 1) +
+    facet_wrap(~ pathway_clean, scales = "free_y", ncol = 2) +
+    scale_color_manual(values = c(A = "#66c2a5", V1 = "#fc8d62", V2 = "#8da0cb")) +
+    labs(
+      x = "Timepoint",
+      y = "GSVA Enrichment Score",
+      title = "Inflammatory Pathway Dynamics Post-TAVI",
+      subtitle = "Individual trajectories (grey) and mean ± SE (red)",
+      color = "Timepoint"
+    ) +
+    theme_bw(base_size = 11) +
+    theme(
+      legend.position = "bottom",
+      strip.background = element_rect(fill = "#fee0d2"),
+      strip.text = element_text(face = "bold"),
+      panel.grid.minor = element_blank()
+    )
+
+  print(p_inflammation)
+
+  # --- Export ---
+  gsva_out_dir <- "../../res/figures/gsva"
+  dir.create(gsva_out_dir, recursive = TRUE, showWarnings = FALSE)
+
+  # Heatmap
+  ggsave(
+    file.path(gsva_out_dir, "GSVA_hallmark_heatmap.pdf"),
+    plot = patchwork::wrap_elements(grid::grid.grabExpr(print(p_gsva_heatmap))),
+    width = 14, height = 10, device = cairo_pdf
+  )
+
+  ggsave(
+    file.path(gsva_out_dir, "GSVA_hallmark_heatmap.png"),
+    plot = patchwork::wrap_elements(grid::grid.grabExpr(print(p_gsva_heatmap))),
+    width = 14, height = 10, dpi = 300
+  )
+
+  # Trajektorien (Top 12)
+  ggsave(
+    file.path(gsva_out_dir, "GSVA_trajectories_top12.pdf"),
+    plot = p_trajectories,
+    width = 14, height = 10, device = cairo_pdf
+  )
+
+  ggsave(
+    file.path(gsva_out_dir, "GSVA_trajectories_top12.png"),
+    plot = p_trajectories,
+    width = 14, height = 10, dpi = 300
+  )
+
+  # Inflammation Focus
+  ggsave(
+    file.path(gsva_out_dir, "GSVA_inflammation_focus.pdf"),
+    plot = p_inflammation,
+    width = 12, height = 8, device = cairo_pdf
+  )
+
+  ggsave(
+    file.path(gsva_out_dir, "GSVA_inflammation_focus.png"),
+    plot = p_inflammation,
+    width = 12, height = 8, dpi = 300
+  )
+
+  # --- GSVA Statistik: Mixed Models für formale Zeitpunkt-Effekte ---
+  # Ziel: Quantifiziere Zeitpunkt-Effekte auf Pathway-Ebene unter Berücksichtigung
+  #       der paired-design Struktur (~ timepoint + (1|pid))
+  # Grund: GSVA-Plots zeigen nur deskriptive Statistik (mean ± SE)
+  #       → Mixed models liefern formale Signifikanz-Tests
+  # Methode: Linear Mixed Model (lme4::lmer) mit Random Intercept pro Patient
+
+  # --- GSVA Mixed Models (Long format) ---
+  if (!requireNamespace("lme4", quietly = TRUE)) {
+    message("⚠ Package 'lme4' not available. Skipping GSVA statistics.")
+  } else if (!requireNamespace("lmerTest", quietly = TRUE)) {
+    message("⚠ Package 'lmerTest' not available. Skipping GSVA statistics.")
+  } else if (!requireNamespace("broom.mixed", quietly = TRUE)) {
+    message("⚠ Package 'broom.mixed' not available. Skipping GSVA statistics.")
   } else {
-    cat("\n⚠ GSVA: Keine signifikanten Zeitpunkt-Effekte (BH padj < ", padj_cutoff, ")\n")
+    message("\n=== Running Mixed Models for GSVA Pathways (gsva_long already long) ===")
+
+    # Safety checks
+    required_cols <- c("pid", "timepoint", "pathway", "gsva_score")
+    missing <- setdiff(required_cols, names(gsva_long))
+    if (length(missing) > 0) stop("gsva_long fehlt Spalten: ", paste(missing, collapse = ", "))
+
+    gsva_long2 <- gsva_long %>%
+      dplyr::mutate(
+        timepoint = factor(timepoint, levels = c("A", "V1", "V2")),
+        pid = as.factor(pid)
+      )
+
+    # Fit per pathway
+    gsva_stats <- gsva_long2 %>%
+      dplyr::group_by(pathway) %>%
+      dplyr::group_modify(~{
+        df <- .x
+        # falls pathway_clean nicht vorhanden wäre:
+        pathway_clean <- if ("pathway_clean" %in% names(df)) df$pathway_clean[1] else gsub("_", " ", sub("^HALLMARK_", "", df$pathway[1]))        
+
+        tryCatch({
+          mod <- lmerTest::lmer(gsva_score ~ timepoint + (1|pid), data = df)
+
+          broom.mixed::tidy(mod, effects = "fixed") %>%
+            dplyr::filter(term != "(Intercept)") %>%
+            dplyr::mutate(pathway_clean = pathway_clean)
+        }, error = function(e) {
+          tibble::tibble(
+            term = NA_character_,
+            estimate = NA_real_,
+            std.error = NA_real_,
+            statistic = NA_real_,
+            p.value = NA_real_,
+            pathway_clean = pathway_clean
+          )
+        })
+      }) %>%
+      dplyr::ungroup() %>%
+      dplyr::mutate(
+        padj = p.adjust(p.value, method = "BH")
+      ) %>%
+      dplyr::select(pathway, pathway_clean, term, estimate, std.error, statistic, p.value, padj)
+
+    # Export
+    out_path <- file.path(gsva_out_dir, "GSVA_hallmark_mixedmodel_fixed_effects.csv")
+    write.csv(gsva_stats, out_path, row.names = FALSE)
+    message("✓ GSVA mixed model stats saved to: ", out_path)
+
+    # Show significant (BH)
+    sig_pathways <- gsva_stats %>%
+      dplyr::filter(!is.na(padj), padj < padj_cutoff) %>%
+      dplyr::arrange(padj)
+
+    if (nrow(sig_pathways) > 0) {
+      cat("\n=== GSVA: Signifikante Zeitpunkt-Effekte (BH padj < ", padj_cutoff, ") ===\n")
+      cat(sprintf("Gefunden: %d signifikante Fixed-Effects\n\n", nrow(sig_pathways)))
+      print(sig_pathways %>%
+              dplyr::select(pathway_clean, term, estimate, padj) %>%
+              dplyr::slice_head(n = 50),
+            n = 50)
+    } else {
+      cat("\n⚠ GSVA: Keine signifikanten Zeitpunkt-Effekte (BH padj < ", padj_cutoff, ")\n")
+    }
   }
-}
 
 
-# Export GSVA-Scores als CSV für externe Analysen
-write.csv(
-  as.data.frame(gsva_scores),
-  file.path(gsva_out_dir, "GSVA_hallmark_scores.csv")
-)
+  # Export GSVA-Scores als CSV für externe Analysen
+  write.csv(
+    as.data.frame(gsva_scores),
+    file.path(gsva_out_dir, "GSVA_hallmark_scores.csv")
+  )
 
-message("GSVA plots saved to: ", gsva_out_dir)
+  message("GSVA plots saved to: ", gsva_out_dir)
 
 ```
 
