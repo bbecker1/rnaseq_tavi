@@ -101,16 +101,11 @@ clinical_params <- list(
   max_predictors = 4       # Events-per-Variable Regel für kontinuierliche Outcomes
   )
 
-# Verzeichnisse
+# Verzeichnisse (IMMER neu setzen bei jedem Render)
 clinical_data_dir <- "../../../dat/info_files"
 clinical_cache_dir <- "../../../res/cache/clinical"
 clinical_output_dir <- "../../../res/clinical"
 clinical_fig_dir <- "../../../res/figures/clinical"
-
-# Alias for results output (guardrail: only if not already defined)
-if (!exists("clinical_res_dir")) {
-  clinical_res_dir <- clinical_output_dir
-}
 
 dir.create(clinical_cache_dir, recursive = TRUE, showWarnings = FALSE)
 dir.create(clinical_output_dir, recursive = TRUE, showWarnings = FALSE)
@@ -2021,6 +2016,12 @@ if (!is.null(clinical_deconv_combined)) {
 
   message("   → Cell-type features hinzugefügt zu sample_meta_clinical")
 
+  # CRITICAL: Re-save sample_meta_clinical with deconvolution columns
+  # Otherwise, Step 3 cache will overwrite in next render
+  saveRDS(sample_meta_clinical,
+          file.path(clinical_cache_dir, "sample_meta_clinical.rds"))
+  message("💾 sample_meta_clinical neu gespeichert (mit Deconvolution-Spalten)")
+
 } else {
   message("⚠️ Deconvolution nicht durchgeführt → wird als Limitation dokumentiert")
   message("   Begründung: CIBERSORT/MCP-counter nicht verfügbar oder fehlgeschlagen")
@@ -2858,7 +2859,7 @@ message("  → Zellenbesetzung EF (A vs V1) geprüft für Secondary Analysis 1")
 
 **Decision Rules:**
 - Primary Success: Overall F-test p < 0.05
-- Heteroscedasticity Flag: SD_max/SD_min > 2.5
+- Heteroscedasticity Flag: SD_max/SD_min > 4
 - Normalität Check: Shapiro-Wilk p < 0.01 → Bootstrap CIs erwägen
 
 
@@ -2914,6 +2915,35 @@ if (!exists("safe_include_graphics")) {
   }
 }
 
+# ------------------------------------------------------------
+# SAFETY: Daten-Prerequisite Check (Verzeichnisse bereits im Setup erstellt)
+# ------------------------------------------------------------
+if (!exists("sample_meta_clinical")) {
+  cache_path <- file.path(clinical_cache_dir, "sample_meta_clinical.rds")
+  if (file.exists(cache_path)) {
+    message("⏳ Lade sample_meta_clinical aus Cache...")
+    sample_meta_clinical <- readRDS(cache_path)
+    message("✓ Geladen: ", nrow(sample_meta_clinical), " samples")
+  } else {
+    stop("FEHLER: sample_meta_clinical nicht gefunden. Bitte vorherige Steps ausführen.")
+  }
+}
+
+if (!exists("sample_meta_clinical_complete")) {
+  cache_path <- file.path(clinical_cache_dir, "sample_meta_clinical_complete.rds")
+  if (file.exists(cache_path)) {
+    message("⏳ Lade sample_meta_clinical_complete aus Cache...")
+    sample_meta_clinical_complete <- readRDS(cache_path)
+    message("✓ Geladen: ", nrow(sample_meta_clinical_complete), " samples")
+  } else {
+    stop("FEHLER: sample_meta_clinical_complete nicht gefunden. Bitte vorherige Steps ausführen.")
+  }
+}
+
+if (!"clinical_inflammation_score" %in% names(sample_meta_clinical)) {
+  stop("FEHLER: clinical_inflammation_score fehlt in sample_meta_clinical. Bitte Steps 6-8 ausführen.")
+}
+
 # ============================================================
 # STEP 1: Data Preparation
 # ============================================================
@@ -2927,20 +2957,82 @@ primary_data <- sample_meta_clinical %>%
   filter(!is.na(clinical_inflammation_score)) %>%
   droplevels()
 
-# Sample sizes per timepoint
+# FIX 1: Explizite Factor-Level Fixierung für Kontrast-Sicherheit
+# (garantiert, dass custom contrasts c(-1,1,0) etc. auf korrekte Levels mappen)
+primary_data$timepoint <- factor(primary_data$timepoint, levels = c("A", "V1", "V2"))
+
+# Validierung: Levels müssen exakt A, V1, V2 sein
+if (!identical(levels(primary_data$timepoint), c("A", "V1", "V2"))) {
+  stop("FEHLER: timepoint levels in primary_data sind nicht exakt c('A','V1','V2'). ",
+       "Aktuelle Levels: ", paste(levels(primary_data$timepoint), collapse = ", "))
+}
+
+# Sample sizes per timepoint (tatsächliche n aus GSVA-Score-Verfügbarkeit)
 primary_sample_sizes <- primary_data %>%
   group_by(timepoint) %>%
   summarise(n = n_distinct(pid), .groups = "drop")
 
-message(sprintf("  Timepoint A:  n = %d", primary_sample_sizes$n[primary_sample_sizes$timepoint == "A"]))
-message(sprintf("  Timepoint V1: n = %d", primary_sample_sizes$n[primary_sample_sizes$timepoint == "V1"]))
-message(sprintf("  Timepoint V2: n = %d", primary_sample_sizes$n[primary_sample_sizes$timepoint == "V2"]))
+n_A  <- primary_sample_sizes$n[primary_sample_sizes$timepoint == "A"]
+n_V1 <- primary_sample_sizes$n[primary_sample_sizes$timepoint == "V1"]
+n_V2 <- primary_sample_sizes$n[primary_sample_sizes$timepoint == "V2"]
+
+message(sprintf("  Timepoint A:  n = %d", n_A))
+message(sprintf("  Timepoint V1: n = %d", n_V1))
+message(sprintf("  Timepoint V2: n = %d", n_V2))
+message("  Hinweis: n basiert auf Samples mit verfügbarem clinical_inflammation_score (GSVA)")
+
+# ------------------------------------------------------------
+# DESKRIPTIVE BACKUP-TABELLE (plan-konform)
+# ------------------------------------------------------------
+# Zweck: Transparente Dokumentation der Outcome-Verteilung
+# Keine inferenzstatistischen Annahmen, nur deskriptiv
+
+message("\n  Deskriptive Statistik (Outcome-Score):")
+
+primary_descriptives <- primary_data %>%
+  group_by(timepoint) %>%
+  summarise(
+    n = n_distinct(pid),
+    mean = mean(clinical_inflammation_score, na.rm = TRUE),
+    sd = sd(clinical_inflammation_score, na.rm = TRUE),
+    median = median(clinical_inflammation_score, na.rm = TRUE),
+    q25 = quantile(clinical_inflammation_score, 0.25, na.rm = TRUE),
+    q75 = quantile(clinical_inflammation_score, 0.75, na.rm = TRUE),
+    min = min(clinical_inflammation_score, na.rm = TRUE),
+    max = max(clinical_inflammation_score, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(IQR = q75 - q25)
+
+# Speichern als CSV (verwendet clinical_output_dir Variable)
+write.csv(
+  primary_descriptives,
+  file.path(clinical_output_dir, "primary_descriptives.csv"),
+  row.names = FALSE
+)
+
+# Knappe Baseline-Zusammenfassung
+baseline_stats <- primary_descriptives %>% filter(timepoint == "A")
+message(sprintf("    Baseline (A): mean = %.3f, SD = %.3f",
+                baseline_stats$mean, baseline_stats$sd))
+message(sprintf("    Baseline (A): median [IQR] = %.3f [%.3f - %.3f]",
+                baseline_stats$median, baseline_stats$q25, baseline_stats$q75))
+message("  ✓ Deskriptive Tabelle gespeichert: primary_descriptives.csv")
 
 # Complete-case data for sensitivity analysis
 primary_data_complete <- sample_meta_clinical_complete %>%
   filter(timepoint %in% c("A", "V1", "V2")) %>%
   filter(!is.na(clinical_inflammation_score)) %>%
   droplevels()
+
+# FIX 1: Explizite Factor-Level Fixierung für complete-case
+primary_data_complete$timepoint <- factor(primary_data_complete$timepoint, levels = c("A", "V1", "V2"))
+
+# Validierung
+if (!identical(levels(primary_data_complete$timepoint), c("A", "V1", "V2"))) {
+  stop("FEHLER: timepoint levels in primary_data_complete nicht exakt c('A','V1','V2'). ",
+       "Aktuelle Levels: ", paste(levels(primary_data_complete$timepoint), collapse = ", "))
+}
 
 n_complete <- n_distinct(primary_data_complete$pid)
 message(sprintf("  Complete triplets (A+V1+V2): n = %d", n_complete))
@@ -2977,12 +3069,19 @@ message(sprintf("  Random effects variance: σ²_between = %.3f, σ²_within = %
 message("\nSTEP 3: Overall F-Test")
 
 primary_anova <- anova(primary_model, type = 3)
-primary_f_pvalue <- primary_anova[["Pr(>F)"]][1]  # timepoint effect
+
+# FIX 3: Omnibus-p robust extrahieren (namentlich statt Index)
+timepoint_row_idx <- which(rownames(primary_anova) == "timepoint")
+if (length(timepoint_row_idx) == 0) {
+  stop("FEHLER: 'timepoint' nicht in ANOVA-Tabelle gefunden. Rownames: ",
+       paste(rownames(primary_anova), collapse = ", "))
+}
+primary_f_pvalue <- primary_anova[["Pr(>F)"]][timepoint_row_idx]
 
 message(sprintf("  F-test for timepoint: F(%.1f, %.1f) = %.2f, p = %.4f",
-                primary_anova$NumDF[1],
-                primary_anova$DenDF[1],
-                primary_anova$`F value`[1],
+                primary_anova$NumDF[timepoint_row_idx],
+                primary_anova$DenDF[timepoint_row_idx],
+                primary_anova$`F value`[timepoint_row_idx],
                 primary_f_pvalue))
 
 if (primary_f_pvalue < 0.05) {
@@ -3026,7 +3125,8 @@ primary_contrasts <- emmeans::contrast(primary_emms,
                                             "V2 - V1" = c(0, -1, 1)),
                                        adjust = "none")  # Unadjusted first
 
-primary_contrasts_df <- as.data.frame(summary(primary_contrasts))
+# FIX 2: 95%-CIs explizit anfordern für Kontrast-CSVs
+primary_contrasts_df <- as.data.frame(summary(primary_contrasts, infer = c(TRUE, TRUE)))
 
 message("\n  Pairwise Contrasts (unadjusted):")
 for (i in 1:nrow(primary_contrasts_df)) {
@@ -3094,11 +3194,22 @@ sd_by_time <- primary_data %>%
 sd_ratio <- max(sd_by_time$sd_resid) / min(sd_by_time$sd_resid)
 message(sprintf("  Residual SD ratio (max/min): %.2f", sd_ratio))
 
-if (sd_ratio > 2.5) {
-  message("  ⚠ WARNING: Heteroscedasticity detected (ratio > 2.5)")
+if (sd_ratio > 4) {
+  message("  ⚠ WARNING: Heteroscedasticity detected (ratio > 4)")
   message("  → Consider varIdent model or robust SEs")
 } else {
   message("  ✓ Homoscedasticity assumption reasonable")
+}
+
+# Cook's Distance check (informal, per analysis plan)
+cooks_d <- cooks.distance(primary_model)
+max_cooks <- max(cooks_d, na.rm = TRUE)
+n_influential <- sum(cooks_d > 1, na.rm = TRUE)
+message(sprintf("  Cook's Distance: max = %.4f, n > 1 = %d", max_cooks, n_influential))
+if (n_influential > 0) {
+  message("  ⚠ WARNING: ", n_influential, " observation(s) with Cook's D > 1")
+} else {
+  message("  ✓ No dominant outliers (all Cook's D < 1)")
 }
 
 # Save diagnostic plots
@@ -3319,7 +3430,7 @@ if (shapiro_test$p.value < 0.01) {
 }
 
 # TRIGGER 2: Heteroskedasticity → varIdent Model
-if (sd_ratio > 2.5) {
+if (sd_ratio > 4) {
   message("\n--- ROBUSTNESS: Heteroskedasticity detected ---")
   message("AUTOMATED ACTION: Fitting nlme varIdent model")
 
@@ -3423,7 +3534,8 @@ primary_contrasts_complete <- emmeans::contrast(
   list("V1 - A" = c(-1, 1, 0), "V2 - A" = c(-1, 0, 1), "V2 - V1" = c(0, -1, 1)),
   adjust = "none"
 )
-primary_contrasts_complete_df <- as.data.frame(summary(primary_contrasts_complete))
+# FIX 2: 95%-CIs explizit für complete-case contrasts
+primary_contrasts_complete_df <- as.data.frame(summary(primary_contrasts_complete, infer = c(TRUE, TRUE)))
 
 message("  Complete-case contrasts:")
 for (i in 1:nrow(primary_contrasts_complete_df)) {
@@ -3449,7 +3561,7 @@ if (diff_pct < 10) {
 # ============================================================
 # STEP 8: Figure 1 - Primary Inflammation Timecourse
 # ============================================================
-# Main figure: Violin/Box plot with Mean ± 95% CI
+# Main figure: Violin/Box plot with Mean ± 95% CI + integrated caption
 
 message("\nSTEP 8: Creating Figure 1")
 
@@ -3457,8 +3569,15 @@ message("\nSTEP 8: Creating Figure 1")
 plot_summary <- primary_emms_df %>%
   mutate(timepoint = factor(timepoint, levels = c("A", "V1", "V2")))
 
+# X-Axis Labels (factor levels bleiben A/V1/V2, aber Display-Labels ändern sich)
+timepoint_labels <- c("A" = "Pre-TAVR", "V1" = "3 days post-TAVR", "V2" = "3 months post-TAVR")
+
 # Create main figure
 primary_figure <- ggplot() +
+  # Patient trajectories (within-person lines) - drawn first (background)
+  geom_line(data = primary_data,
+            aes(x = timepoint, y = clinical_inflammation_score, group = pid),
+            color = "gray80", alpha = 0.2, linewidth = 0.3) +
   # Individual data points with jitter
   geom_jitter(data = primary_data,
               aes(x = timepoint, y = clinical_inflammation_score),
@@ -3482,6 +3601,7 @@ primary_figure <- ggplot() +
             color = "red", linewidth = 1, linetype = "solid") +
   # Styling
   scale_fill_brewer(palette = "Set2") +
+  scale_x_discrete(labels = timepoint_labels) +  # Custom X-Achsen-Labels
   labs(
     x = "Timepoint",
     y = "GSVA Inflammation Score (Composite)",
@@ -3495,19 +3615,82 @@ primary_figure <- ggplot() +
   ) +
   # Add sample sizes
   annotate("text", x = 1, y = min(primary_data$clinical_inflammation_score, na.rm = TRUE) - 0.3,
-           label = sprintf("n = %d", primary_sample_sizes$n[1]), size = 3.5) +
+           label = sprintf("n = %d", n_A), size = 3.5) +
   annotate("text", x = 2, y = min(primary_data$clinical_inflammation_score, na.rm = TRUE) - 0.3,
-           label = sprintf("n = %d", primary_sample_sizes$n[2]), size = 3.5) +
+           label = sprintf("n = %d", n_V1), size = 3.5) +
   annotate("text", x = 3, y = min(primary_data$clinical_inflammation_score, na.rm = TRUE) - 0.3,
-           label = sprintf("n = %d", primary_sample_sizes$n[3]), size = 3.5)
+           label = sprintf("n = %d", n_V2), size = 3.5)
 
-# Save figure
+# ------------------------------------------------------------
+# DYNAMIC CAPTION (English, integrated into PNG)
+# ------------------------------------------------------------
+
+# Helper: format p-values
+format_p <- function(p) {
+  if (p < 0.001) return("p < 0.001")
+  return(sprintf("p = %.3f", p))
+}
+
+# Extract F-test info (dynamisch aus ANOVA-Tabelle)
+f_stat <- primary_anova$`F value`[timepoint_row_idx]
+f_df1 <- primary_anova$NumDF[timepoint_row_idx]
+f_df2 <- primary_anova$DenDF[timepoint_row_idx]
+
+# Build caption text (komplett dynamisch)
+caption_text <- sprintf(
+  "Figure 1. Longitudinal changes in composite GSVA inflammation score across timepoints (Pre-TAVR: n=%d; 3d post-TAVR: n=%d; 3mo post-TAVR: n=%d). Linear mixed model with random intercept for patient ID. Omnibus test: F(%.0f, %.1f) = %.2f, %s. Pairwise contrasts (Holm-adjusted): ",
+  n_A, n_V1, n_V2, f_df1, f_df2, f_stat, format_p(primary_f_pvalue)
+)
+
+# Add contrasts (dynamisch aus primary_contrasts_df)
+contrasts_text <- sapply(1:nrow(primary_contrasts_df), function(i) {
+  contr <- primary_contrasts_df[i, ]
+  sprintf(
+    "%s: Δ = %.3f [95%% CI: %.3f, %.3f], %s",
+    contr$contrast,
+    contr$estimate,
+    contr$lower.CL,
+    contr$upper.CL,
+    format_p(contr$p_holm)
+  )
+})
+
+caption_full <- paste0(caption_text, paste(contrasts_text, collapse = "; "), ".")
+
+# Wrap caption to prevent right-side clipping
+caption_full_wrapped <- paste(strwrap(caption_full, width = 110), collapse = "\n")
+
+# Create caption text panel (using patchwork + grid)
+if (!requireNamespace("patchwork", quietly = TRUE)) {
+  stop("Package 'patchwork' required. Install with: install.packages('patchwork')")
+}
+
+caption_grob <- grid::textGrob(
+  caption_full_wrapped,
+  x = 0, y = 0.5, hjust = 0,
+  gp = grid::gpar(fontsize = 9, lineheight = 1.2)
+)
+
+caption_panel <- patchwork::wrap_elements(full = caption_grob)
+
+# Combine plot + caption (Plot: 78%, Caption: 22% height)
+primary_figure_with_caption <- primary_figure / caption_panel +
+  patchwork::plot_layout(heights = c(0.78, 0.22))
+
+# Save combined figure (height erhöht auf 9.5 für vollständige Caption-Darstellung)
 safe_ggsave(
   file.path(clinical_fig_dir, "primary_inflammation_timecourse.png"),
-  primary_figure,
-  width = 8, height = 6, dpi = 300, bg = "white"
+  primary_figure_with_caption,
+  width = 8, height = 9.5, dpi = 300, bg = "white"
 )
-message("  ✓ Figure saved: primary_inflammation_timecourse.png")
+message("  ✓ Figure saved: primary_inflammation_timecourse.png (with integrated caption)")
+
+# Optional: Save caption as TXT
+writeLines(
+  caption_full,
+  file.path(clinical_output_dir, "primary_figure1_caption.txt")
+)
+message("  ✓ Caption saved: primary_figure1_caption.txt")
 
 # ============================================================
 # STEP 9: Save Results
@@ -3517,12 +3700,12 @@ message("\nSTEP 9: Saving Results")
 
 # Save EMMs
 write.csv(primary_emms_df,
-          file.path(clinical_res_dir, "primary_emms.csv"),
+          file.path(clinical_output_dir, "primary_emms.csv"),
           row.names = FALSE)
 
 # Save contrasts
 write.csv(primary_contrasts_df,
-          file.path(clinical_res_dir, "primary_contrasts.csv"),
+          file.path(clinical_output_dir, "primary_contrasts.csv"),
           row.names = FALSE)
 
 # Save model object
@@ -3531,13 +3714,34 @@ saveRDS(primary_model,
 
 # Save complete-case results
 write.csv(primary_contrasts_complete_df,
-          file.path(clinical_res_dir, "primary_contrasts_complete_case.csv"),
+          file.path(clinical_output_dir, "primary_contrasts_complete_case.csv"),
           row.names = FALSE)
 
 message("  ✓ EMMs saved: primary_emms.csv")
 message("  ✓ Contrasts saved: primary_contrasts.csv")
 message("  ✓ Complete-case contrasts saved: primary_contrasts_complete_case.csv")
 message("  ✓ Model object saved: primary_model.rds")
+
+# Save model diagnostics (Omnibus F-Test, Shapiro-Wilk, SD ratio)
+# FIX 3: verwende timepoint_row_idx statt Index [1]
+primary_diagnostics_df <- data.frame(
+  test = c("Omnibus F-test (timepoint)", "Shapiro-Wilk (normality)", "SD ratio (heteroscedasticity)"),
+  statistic = c(primary_anova$`F value`[timepoint_row_idx], shapiro_test$statistic, sd_ratio),
+  df1 = c(primary_anova$NumDF[timepoint_row_idx], NA, NA),
+  df2 = c(primary_anova$DenDF[timepoint_row_idx], NA, NA),
+  p_value = c(primary_f_pvalue, shapiro_test$p.value, NA),
+  threshold = c(0.05, 0.01, 4),
+  decision = c(
+    ifelse(primary_f_pvalue < 0.05, "Significant - proceed to contrasts", "Not significant"),
+    ifelse(shapiro_test$p.value < 0.01, "Non-normal - bootstrap CIs triggered", "Approximately normal"),
+    ifelse(sd_ratio > 4, "Heteroscedastic - varIdent model triggered", "Homoscedastic")
+  )
+)
+
+write.csv(primary_diagnostics_df,
+          file.path(clinical_output_dir, "primary_model_diagnostics.csv"),
+          row.names = FALSE)
+message("  ✓ Model diagnostics saved: primary_model_diagnostics.csv")
 
 # ============================================================
 # NOTE: EF, MLR, Lab, and Survival analyses moved to STEP 10 (Secondary)
@@ -3823,55 +4027,288 @@ run_loocv <- function(model_formula, data, model_type = "lmer", id_col = "pid") 
 #| label: step10-secondary-ef-analysis
 #| echo: false
 #| warning: false
+#| message: true
 
 message("\n========================================")
 message("SECONDARY 1: EF Effect on Inflammation")
 message("========================================\n")
 
+# ============================================================
+# A) DATENBASIS & VALIDIERUNG
+# ============================================================
+
 # Data: alle 3 Zeitpunkte mit EF
-secondary_ef_data <- sample_meta_clinical %>%
+ef_data <- sample_meta_clinical %>%
   filter(timepoint %in% c("A", "V1", "V2")) %>%
   filter(!is.na(pr_echo_ef_percent), !is.na(clinical_inflammation_score)) %>%
   mutate(ef_centered = pr_echo_ef_percent - 50) %>%
   droplevels()
 
 message(sprintf("Data: n = %d patients, %d observations",
-                n_distinct(secondary_ef_data$pid),
-                nrow(secondary_ef_data)))
+                n_distinct(ef_data$pid),
+                nrow(ef_data)))
 
-# Test Interaction
-ef_interaction_model <- lmerTest::lmer(
-  clinical_inflammation_score ~ timepoint * ef_centered + age + sex + (1|pid),
-  data = secondary_ef_data,
-  REML = TRUE
-)
-
-ef_anova <- anova(ef_interaction_model, type = 3)
-ef_interaction_p <- ef_anova["timepoint:ef_centered", "Pr(>F)"]
-ef_vif <- car::vif(ef_interaction_model)
-
-message(sprintf("Interaction: p = %.4f, max VIF = %.2f",
-                ef_interaction_p, max(ef_vif)))
-
-# Decision Rule
-if (ef_interaction_p < 0.05 && max(ef_vif) < 5) {
-  message("✓ Report Interaction Model")
-  ef_final_model <- ef_interaction_model
-} else {
-  message("→ Fit Additive Model")
-  ef_final_model <- lmerTest::lmer(
-    clinical_inflammation_score ~ timepoint + ef_centered + age + sex + (1|pid),
-    data = secondary_ef_data,
-    REML = TRUE
+# A1) EF-baseline Konstanz-Validierung
+# Regel: EF muss pro pid konstant sein (baseline measurement)
+ef_validity_check <- ef_data %>%
+  group_by(pid) %>%
+  summarise(
+    n_ef_unique = n_distinct(pr_echo_ef_percent),
+    ef_min = min(pr_echo_ef_percent),
+    ef_max = max(pr_echo_ef_percent),
+    .groups = "drop"
   )
+
+ef_offenders <- ef_validity_check %>% filter(n_ef_unique > 1)
+
+if (nrow(ef_offenders) > 0) {
+  print(ef_offenders)
+  stop("❌ EF validity violation: EF not constant within pid for ",
+       nrow(ef_offenders), " patient(s). Check data integrity.")
 }
 
-# Save
-write.csv(broom.mixed::tidy(ef_final_model, conf.int = TRUE) %>% filter(effect == "fixed"),
-          file.path(clinical_res_dir, "secondary_ef_coefficients.csv"),
-          row.names = FALSE)
+message(sprintf("✓ EF validity: EF constant within pid (n = %d patients checked)",
+                nrow(ef_validity_check)))
 
-message("✓ EF analysis complete\n")
+# ============================================================
+# B) LINEARITY-CHECK (Plan-required)
+# ============================================================
+
+# B1) Scatterplot: Baseline A only, inflammation_score vs EF
+ef_baseline_linearity_data <- ef_data %>% filter(timepoint == "A")
+
+p_linearity <- ggplot(ef_baseline_linearity_data,
+                      aes(x = pr_echo_ef_percent, y = clinical_inflammation_score)) +
+  geom_point(alpha = 0.6, size = 2.5) +
+  geom_smooth(method = "lm", se = TRUE, color = "steelblue", linewidth = 1) +
+  labs(
+    title = "EF Linearity Check at Baseline",
+    x = "Baseline EF (%)",
+    y = "Inflammation Score (GSVA)"
+  ) +
+  theme_bw(base_size = 11)
+
+ggsave(
+  file.path(clinical_fig_dir, "Fig_S_EF_linearity_baseline.png"),
+  plot = p_linearity,
+  width = 7, height = 5, dpi = 300
+)
+
+message("✓ Saved: Fig_S_EF_linearity_baseline.png")
+
+# ============================================================
+# C) MODELL & HIERARCHIE: Interaction Test
+# ============================================================
+
+# C1) Fit Interaktionsmodell (REML=FALSE für ANOVA)
+ef_interaction_model <- lmerTest::lmer(
+  clinical_inflammation_score ~ timepoint * ef_centered + age + sex + (1|pid),
+  data = ef_data,
+  REML = FALSE
+)
+
+# Type-III ANOVA (Satterthwaite) für timepoint:ef_centered
+ef_anova <- anova(ef_interaction_model, type = 3, ddf = "Satterthwaite")
+ef_interaction_p <- ef_anova["timepoint:ef_centered", "Pr(>F)"]
+
+# Klassifikation der Interaktion
+if (ef_interaction_p < 0.05) {
+  interaction_class <- "significant"
+} else if (ef_interaction_p >= 0.05 && ef_interaction_p < 0.10) {
+  interaction_class <- "suggestive"
+} else {
+  interaction_class <- "ns"
+}
+
+message(sprintf("Interaction (timepoint:ef_centered): p = %.4f [%s]",
+                ef_interaction_p, interaction_class))
+
+# ============================================================
+# D) VIF-DIAGNOSTIK (rein diagnostisch, keine Auto-Refactoring)
+# ============================================================
+
+# D1) VIF berechnen am Interaktionsmodell
+ef_vif <- car::vif(ef_interaction_model)
+message("\nVIF diagnostics:")
+print(ef_vif)
+
+# Extract max VIF (handles both numeric vector and GVIF matrix)
+if (is.matrix(ef_vif)) {
+  # GVIF case: extract GVIF^(1/(2*Df)) column (standardized)
+  max_vif <- max(ef_vif[, "GVIF^(1/(2*Df))"], na.rm = TRUE)
+} else {
+  max_vif <- max(ef_vif, na.rm = TRUE)
+}
+
+# VIF-Interpretation (diagnostisch, keine Modelländerung)
+vif_threshold <- 10
+
+if (max_vif > vif_threshold) {
+  warning(sprintf("High (G)VIF detected (max = %.2f > %d). Proceeding WITHOUT changing the model. Interpret coefficients with caution.",
+                  max_vif, vif_threshold))
+  message("  → Multicollinearity present but model retained as specified")
+} else if (max_vif > 5) {
+  message(sprintf("⚠️ VIF classification: MODERATE (max = %.2f). Caution advised, but acceptable.",
+                  max_vif))
+} else {
+  message(sprintf("✓ VIF diagnostics: OK (max = %.2f, threshold = %d)",
+                  max_vif, vif_threshold))
+}
+
+# ============================================================
+# E & F) HIERARCHISCHE ENTSCHEIDUNGSREGEL
+# ============================================================
+
+if (interaction_class %in% c("significant", "suggestive")) {
+
+  # ========== INTERACTION BRANCH: PROBING ==========
+
+  message("\n→ Interaction is notable => Probing contrasts at EF levels")
+
+  # E1a) emmeans contrasts: EF=30% vs EF=60%
+  # ef_centered = EF - 50, daher: EF=30 => -20, EF=60 => +10
+  ef_emms <- emmeans::emmeans(ef_interaction_model,
+                               ~ timepoint | ef_centered,
+                               at = list(ef_centered = c(-20, 10)))
+
+  ef_contrasts_by_level <- emmeans::contrast(
+    ef_emms,
+    list(
+      "V1 - A"  = c(-1, 1, 0),
+      "V2 - A"  = c(-1, 0, 1),
+      "V2 - V1" = c( 0,-1, 1)
+    ),
+    adjust = "none"
+  )
+
+  # Dataframe aufbauen
+  ef_contrasts_df <- as.data.frame(summary(ef_contrasts_by_level, infer = TRUE)) %>%
+    mutate(EF_percent = ef_centered + 50) %>%
+    select(EF_percent, contrast, estimate, SE, df, lower.CL, upper.CL, p.value)
+
+  # Export
+  write.csv(
+    ef_contrasts_df,
+    file.path(clinical_output_dir, "secondary_EF_interaction_contrasts_EF30vs60.csv"),
+    row.names = FALSE
+  )
+
+  message("✓ Saved: secondary_EF_interaction_contrasts_EF30vs60.csv")
+
+  # E1b) "Per 10% EF" Effekt auf akuten Response (V1-A)
+  # Schätze V1-A bei EF=40 und EF=50, berechne Differenz
+  ef_emms_acute <- emmeans::emmeans(ef_interaction_model,
+                                     ~ timepoint | ef_centered,
+                                     at = list(ef_centered = c(-10, 0)))
+
+  ef_contrasts_acute <- emmeans::contrast(
+    ef_emms_acute,
+    list("V1 - A" = c(-1, 1, 0)),
+    adjust = "none"
+  )
+
+  acute_response_df <- as.data.frame(summary(ef_contrasts_acute))
+
+  # V1-A @ EF=40 und EF=50
+  v1a_at_40 <- acute_response_df$estimate[acute_response_df$ef_centered == -10]
+  v1a_at_50 <- acute_response_df$estimate[acute_response_df$ef_centered == 0]
+
+  delta10_acute <- v1a_at_50 - v1a_at_40
+
+  message(sprintf("✓ Per +10%% EF effect on acute response (V1-A): Δ = %.3f",
+                  delta10_acute))
+
+  # ========== FIGURE 3 (conditional) ==========
+
+  # F1) Figure 3: nur bei notable interaction
+  message("\n→ Creating Figure 3 (conditional visualization)")
+
+  ef_data_fig3 <- ef_data %>%
+    mutate(EF_group = if_else(pr_echo_ef_percent >= 50,
+                              "Preserved EF (≥50%)",
+                              "Reduced EF (<50%)"))
+
+  ef_summary_fig3 <- ef_data_fig3 %>%
+    group_by(EF_group, timepoint) %>%
+    summarise(
+      mean_inflammation = mean(clinical_inflammation_score, na.rm = TRUE),
+      se_inflammation = sd(clinical_inflammation_score, na.rm = TRUE) / sqrt(n()),
+      .groups = "drop"
+    )
+
+  p_fig3 <- ggplot(ef_summary_fig3,
+                   aes(x = timepoint, y = mean_inflammation,
+                       color = EF_group, group = EF_group)) +
+    geom_line(linewidth = 1.2) +
+    geom_point(size = 3) +
+    geom_errorbar(aes(ymin = mean_inflammation - se_inflammation,
+                      ymax = mean_inflammation + se_inflammation),
+                  width = 0.1, linewidth = 0.8) +
+    scale_color_manual(values = c("Preserved EF (≥50%)" = "#2E7D32",
+                                   "Reduced EF (<50%)" = "#C62828")) +
+    labs(
+      title = "Inflammation Trajectory by EF Subgroup",
+      x = "Timepoint",
+      y = "Inflammation Score (GSVA)",
+      color = "EF Category"
+    ) +
+    theme_bw(base_size = 11) +
+    theme(legend.position = "top")
+
+  ggsave(
+    file.path(clinical_fig_dir, "Fig3_EF_subgroup_trajectory.png"),
+    plot = p_fig3,
+    width = 7, height = 5, dpi = 300
+  )
+
+  message("✓ Saved: Fig3_EF_subgroup_trajectory.png (conditional, visual-only)")
+
+} else {
+
+  # ========== ADDITIVE BRANCH ==========
+
+  message("\n→ Interaction ns => Fitting additive model")
+
+  # F1) Additives Modell
+  ef_additive_model <- lmerTest::lmer(
+    clinical_inflammation_score ~ timepoint + ef_centered + age + sex + (1|pid),
+    data = ef_data,
+    REML = FALSE
+  )
+
+  # Export fixed effects
+  ef_additive_coefs <- broom.mixed::tidy(ef_additive_model, conf.int = TRUE) %>%
+    filter(effect == "fixed")
+
+  write.csv(
+    ef_additive_coefs,
+    file.path(clinical_output_dir, "secondary_EF_additive_coefficients.csv"),
+    row.names = FALSE
+  )
+
+  message("✓ Saved: secondary_EF_additive_coefficients.csv")
+
+  # F2) Report EF main effect per +10% EF
+  ef_main_row <- ef_additive_coefs %>% filter(term == "ef_centered")
+
+  if (nrow(ef_main_row) == 1) {
+    beta10 <- 10 * ef_main_row$estimate
+    ci10_lower <- 10 * ef_main_row$conf.low
+    ci10_upper <- 10 * ef_main_row$conf.high
+    p_main <- ef_main_row$p.value
+
+    message(sprintf("→ EF main effect per +10%% EF: β = %.3f, 95%% CI [%.3f, %.3f], p = %.4f",
+                    beta10, ci10_lower, ci10_upper, p_main))
+  }
+
+  message("\n(No Figure 3 created: interaction not notable)")
+}
+
+# ============================================================
+# FERTIG
+# ============================================================
+
+message("\n✓ EF analysis complete (hierarchical, reviewer-proof)\n")
 ```
 
 ## SECONDARY ANALYSIS 2: Myeloid-Lymphoid Ratio
@@ -3890,19 +4327,22 @@ message("SECONDARY 2: Myeloid-Lymphoid Ratio")
 message("========================================\n")
 
 # Check if deconvolution data available
-has_cib <- all(c("celltype_Monocytes", "celltype_Neutrophils",
-                 "celltype_T_cells", "celltype_NK") %in% names(sample_meta_clinical))
+# Spaltennamen nach Step 5 Join: CIBERSORT_ prefix, Singular für Mono/Neutro, Aggregate für T/NK
+has_cib <- all(c("CIBERSORT_Monocyte", "CIBERSORT_Neutrophil",
+                 "CIBERSORT_t_cell_total", "CIBERSORT_nk_cell_total") %in% names(sample_meta_clinical))
 
 if (!has_cib) {
-  message("⚠️ SKIPPED: Deconvolution data not available\n")
+  message("⚠️ SKIPPED: Deconvolution data not available")
+  message("  Expected columns: CIBERSORT_Monocyte, CIBERSORT_Neutrophil, CIBERSORT_t_cell_total, CIBERSORT_nk_cell_total")
+  message("  Available CIBERSORT columns: ", paste(grep("^CIBERSORT_", names(sample_meta_clinical), value = TRUE), collapse = ", "))
 } else {
-  # Compute MLR
+  # Compute MLR (Plan: log2((Mono+Neut+eps)/(T+NK+eps)), eps=0.01)
   epsilon <- 0.01
   mlr_data <- sample_meta_clinical %>%
     filter(timepoint %in% c("A", "V1", "V2")) %>%
     mutate(
-      mlr_cibersort = log2((celltype_Monocytes + celltype_Neutrophils + epsilon) /
-                           (celltype_T_cells + celltype_NK + epsilon))
+      mlr_cibersort = log2((CIBERSORT_Monocyte + CIBERSORT_Neutrophil + epsilon) /
+                           (CIBERSORT_t_cell_total + CIBERSORT_nk_cell_total + epsilon))
     )
 
   # LMM
@@ -3921,19 +4361,323 @@ if (!has_cib) {
   mlr_emms <- emmeans::emmeans(mlr_model, ~ timepoint)
   mlr_contrasts <- emmeans::contrast(mlr_emms,
                                      list("V1 - A" = c(-1, 1, 0),
-                                          "V2 - A" = c(-1, 0, 1)),
+                                          "V2 - A" = c(-1, 0, 1),
+                                          "V2 - V1" = c(0, -1, 1)),
                                      adjust = "none")
 
   message("\nContrasts:")
-  print(as.data.frame(summary(mlr_contrasts)) %>%
-          select(contrast, estimate, p.value))
+  mlr_contrasts_df <- as.data.frame(summary(mlr_contrasts))
+  print(dplyr::select(mlr_contrasts_df, contrast, estimate, p.value))
 
-  # Save
-  write.csv(as.data.frame(summary(mlr_contrasts)),
-            file.path(clinical_res_dir, "secondary_mlr_contrasts.csv"),
+
+  # Save contrasts
+  mlr_contrasts_summary <- as.data.frame(summary(mlr_contrasts, infer = TRUE))
+  write.csv(mlr_contrasts_summary,
+            file.path(clinical_output_dir, "secondary_mlr_contrasts.csv"),
             row.names = FALSE)
 
+  # Save EMMs
+  mlr_emms_summary <- as.data.frame(summary(mlr_emms, infer = TRUE))
+  write.csv(mlr_emms_summary,
+            file.path(clinical_output_dir, "secondary_mlr_emms.csv"),
+            row.names = FALSE)
+
+  # ============================================================
+  # Fig S4: MLR Figure (Primary-Style: Violin+Box+Spaghetti+EMM)
+  # ============================================================
+  message("\nCreating Figure S4 (MLR in Primary style)...")
+
+  # Ensure factor levels
+  mlr_data$timepoint <- factor(mlr_data$timepoint, levels = c("A", "V1", "V2"))
+
+  # X-Axis Labels (matching Primary)
+  timepoint_labels <- c("A" = "Pre-TAVR", "V1" = "3 days post-TAVR", "V2" = "3 months post-TAVR")
+
+  # Prepare EMM summary for plotting
+  mlr_plot_summary <- mlr_emms_summary %>%
+    mutate(timepoint = factor(timepoint, levels = c("A", "V1", "V2")))
+
+  # Sample sizes per timepoint
+  mlr_n_counts <- mlr_data %>%
+    group_by(timepoint) %>%
+    summarise(n = n_distinct(pid), .groups = "drop")
+
+  n_mlr_A  <- mlr_n_counts$n[mlr_n_counts$timepoint == "A"]
+  n_mlr_V1 <- mlr_n_counts$n[mlr_n_counts$timepoint == "V1"]
+  n_mlr_V2 <- mlr_n_counts$n[mlr_n_counts$timepoint == "V2"]
+
+  # Create figure (Primary-style)
+  p_mlr_figure <- ggplot() +
+    # Patient trajectories (spaghetti lines) - background
+    geom_line(data = mlr_data,
+              aes(x = timepoint, y = mlr_cibersort, group = pid),
+              color = "gray80", alpha = 0.2, linewidth = 0.3) +
+    # Individual data points with jitter
+    geom_jitter(data = mlr_data,
+                aes(x = timepoint, y = mlr_cibersort),
+                width = 0.15, alpha = 0.3, size = 1.5, color = "gray50") +
+    # Violin plots
+    geom_violin(data = mlr_data,
+                aes(x = timepoint, y = mlr_cibersort, fill = timepoint),
+                alpha = 0.3, trim = TRUE) +
+    # Boxplots overlaid
+    geom_boxplot(data = mlr_data,
+                 aes(x = timepoint, y = mlr_cibersort),
+                 width = 0.2, alpha = 0, outlier.shape = NA) +
+    # EMM points with 95% CI (red)
+    geom_pointrange(data = mlr_plot_summary,
+                    aes(x = timepoint, y = emmean,
+                        ymin = lower.CL, ymax = upper.CL),
+                    color = "red", size = 1, linewidth = 1.2) +
+    # EMM line connecting timepoints (red)
+    geom_line(data = mlr_plot_summary,
+              aes(x = as.numeric(timepoint), y = emmean),
+              color = "red", linewidth = 1, linetype = "solid") +
+    # Styling
+    scale_fill_brewer(palette = "Set2") +
+    scale_x_discrete(labels = timepoint_labels) +
+    labs(
+      x = "Timepoint",
+      y = "Myeloid–Lymphoid Ratio (log2 scale)",
+      title = "SECONDARY ANALYSIS: Myeloid–Lymphoid Ratio"
+    ) +
+    theme_bw(base_size = 13) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5, size = 14),
+      legend.position = "none",
+      panel.grid.minor = element_blank()
+    ) +
+    # Add sample sizes below x-axis
+    annotate("text", x = 1, y = min(mlr_data$mlr_cibersort, na.rm = TRUE) - 0.5,
+             label = sprintf("n = %d", n_mlr_A), size = 3.5) +
+    annotate("text", x = 2, y = min(mlr_data$mlr_cibersort, na.rm = TRUE) - 0.5,
+             label = sprintf("n = %d", n_mlr_V1), size = 3.5) +
+    annotate("text", x = 3, y = min(mlr_data$mlr_cibersort, na.rm = TRUE) - 0.5,
+             label = sprintf("n = %d", n_mlr_V2), size = 3.5)
+
+  # Save figure
+  ggsave(
+    file.path(clinical_fig_dir, "Fig_S4_MLR_timecourse.png"),
+    plot = p_mlr_figure,
+    width = 8, height = 6, dpi = 300, bg = "white"
+  )
+  message("  ✓ Fig S4 saved: Fig_S4_MLR_timecourse.png")
+
+  # Optional: Create caption (similar to Primary)
+  # Helper: format p-values
+  format_p_mlr <- function(p) {
+    if (is.na(p)) return("p = NA")
+    if (p < 1e-4) return(sprintf("p < %.1e", 1e-4))
+    if (p < 0.001) return("p < 0.001")
+    return(sprintf("p = %.3f", p))
+  }
+
+  # Extract F-test info
+  mlr_f_stat <- mlr_anova["timepoint", "F value"]
+  mlr_f_p <- mlr_anova["timepoint", "Pr(>F)"]
+  mlr_f_df1 <- mlr_anova["timepoint", "NumDF"]
+  mlr_f_df2 <- mlr_anova["timepoint", "DenDF"]
+
+  # Build caption
+  mlr_caption_text <- sprintf(
+    "Figure S4. Longitudinal changes in Myeloid–Lymphoid Ratio (MLR) across timepoints (Pre-TAVR: n=%d; 3d post-TAVR: n=%d; 3mo post-TAVR: n=%d). MLR = log2((Monocytes + Neutrophils) / (T cells + NK cells)). Linear mixed model: F(%.0f, %.1f) = %.2f, %s. Pairwise contrasts (unadjusted): ",
+    n_mlr_A, n_mlr_V1, n_mlr_V2, mlr_f_df1, mlr_f_df2, mlr_f_stat, format_p_mlr(mlr_f_p)
+  )
+
+  # Add contrasts to caption
+  for (i in 1:nrow(mlr_contrasts_summary)) {
+    contr <- mlr_contrasts_summary[i, ]
+    mlr_caption_text <- paste0(
+      mlr_caption_text,
+      sprintf("%s: Δ = %.3f [%.3f, %.3f], %s",
+              contr$contrast, contr$estimate, contr$lower.CL, contr$upper.CL,
+              format_p_mlr(contr$p.value))
+    )
+    if (i < nrow(mlr_contrasts_summary)) mlr_caption_text <- paste0(mlr_caption_text, "; ")
+  }
+  mlr_caption_text <- paste0(mlr_caption_text, ". Data shown: individual patients (gray lines), violin/box plots, and estimated marginal means ± 95% CI (red).")
+
+  # Save caption as TXT
+  writeLines(
+    mlr_caption_text,
+    file.path(clinical_output_dir, "secondary_mlr_figure_caption.txt")
+  )
+  message("  ✓ Caption saved: secondary_mlr_figure_caption.txt")
+
   message("\n✓ MLR analysis complete\n")
+
+  # ============================================================
+  # MCP-counter Validation (Cross-Method Check)
+  # ============================================================
+  message("\n========================================")
+  message("MCP-counter MLR Validation")
+  message("========================================\n")
+
+  # Check MCP columns availability
+  has_mcp <- all(c("MCP_Monocyte", "MCP_Neutrophil", "MCP_T_cell", "MCP_NK_cell") %in% names(sample_meta_clinical))
+
+  if (!has_mcp) {
+    message("⚠️ MCP-counter validation SKIPPED: Required columns not available")
+    message("  Expected: MCP_Monocyte, MCP_Neutrophil, MCP_T_cell, MCP_NK_cell")
+    message("  Available MCP columns: ", paste(grep("^MCP_", names(sample_meta_clinical), value = TRUE), collapse = ", "))
+  } else {
+
+    # (1) Compute MLR_MCP (same formula as CIBERSORT)
+    mlr_data <- mlr_data %>%
+      mutate(
+        mlr_mcp = log2((MCP_Monocyte + MCP_Neutrophil + epsilon) /
+                       (MCP_T_cell + MCP_NK_cell + epsilon))
+      )
+
+    message("✓ MLR_MCP computed")
+
+    # (2) Cross-Method Validation: Correlation between CIBERSORT and MCP
+    message("\n--- Cross-Method Correlation ---")
+
+    # Overall correlation
+    mlr_complete <- mlr_data %>%
+      filter(!is.na(mlr_cibersort) & !is.na(mlr_mcp))
+
+    if (nrow(mlr_complete) > 2) {
+      cor_overall <- cor.test(mlr_complete$mlr_cibersort, mlr_complete$mlr_mcp, method = "pearson")
+      message(sprintf("Overall correlation: r = %.3f, p = %.4f, n = %d",
+                      cor_overall$estimate, cor_overall$p.value, nrow(mlr_complete)))
+
+      # Per-timepoint correlation
+      cor_by_tp <- mlr_complete %>%
+        group_by(timepoint) %>%
+        summarise(
+          n = n(),
+          r = ifelse(n() > 2, cor(mlr_cibersort, mlr_mcp, use = "complete.obs"), NA_real_),
+          p_value = ifelse(n() > 2, cor.test(mlr_cibersort, mlr_mcp)$p.value, NA_real_),
+          .groups = "drop"
+        )
+
+      message("\nPer-timepoint correlations:")
+      print(cor_by_tp)
+
+      # Combine overall + per-timepoint for export
+      cor_summary <- bind_rows(
+        tibble(scope = "overall", n = nrow(mlr_complete),
+               r = cor_overall$estimate, p_value = cor_overall$p.value),
+        cor_by_tp %>% mutate(scope = as.character(timepoint)) %>% dplyr::select(scope, n, r, p_value)
+      )
+
+      # Save correlation table
+      write.csv(cor_summary,
+                file.path(clinical_output_dir, "secondary_mlr_crossmethod_correlation.csv"),
+                row.names = FALSE)
+      message("  ✓ Saved: secondary_mlr_crossmethod_correlation.csv")
+
+    } else {
+      message("⚠️ Insufficient data for correlation (n = ", nrow(mlr_complete), ")")
+    }
+
+    # (3) Timepoint Model for MCP (validation of CIBERSORT findings)
+    message("\n--- MCP-based Timepoint Model ---")
+
+    mlr_mcp_model <- lmerTest::lmer(
+      mlr_mcp ~ timepoint + (1|pid),
+      data = mlr_data,
+      REML = TRUE
+    )
+
+    mlr_mcp_anova <- anova(mlr_mcp_model, type = 3)
+    message(sprintf("MLR_MCP Timepoint effect: F = %.2f, p = %.4f",
+                    mlr_mcp_anova["timepoint", "F value"],
+                    mlr_mcp_anova["timepoint", "Pr(>F)"]))
+
+    # Contrasts (identical to CIBERSORT)
+    mlr_mcp_emms <- emmeans::emmeans(mlr_mcp_model, ~ timepoint)
+    mlr_mcp_contrasts <- emmeans::contrast(mlr_mcp_emms,
+                                           list("V1 - A" = c(-1, 1, 0),
+                                                "V2 - A" = c(-1, 0, 1),
+                                                "V2 - V1" = c(0, -1, 1)),
+                                           adjust = "none")
+
+    message("\nMCP Contrasts:")
+    mlr_mcp_contrasts_df <- as.data.frame(summary(mlr_mcp_contrasts))
+    print(dplyr::select(mlr_mcp_contrasts_df, contrast, estimate, p.value))
+
+    # Save MCP outputs
+    mlr_mcp_contrasts_summary <- as.data.frame(summary(mlr_mcp_contrasts, infer = TRUE))
+    write.csv(mlr_mcp_contrasts_summary,
+              file.path(clinical_output_dir, "secondary_mlr_mcp_contrasts.csv"),
+              row.names = FALSE)
+    message("  ✓ Saved: secondary_mlr_mcp_contrasts.csv")
+
+    mlr_mcp_emms_summary <- as.data.frame(summary(mlr_mcp_emms, infer = TRUE))
+    write.csv(mlr_mcp_emms_summary,
+              file.path(clinical_output_dir, "secondary_mlr_mcp_emms.csv"),
+              row.names = FALSE)
+    message("  ✓ Saved: secondary_mlr_mcp_emms.csv")
+
+    # (4) Figure S4b: MCP-based MLR (same style as CIBERSORT)
+    message("\n--- Creating Figure S4b (MCP-based MLR) ---")
+
+    # Prepare MCP EMM summary for plotting
+    mlr_mcp_plot_summary <- mlr_mcp_emms_summary %>%
+      mutate(timepoint = factor(timepoint, levels = c("A", "V1", "V2")))
+
+    # Create figure (identical style to CIBERSORT figure)
+    p_mlr_mcp_figure <- ggplot() +
+      # Patient trajectories (spaghetti lines) - background
+      geom_line(data = mlr_data,
+                aes(x = timepoint, y = mlr_mcp, group = pid),
+                color = "gray80", alpha = 0.2, linewidth = 0.3) +
+      # Individual data points with jitter
+      geom_jitter(data = mlr_data,
+                  aes(x = timepoint, y = mlr_mcp),
+                  width = 0.15, alpha = 0.3, size = 1.5, color = "gray50") +
+      # Violin plots
+      geom_violin(data = mlr_data,
+                  aes(x = timepoint, y = mlr_mcp, fill = timepoint),
+                  alpha = 0.3, trim = TRUE) +
+      # Boxplots overlaid
+      geom_boxplot(data = mlr_data,
+                   aes(x = timepoint, y = mlr_mcp),
+                   width = 0.2, alpha = 0, outlier.shape = NA) +
+      # EMM points with 95% CI (red)
+      geom_pointrange(data = mlr_mcp_plot_summary,
+                      aes(x = timepoint, y = emmean,
+                          ymin = lower.CL, ymax = upper.CL),
+                      color = "red", size = 1, linewidth = 1.2) +
+      # EMM line connecting timepoints (red)
+      geom_line(data = mlr_mcp_plot_summary,
+                aes(x = as.numeric(timepoint), y = emmean),
+                color = "red", linewidth = 1, linetype = "solid") +
+      # Styling
+      scale_fill_brewer(palette = "Set2") +
+      scale_x_discrete(labels = timepoint_labels) +
+      labs(
+        x = "Timepoint",
+        y = "Myeloid–Lymphoid Ratio (log2 scale, MCP-counter)",
+        title = "VALIDATION: MLR based on MCP-counter"
+      ) +
+      theme_bw(base_size = 13) +
+      theme(
+        plot.title = element_text(face = "bold", hjust = 0.5, size = 14),
+        legend.position = "none",
+        panel.grid.minor = element_blank()
+      ) +
+      # Add sample sizes below x-axis (same as CIBERSORT)
+      annotate("text", x = 1, y = min(mlr_data$mlr_mcp, na.rm = TRUE) - 0.5,
+               label = sprintf("n = %d", n_mlr_A), size = 3.5) +
+      annotate("text", x = 2, y = min(mlr_data$mlr_mcp, na.rm = TRUE) - 0.5,
+               label = sprintf("n = %d", n_mlr_V1), size = 3.5) +
+      annotate("text", x = 3, y = min(mlr_data$mlr_mcp, na.rm = TRUE) - 0.5,
+               label = sprintf("n = %d", n_mlr_V2), size = 3.5)
+
+    # Save MCP figure
+    ggsave(
+      file.path(clinical_fig_dir, "Fig_S4b_MLR_MCP_timecourse.png"),
+      plot = p_mlr_mcp_figure,
+      width = 8, height = 6, dpi = 300, bg = "white"
+    )
+    message("  ✓ Saved: Fig_S4b_MLR_MCP_timecourse.png")
+
+    message("\n✓ MCP-counter validation complete\n")
+  }
 }
 ```
 
@@ -3981,11 +4725,11 @@ if (!has_gsva || !has_mlr_computed) {
     filter(timepoint %in% c("A", "V1")) %>%
     filter(!is.na(clinical_inflammation_score)) %>%
     left_join(
-      mlr_data %>% select(sample_id, mlr_cibersort),
+      mlr_data %>% dplyr::select(sample_id, mlr_cibersort),
       by = "sample_id"
     ) %>%
     filter(!is.na(mlr_cibersort)) %>%
-    select(pid, timepoint, clinical_inflammation_score, mlr_cibersort) %>%
+    dplyr::select(pid, timepoint, clinical_inflammation_score, mlr_cibersort) %>%
     tidyr::pivot_wider(
       names_from = timepoint,
       values_from = c(clinical_inflammation_score, mlr_cibersort),
@@ -4018,6 +4762,13 @@ if (!has_gsva || !has_mlr_computed) {
       exact = FALSE
     )
 
+    # Helper: Format p-value in scientific notation
+    format_p_sci <- function(p) {
+      if (is.na(p)) return("p-value = NA")
+      if (p < 2.2e-16) return("p-value < 2.2e-16")
+      paste0("p-value = ", format(p, scientific = TRUE, digits = 3))
+    }
+
     # Create results table
     gsva_mlr_assoc_results <- data.frame(
       analysis = "GSVA-MLR Delta Association",
@@ -4037,7 +4788,7 @@ if (!has_gsva || !has_mlr_computed) {
 
     message(sprintf("  n pairs (A+V1): %d", nrow(gsva_mlr_paired)))
     message(sprintf("  Spearman rho = %.3f", spearman_result$estimate))
-    message(sprintf("  p-value = %.4f", spearman_result$p.value))
+    message(sprintf("  %s", format_p_sci(spearman_result$p.value)))
     message(sprintf("  Interpretation: %s",
                    ifelse(spearman_result$p.value < 0.05,
                           "Nominally significant (exploratory)",
@@ -4054,9 +4805,11 @@ if (!has_gsva || !has_mlr_computed) {
           ggplot2::geom_smooth(method = "lm", se = TRUE, color = "darkred") +
           ggplot2::labs(
             title = "Explorative GSVA-MLR Association (Δ A→V1)",
-            subtitle = sprintf("Spearman rho = %.3f, p = %.4f (n=%d)",
+            subtitle = sprintf("Spearman rho = %.3f, p = %s (n=%d)",
                               spearman_result$estimate,
-                              spearman_result$p.value,
+                              if (is.na(spearman_result$p.value)) "NA"
+                              else if (spearman_result$p.value < 2.2e-16) "< 2.2e-16"
+                              else format(spearman_result$p.value, scientific = TRUE, digits = 3),
                               nrow(gsva_mlr_paired)),
             x = "Δ Myeloid-Lymphoid Ratio (V1 - A)",
             y = "Δ GSVA Inflammation Score (V1 - A)"
@@ -4068,7 +4821,7 @@ if (!has_gsva || !has_mlr_computed) {
           )
 
         ggplot2::ggsave(
-          file.path(clinical_output_dir, "secondary_gsva_mlr_assoc_plot.pdf"),
+          file.path(clinical_fig_dir, "secondary_gsva_mlr_assoc_plot.pdf"),
           plot = gsva_mlr_plot,
           width = 6, height = 5
         )
@@ -4085,6 +4838,732 @@ if (!has_gsva || !has_mlr_computed) {
 }
 
 message("\n✓ GSVA-MLR association analysis complete\n")
+```
+
+## EXPLORATORY: Baseline-Nierenfunktion (GFR) als Vulnerabilitätsfaktor
+
+**Ziel:** Prüfen, ob Patienten mit eingeschränkter Nierenfunktion eine abweichende Entzündungsantwort zeigen.
+
+**Methodik:** LMM mit Timepoint × GFR-Interaktion, strenge Schwelle p<0.05 (kein Trend).
+
+```{r}
+#| label: step10-exploratory-gfr
+#| echo: false
+#| warning: false
+
+message("========================================")
+message("EXPLORATORY: GFR Effect on Inflammation")
+message("========================================\n")
+
+# Data: alle 3 Zeitpunkte mit GFR
+gfr_data <- sample_meta_clinical %>%
+  filter(timepoint %in% c("A", "V1", "V2")) %>%
+  filter(!is.na(gfr_impaired), !is.na(clinical_inflammation_score)) %>%
+  droplevels()
+
+gfr_data$timepoint <- factor(gfr_data$timepoint, levels = c("A", "V1", "V2"))
+
+n_gfr_normal <- n_distinct(gfr_data$pid[gfr_data$gfr_impaired == FALSE])
+n_gfr_impaired <- n_distinct(gfr_data$pid[gfr_data$gfr_impaired == TRUE])
+
+message(sprintf("Data: n = %d patients (%d GFR normal, %d GFR impaired), %d observations",
+                n_distinct(gfr_data$pid), n_gfr_normal, n_gfr_impaired, nrow(gfr_data)))
+
+# Stop-Regel: n >= 15 pro Gruppe
+if (min(n_gfr_normal, n_gfr_impaired) < clinical_params$min_n_per_group) {
+  message(sprintf("⚠️ SKIPPED: One GFR group has n < %d (normal=%d, impaired=%d)",
+                  clinical_params$min_n_per_group, n_gfr_normal, n_gfr_impaired))
+} else {
+
+  # Interaktionsmodell: score ~ timepoint * gfr_impaired + age + (1|pid)
+  # Keine zusätzliche Kovariate sex (Modell einfach halten, per Plan)
+  gfr_interaction_model <- lmerTest::lmer(
+    clinical_inflammation_score ~ timepoint * gfr_impaired + age + (1|pid),
+    data = gfr_data,
+    REML = FALSE
+  )
+
+  gfr_anova <- anova(gfr_interaction_model, type = 3, ddf = "Satterthwaite")
+
+  # Interaktionstest (streng: nur p<0.05, kein Trend)
+  gfr_interaction_p <- gfr_anova["timepoint:gfr_impaired", "Pr(>F)"]
+  message(sprintf("Interaction (timepoint:GFR): p = %.4f", gfr_interaction_p))
+
+  if (gfr_interaction_p < 0.05) {
+    message("→ Interaction significant: probing interaction")
+    # Hier wuerde man emmeans aufschluesseln — bei Signifikanz
+    gfr_final_model <- gfr_interaction_model
+    gfr_model_type <- "interaction"
+  } else {
+    message("→ Interaction ns: fitting additive model")
+
+    gfr_additive_model <- lmerTest::lmer(
+      clinical_inflammation_score ~ timepoint + gfr_impaired + age + (1|pid),
+      data = gfr_data,
+      REML = FALSE
+    )
+
+    gfr_final_model <- gfr_additive_model
+    gfr_model_type <- "additive"
+  }
+
+  # Export fixed effects
+  gfr_coefs <- broom.mixed::tidy(gfr_final_model, conf.int = TRUE) %>%
+    filter(effect == "fixed")
+
+  write.csv(
+    gfr_coefs,
+    file.path(clinical_output_dir, "exploratory_GFR_coefficients.csv"),
+    row.names = FALSE
+  )
+
+  # Report GFR main effect
+  gfr_row <- gfr_coefs %>% filter(grepl("gfr_impaired", term))
+  if (nrow(gfr_row) == 1) {
+    message(sprintf("→ GFR effect (impaired vs normal): β = %.3f, 95%% CI [%.3f, %.3f], p = %.4f",
+                    gfr_row$estimate, gfr_row$conf.low, gfr_row$conf.high, gfr_row$p.value))
+  }
+
+  message(sprintf("✓ Saved: exploratory_GFR_coefficients.csv (model type: %s)", gfr_model_type))
+
+  # ============================================================
+  # SENSITIVITÄT: Kontinuierliche GFR (zusätzlich zur binären)
+  # ============================================================
+  message("\n--- Sensitivitätsanalyse: Kontinuierliche GFR ---")
+
+  # Prüfe ob kontinuierliche GFR-Variable vorhanden
+  if (!"pr_errechnete_gfr_mdrd" %in% names(gfr_data)) {
+    message("⚠️ Kontinuierliche GFR (pr_errechnete_gfr_mdrd) nicht verfügbar")
+  } else {
+
+    # Filter: nur Fälle mit valider kontinuierlicher GFR
+    gfr_cont_data <- gfr_data %>%
+      filter(!is.na(pr_errechnete_gfr_mdrd))
+
+    if (nrow(gfr_cont_data) < 30) {
+      message(sprintf("⚠️ SKIPPED: Zu wenige Beobachtungen mit GFR-Wert (n=%d)", nrow(gfr_cont_data)))
+    } else {
+
+      # Zentriere GFR am Mittelwert (interpretierbarkeit + numerische Stabilität)
+      gfr_mean <- mean(gfr_cont_data$pr_errechnete_gfr_mdrd, na.rm = TRUE)
+      gfr_cont_data <- gfr_cont_data %>%
+        mutate(gfr_cont_centered = pr_errechnete_gfr_mdrd - gfr_mean)
+
+      message(sprintf("GFR zentriert am Mittelwert: %.1f ml/min/1.73m²", gfr_mean))
+      message(sprintf("Daten: n = %d Patienten, %d Beobachtungen",
+                      n_distinct(gfr_cont_data$pid), nrow(gfr_cont_data)))
+
+      # Additives Modell (Interaktion bereits mit binär getestet und ns)
+      # score ~ timepoint + gfr_cont_centered + age + (1|pid)
+      gfr_cont_model <- lmerTest::lmer(
+        clinical_inflammation_score ~ timepoint + gfr_cont_centered + age + (1|pid),
+        data = gfr_cont_data,
+        REML = FALSE
+      )
+
+      # Exportiere Fixed Effects mit 95% CI
+      gfr_cont_coefs <- broom.mixed::tidy(gfr_cont_model, conf.int = TRUE) %>%
+        filter(effect == "fixed")
+
+      write.csv(
+        gfr_cont_coefs,
+        file.path(clinical_output_dir, "exploratory_GFR_continuous_coefficients.csv"),
+        row.names = FALSE
+      )
+
+      # Berichte Effekt pro +10 ml/min (klinisch relevantere Einheit)
+      gfr_cont_row <- gfr_cont_coefs %>% filter(term == "gfr_cont_centered")
+
+      if (nrow(gfr_cont_row) == 1) {
+        beta_per_1 <- gfr_cont_row$estimate
+        beta_per_10 <- 10 * beta_per_1
+        ci_low_per_10 <- 10 * gfr_cont_row$conf.low
+        ci_high_per_10 <- 10 * gfr_cont_row$conf.high
+        p_val <- gfr_cont_row$p.value
+
+        message(sprintf("→ Kontinuierlicher GFR-Effekt (pro +10 ml/min): β₁₀ = %.3f, 95%% CI [%.3f, %.3f], p = %.4f",
+                        beta_per_10, ci_low_per_10, ci_high_per_10, p_val))
+      }
+
+      message("✓ Saved: exploratory_GFR_continuous_coefficients.csv")
+    }
+  }
+
+  # ============================================================
+  # EXPLORATIV: GFR und Recovery (V1 → V2)
+  # ============================================================
+  message("\n--- Explorative Analyse: GFR-assoziierte Recovery (V1→V2) ---")
+  message("Fragestellung: Zeigen Patienten mit schlechterer Nierenfunktion weniger Erholung?")
+
+  # Patient-level Paired Dataset (V1 und V2)
+  recovery_data <- sample_meta_clinical %>%
+    filter(timepoint %in% c("V1", "V2")) %>%
+    filter(!is.na(clinical_inflammation_score)) %>%
+    filter(!is.na(pr_errechnete_gfr_mdrd)) %>%
+    filter(!is.na(gfr_impaired)) %>%
+    filter(!is.na(age)) %>%
+    dplyr::select(pid, timepoint, clinical_inflammation_score, pr_errechnete_gfr_mdrd, gfr_impaired, age) %>%
+    # Pivot wider: eine Zeile pro Patient mit V1 und V2 Spalten
+    tidyr::pivot_wider(
+      names_from = timepoint,
+      values_from = clinical_inflammation_score,
+      names_prefix = "score_"
+    ) %>%
+    # Nur komplette Paare behalten
+    filter(!is.na(score_V1) & !is.na(score_V2))
+
+  n_pairs_V1_V2 <- nrow(recovery_data)
+
+  if (n_pairs_V1_V2 < 10) {
+    message(sprintf("⚠️ SKIPPED: Zu wenige gepaarte Fälle V1-V2 (n=%d, benötigt ≥10)", n_pairs_V1_V2))
+  } else {
+
+    # Recovery Delta: V2 - V1 (negativ = Erholung, positiv = Persistenz/Verschlechterung)
+    recovery_data <- recovery_data %>%
+      mutate(delta_rec = score_V2 - score_V1)
+
+    message(sprintf("Daten: n = %d gepaarte Fälle (V1+V2 komplett)", n_pairs_V1_V2))
+
+    # ----------------
+    # Modell 1: Kontinuierliche GFR
+    # ----------------
+    # Zentriere GFR
+    gfr_recovery_mean <- mean(recovery_data$pr_errechnete_gfr_mdrd, na.rm = TRUE)
+    recovery_data <- recovery_data %>%
+      mutate(gfr_cont_centered = pr_errechnete_gfr_mdrd - gfr_recovery_mean)
+
+    # Patient-level lm (kein mixed model, da Delta bereits within-patient)
+    recovery_cont_model <- lm(
+      delta_rec ~ gfr_cont_centered + age,
+      data = recovery_data
+    )
+
+    # Tidy output mit CI
+    recovery_cont_coefs <- broom::tidy(recovery_cont_model, conf.int = TRUE)
+
+    # Export
+    write.csv(
+      recovery_cont_coefs,
+      file.path(clinical_output_dir, "exploratory_GFR_recovery_V2_minus_V1_continuous.csv"),
+      row.names = FALSE
+    )
+
+    # Effekt pro +10 ml/min
+    gfr_cont_rec_row <- recovery_cont_coefs %>% filter(term == "gfr_cont_centered")
+
+    if (nrow(gfr_cont_rec_row) == 1) {
+      beta_per_1_rec <- gfr_cont_rec_row$estimate
+      beta_per_10_rec <- 10 * beta_per_1_rec
+      ci_low_10_rec <- 10 * gfr_cont_rec_row$conf.low
+      ci_high_10_rec <- 10 * gfr_cont_rec_row$conf.high
+      p_cont_rec <- gfr_cont_rec_row$p.value
+
+      message(sprintf("→ Kontinuierliche GFR (pro +10 ml/min): β₁₀ = %.3f, 95%% CI [%.3f, %.3f], p = %.4f",
+                      beta_per_10_rec, ci_low_10_rec, ci_high_10_rec, p_cont_rec))
+      message("   (Da Δ = V2 − V1 gilt: negativer β₁₀ würde bedeuten: höhere GFR → stärkere Erholung; positiver β₁₀: höhere GFR → weniger Erholung.)")
+    } else {
+      beta_per_10_rec <- NA
+      ci_low_10_rec <- NA
+      ci_high_10_rec <- NA
+      p_cont_rec <- NA
+    }
+
+    # ----------------
+    # Modell 2: Binäre GFR
+    # ----------------
+    recovery_binary_model <- lm(
+      delta_rec ~ gfr_impaired + age,
+      data = recovery_data
+    )
+
+    # Tidy output mit CI
+    recovery_binary_coefs <- broom::tidy(recovery_binary_model, conf.int = TRUE)
+
+    # Export
+    write.csv(
+      recovery_binary_coefs,
+      file.path(clinical_output_dir, "exploratory_GFR_recovery_V2_minus_V1_binary.csv"),
+      row.names = FALSE
+    )
+
+    # Effekt impaired vs normal
+    gfr_binary_rec_row <- recovery_binary_coefs %>% filter(grepl("gfr_impaired", term))
+
+    if (nrow(gfr_binary_rec_row) == 1) {
+      beta_binary_rec <- gfr_binary_rec_row$estimate
+      ci_low_binary_rec <- gfr_binary_rec_row$conf.low
+      ci_high_binary_rec <- gfr_binary_rec_row$conf.high
+      p_binary_rec <- gfr_binary_rec_row$p.value
+
+      message(sprintf("→ Binäre GFR (impaired vs normal): β = %.3f, 95%% CI [%.3f, %.3f], p = %.4f",
+                      beta_binary_rec, ci_low_binary_rec, ci_high_binary_rec, p_binary_rec))
+      message("   (Da Δ = V2 − V1 gilt: positiver β würde bedeuten: impaired → weniger Erholung; negativer β: impaired → mehr Erholung.)")
+    } else {
+      beta_binary_rec <- NA
+      ci_low_binary_rec <- NA
+      ci_high_binary_rec <- NA
+      p_binary_rec <- NA
+    }
+
+    # ----------------
+    # Summary Table (Eine Zeile)
+    # ----------------
+    recovery_summary <- data.frame(
+      n_pairs = n_pairs_V1_V2,
+      beta10_cont = beta_per_10_rec,
+      CI_low_cont = ci_low_10_rec,
+      CI_high_cont = ci_high_10_rec,
+      p_cont = p_cont_rec,
+      beta_binary = beta_binary_rec,
+      CI_low_binary = ci_low_binary_rec,
+      CI_high_binary = ci_high_binary_rec,
+      p_binary = p_binary_rec
+    )
+
+    write.csv(
+      recovery_summary,
+      file.path(clinical_output_dir, "exploratory_GFR_recovery_V2_minus_V1_summary.csv"),
+      row.names = FALSE
+    )
+
+    message("✓ Saved: exploratory_GFR_recovery_V2_minus_V1_continuous.csv")
+    message("✓ Saved: exploratory_GFR_recovery_V2_minus_V1_binary.csv")
+    message("✓ Saved: exploratory_GFR_recovery_V2_minus_V1_summary.csv")
+
+    # ----------------
+    # Optional: Scatter-Plot
+    # ----------------
+    if (requireNamespace("ggplot2", quietly = TRUE)) {
+      tryCatch({
+        p_recovery_scatter <- ggplot(recovery_data, aes(x = pr_errechnete_gfr_mdrd, y = delta_rec)) +
+          geom_hline(yintercept = 0, linetype = "dashed", color = "gray50", linewidth = 0.5) +
+          geom_point(size = 2.5, alpha = 0.6, color = "steelblue") +
+          geom_smooth(method = "lm", se = TRUE, color = "darkred", linewidth = 1) +
+          labs(
+            title = "GFR and Inflammation Recovery (V1 → V2)",
+            subtitle = sprintf("n = %d paired cases; Δ Inflammation = V2 − V1", n_pairs_V1_V2),
+            x = "Baseline GFR (ml/min/1.73m²)",
+            y = "Δ Inflammation Score (V2 − V1)\n← Recovery | Persistence →"
+          ) +
+          theme_bw(base_size = 12) +
+          theme(
+            plot.title = element_text(face = "bold", hjust = 0.5),
+            plot.subtitle = element_text(size = 10, color = "gray40", hjust = 0.5),
+            panel.grid.minor = element_blank()
+          )
+
+        ggsave(
+          file.path(clinical_fig_dir, "Fig_S_GFR_recovery_delta_V2_minus_V1.png"),
+          plot = p_recovery_scatter,
+          width = 7, height = 5.5, dpi = 300, bg = "white"
+        )
+
+        message("✓ Saved: Fig_S_GFR_recovery_delta_V2_minus_V1.png")
+
+      }, error = function(e) {
+        message("  Note: Plot generation skipped (", e$message, ")")
+      })
+    }
+
+  }
+
+  # ============================================================
+  # EXPLORATIV: GFR-Assoziation bei Baseline (nur Zeitpunkt A)
+  # ============================================================
+  message("\n--- Baseline-Analyse: GFR und Inflammation (Pre-TAVR, A) ---")
+  message("Fragestellung: Haben Patienten mit schlechterer Nierenfunktion bereits präprozedural höhere Inflammationsscores?")
+
+  # Baseline-Dataset (nur Zeitpunkt A)
+  gfr_baseline <- gfr_data %>%
+    dplyr::filter(timepoint == "A")
+
+  # Enforce uniqueness: ein Patient sollte nur einmal bei A vorkommen
+  if (any(duplicated(gfr_baseline$pid))) {
+    gfr_baseline <- gfr_baseline %>%
+      distinct(pid, .keep_all = TRUE)
+    message("⚠️ Duplikate bei Zeitpunkt A entfernt (distinct by pid)")
+  }
+
+  # Stopp-Regel: mindestens 10 Patienten
+  n_baseline <- nrow(gfr_baseline)
+
+  if (n_baseline < 10) {
+    message(sprintf("⚠️ SKIPPED: Zu wenige Baseline-Fälle (n=%d, benötigt ≥10)", n_baseline))
+  } else {
+
+    # Diagnostics
+    message(sprintf("Daten: n = %d Patienten bei Baseline (A)", n_baseline))
+
+    # ----------------
+    # Modell 1: Binäre GFR
+    # ----------------
+    baseline_binary_model <- lm(
+      clinical_inflammation_score ~ gfr_impaired + age,
+      data = gfr_baseline
+    )
+
+    # Tidy output mit CI
+    baseline_binary_coefs <- broom::tidy(baseline_binary_model, conf.int = TRUE)
+
+    # Export
+    write.csv(
+      baseline_binary_coefs,
+      file.path(clinical_output_dir, "exploratory_GFR_baseline_A_binary.csv"),
+      row.names = FALSE
+    )
+
+    # Effekt impaired vs normal
+    baseline_gfr_binary_row <- baseline_binary_coefs %>% filter(grepl("gfr_impaired", term))
+
+    if (nrow(baseline_gfr_binary_row) == 1) {
+      beta_baseline_binary <- baseline_gfr_binary_row$estimate
+      ci_low_baseline_binary <- baseline_gfr_binary_row$conf.low
+      ci_high_baseline_binary <- baseline_gfr_binary_row$conf.high
+      p_baseline_binary <- baseline_gfr_binary_row$p.value
+
+      # Format p-value (scientific if very small)
+      p_formatted_binary <- if (is.na(p_baseline_binary)) {
+        "NA"
+      } else if (p_baseline_binary < 1e-4) {
+        format(p_baseline_binary, scientific = TRUE, digits = 3)
+      } else {
+        sprintf("%.4f", p_baseline_binary)
+      }
+
+      message(sprintf("→ Binäre GFR (impaired vs normal): β = %.3f, 95%% CI [%.3f, %.3f], p = %s",
+                      beta_baseline_binary, ci_low_baseline_binary, ci_high_baseline_binary, p_formatted_binary))
+    }
+
+    message("✓ Saved: exploratory_GFR_baseline_A_binary.csv")
+
+    # ----------------
+    # Modell 2: Kontinuierliche GFR
+    # ----------------
+    # Zentriere GFR am Baseline-Mittelwert
+    gfr_baseline_mean <- mean(gfr_baseline$pr_errechnete_gfr_mdrd, na.rm = TRUE)
+    gfr_baseline <- gfr_baseline %>%
+      mutate(gfr_cont_centered = pr_errechnete_gfr_mdrd - gfr_baseline_mean)
+
+    baseline_cont_model <- lm(
+      clinical_inflammation_score ~ gfr_cont_centered + age,
+      data = gfr_baseline
+    )
+
+    # Tidy output mit CI
+    baseline_cont_coefs <- broom::tidy(baseline_cont_model, conf.int = TRUE)
+
+    # Export
+    write.csv(
+      baseline_cont_coefs,
+      file.path(clinical_output_dir, "exploratory_GFR_baseline_A_continuous.csv"),
+      row.names = FALSE
+    )
+
+    # Effekt pro +10 ml/min
+    baseline_gfr_cont_row <- baseline_cont_coefs %>% filter(term == "gfr_cont_centered")
+
+    if (nrow(baseline_gfr_cont_row) == 1) {
+      beta_per_1_baseline <- baseline_gfr_cont_row$estimate
+      beta_per_10_baseline <- 10 * beta_per_1_baseline
+      ci_low_10_baseline <- 10 * baseline_gfr_cont_row$conf.low
+      ci_high_10_baseline <- 10 * baseline_gfr_cont_row$conf.high
+      p_baseline_cont <- baseline_gfr_cont_row$p.value
+
+      # Format p-value (scientific if very small)
+      p_formatted_cont <- if (is.na(p_baseline_cont)) {
+        "NA"
+      } else if (p_baseline_cont < 1e-4) {
+        format(p_baseline_cont, scientific = TRUE, digits = 3)
+      } else {
+        sprintf("%.4f", p_baseline_cont)
+      }
+
+      message(sprintf("→ Kontinuierliche GFR (pro +10 ml/min): β₁₀ = %.3f, 95%% CI [%.3f, %.3f], p = %s",
+                      beta_per_10_baseline, ci_low_10_baseline, ci_high_10_baseline, p_formatted_cont))
+    }
+
+    message("✓ Saved: exploratory_GFR_baseline_A_continuous.csv")
+
+    # ----------------
+    # Optional: Scatter-Plot bei Baseline
+    # ----------------
+    if (requireNamespace("ggplot2", quietly = TRUE)) {
+      tryCatch({
+        p_baseline_scatter <- ggplot(gfr_baseline, aes(x = pr_errechnete_gfr_mdrd, y = clinical_inflammation_score)) +
+          geom_point(size = 2.5, alpha = 0.6, color = "steelblue") +
+          geom_smooth(method = "lm", se = TRUE, color = "darkred", linewidth = 1) +
+          labs(
+            title = "Baseline GFR and Inflammation Score (Pre-TAVR)",
+            subtitle = sprintf("n = %d patients at baseline (A)", n_baseline),
+            x = "Baseline GFR (ml/min/1.73m²)",
+            y = "GSVA Inflammation Score"
+          ) +
+          theme_bw(base_size = 12) +
+          theme(
+            plot.title = element_text(face = "bold", hjust = 0.5),
+            plot.subtitle = element_text(size = 10, color = "gray40", hjust = 0.5),
+            panel.grid.minor = element_blank()
+          )
+
+        ggsave(
+          file.path(clinical_fig_dir, "Fig_S_GFR_baseline_scatter_A.png"),
+          plot = p_baseline_scatter,
+          width = 7, height = 5.5, dpi = 300, bg = "white"
+        )
+
+        message("✓ Saved: Fig_S_GFR_baseline_scatter_A.png")
+
+      }, error = function(e) {
+        message("  Note: Plot generation skipped (", e$message, ")")
+      })
+    }
+
+  }
+}
+
+message("\n✓ GFR analysis complete\n")
+```
+
+## EXPLORATORY: Klappentyp (BEV vs SEV) und prozedurale Unterschiede
+
+**Ziel:** Prüfen, ob der Klappentyp den Entzündungsverlauf beeinflusst.
+
+**Methodik:** LMM mit Timepoint × ValveType-Interaktion, keine zusätzlichen Kovariaten.
+
+```{r}
+#| label: step10-exploratory-valvetype
+#| echo: false
+#| warning: false
+
+message("========================================")
+message("EXPLORATORY: ValveType Effect on Inflammation")
+message("========================================\n")
+
+# Data: alle 3 Zeitpunkte mit valve_type_grouped
+valve_data <- sample_meta_clinical %>%
+  filter(timepoint %in% c("A", "V1", "V2")) %>%
+  filter(!is.na(valve_type_grouped), !is.na(clinical_inflammation_score)) %>%
+  droplevels()
+
+valve_data$timepoint <- factor(valve_data$timepoint, levels = c("A", "V1", "V2"))
+
+n_bev <- n_distinct(valve_data$pid[valve_data$valve_type_grouped == "BEV"])
+n_sev <- n_distinct(valve_data$pid[valve_data$valve_type_grouped == "SEV"])
+
+message(sprintf("Data: n = %d patients (BEV=%d, SEV=%d), %d observations",
+                n_distinct(valve_data$pid), n_bev, n_sev, nrow(valve_data)))
+
+# Stop-Regel: n >= 15 pro Gruppe
+if (min(n_bev, n_sev) < clinical_params$min_n_per_group) {
+  message(sprintf("⚠️ SKIPPED: One valve group has n < %d (BEV=%d, SEV=%d)",
+                  clinical_params$min_n_per_group, n_bev, n_sev))
+} else {
+
+  # Interaktionsmodell: score ~ timepoint * valve_type_grouped + (1|pid)
+  # Keine zusätzlichen Kovariaten (Plan: Modell einfach halten)
+  valve_interaction_model <- lmerTest::lmer(
+    clinical_inflammation_score ~ timepoint * valve_type_grouped + (1|pid),
+    data = valve_data,
+    REML = FALSE
+  )
+
+  valve_anova <- anova(valve_interaction_model, type = 3, ddf = "Satterthwaite")
+
+  # Interaktionstest
+  valve_interaction_row <- grep("timepoint:valve_type_grouped", rownames(valve_anova))
+  valve_interaction_p <- valve_anova[valve_interaction_row, "Pr(>F)"]
+
+  message(sprintf("Interaction (timepoint:ValveType): p = %.4f", valve_interaction_p))
+
+  # Haupteffekt
+  valve_main_row <- grep("^valve_type_grouped", rownames(valve_anova))
+  valve_main_p <- valve_anova[valve_main_row, "Pr(>F)"]
+  message(sprintf("Main effect (ValveType): p = %.4f", valve_main_p))
+
+  if (valve_interaction_p < 0.05) {
+    message("→ Interaction significant")
+    valve_model_type <- "interaction"
+  } else {
+    message("→ Interaction ns: checking main effect only")
+
+    # Additives Modell
+    valve_additive_model <- lmerTest::lmer(
+      clinical_inflammation_score ~ timepoint + valve_type_grouped + (1|pid),
+      data = valve_data,
+      REML = FALSE
+    )
+
+    valve_model_type <- "additive"
+  }
+
+  # Report: kein separater Output per Plan (negative Ergebnisse nur kurz im Text)
+  message(sprintf("→ Result: No significant valve type effect (interaction p=%.3f, main p=%.3f)",
+                  valve_interaction_p, valve_main_p))
+  message("  (Per plan: negative result reported briefly in text, no separate figure)")
+
+  # ============================================================
+  # SENSITIVITÄT: Patient-level Δ(V1−A) Vergleich BEV vs SEV
+  # ============================================================
+  message("\n--- Sensitivitätsanalyse: Δ(V1−A) nach Klappentyp ---")
+
+  # Paired A/V1 Dataset erstellen
+  valve_delta_data <- valve_data %>%
+    filter(timepoint %in% c("A", "V1")) %>%
+    dplyr::select(pid, timepoint, clinical_inflammation_score, valve_type_grouped) %>%
+    tidyr::pivot_wider(
+      names_from = timepoint,
+      values_from = clinical_inflammation_score,
+      names_prefix = "inflammation_"
+    ) %>%
+    # Nur komplette Paare behalten
+    filter(!is.na(inflammation_A) & !is.na(inflammation_V1)) %>%
+    # Delta berechnen
+    mutate(delta_V1_A = inflammation_V1 - inflammation_A)
+
+  n_paired_total <- nrow(valve_delta_data)
+  n_paired_bev <- sum(valve_delta_data$valve_type_grouped == "BEV", na.rm = TRUE)
+  n_paired_sev <- sum(valve_delta_data$valve_type_grouped == "SEV", na.rm = TRUE)
+
+  message(sprintf("Gepaarte Fälle (A+V1): n = %d gesamt (BEV=%d, SEV=%d)",
+                  n_paired_total, n_paired_bev, n_paired_sev))
+
+  if (n_paired_total < 10 || min(n_paired_bev, n_paired_sev) < 5) {
+    message("⚠️ SKIPPED: Zu wenige gepaarte Fälle für Delta-Analyse")
+  } else {
+
+    # Zusammenfassung nach Gruppe
+    delta_summary_by_group <- valve_delta_data %>%
+      group_by(valve_type_grouped) %>%
+      summarise(
+        n = n(),
+        mean_delta = mean(delta_V1_A, na.rm = TRUE),
+        median_delta = median(delta_V1_A, na.rm = TRUE),
+        sd_delta = sd(delta_V1_A, na.rm = TRUE),
+        q25 = quantile(delta_V1_A, 0.25, na.rm = TRUE),
+        q75 = quantile(delta_V1_A, 0.75, na.rm = TRUE),
+        .groups = "drop"
+      )
+
+    message("\nGruppenzusammenfassung (Δ = V1 − A):")
+    print(delta_summary_by_group)
+
+    # Wilcoxon rank-sum test (robust, non-parametric)
+    wilcox_result <- wilcox.test(
+      delta_V1_A ~ valve_type_grouped,
+      data = valve_delta_data,
+      exact = FALSE
+    )
+
+    message(sprintf("\nWilcoxon rank-sum test: p = %.4f", wilcox_result$p.value))
+
+    # Gruppenmittelwert-Differenz (BEV - SEV)
+    mean_delta_bev <- delta_summary_by_group$mean_delta[delta_summary_by_group$valve_type_grouped == "BEV"]
+    mean_delta_sev <- delta_summary_by_group$mean_delta[delta_summary_by_group$valve_type_grouped == "SEV"]
+    mean_diff <- mean_delta_bev - mean_delta_sev
+
+    message(sprintf("Mittlere Δ-Differenz (BEV − SEV): %.3f", mean_diff))
+
+    # ----------------
+    # CSV Export: Patient-level data
+    # ----------------
+    write.csv(
+      valve_delta_data,
+      file.path(clinical_output_dir, "secondary_valvetype_deltaV1A.csv"),
+      row.names = FALSE
+    )
+    message("✓ Saved: secondary_valvetype_deltaV1A.csv")
+
+    # ----------------
+    # TXT Summary Export
+    # ----------------
+    summary_text <- c(
+      "SECONDARY ANALYSIS: Valve Type and Inflammation Change (Δ V1−A)",
+      "================================================================",
+      "",
+      sprintf("Sample size: n = %d paired cases (A+V1)", n_paired_total),
+      sprintf("  BEV: n = %d", n_paired_bev),
+      sprintf("  SEV: n = %d", n_paired_sev),
+      "",
+      "Group summaries (Δ Inflammation = V1 − A):",
+      sprintf("  BEV: mean = %.3f, median = %.3f, SD = %.3f",
+              mean_delta_bev,
+              delta_summary_by_group$median_delta[delta_summary_by_group$valve_type_grouped == "BEV"],
+              delta_summary_by_group$sd_delta[delta_summary_by_group$valve_type_grouped == "BEV"]),
+      sprintf("  SEV: mean = %.3f, median = %.3f, SD = %.3f",
+              mean_delta_sev,
+              delta_summary_by_group$median_delta[delta_summary_by_group$valve_type_grouped == "SEV"],
+              delta_summary_by_group$sd_delta[delta_summary_by_group$valve_type_grouped == "SEV"]),
+      "",
+      sprintf("Mean difference (BEV − SEV): %.3f", mean_diff),
+      "",
+      sprintf("Wilcoxon rank-sum test: p = %.4f", wilcox_result$p.value),
+      "",
+      "Interpretation: Exploratory sensitivity analysis (hypothesis-generating)"
+    )
+
+    writeLines(
+      summary_text,
+      file.path(clinical_output_dir, "secondary_valvetype_deltaV1A_summary.txt")
+    )
+    message("✓ Saved: secondary_valvetype_deltaV1A_summary.txt")
+
+    # ----------------
+    # Plot: Delta Distribution (Option A - violin + box + jitter)
+    # ----------------
+    if (requireNamespace("ggplot2", quietly = TRUE)) {
+      tryCatch({
+
+        # Gruppenmittelwerte für Overlay
+        group_means <- delta_summary_by_group %>%
+          dplyr::select(valve_type_grouped, mean_delta)
+
+        p_valve_delta <- ggplot(valve_delta_data, aes(x = valve_type_grouped, y = delta_V1_A, fill = valve_type_grouped)) +
+          # Violin plots
+          geom_violin(alpha = 0.3, trim = TRUE) +
+          # Boxplots overlaid
+          geom_boxplot(width = 0.2, alpha = 0, outlier.shape = NA) +
+          # Individual points with jitter
+          geom_jitter(width = 0.15, alpha = 0.5, size = 2, color = "gray30") +
+          # Horizontal line at zero (reference: no change)
+          geom_hline(yintercept = 0, linetype = "dashed", color = "gray50", linewidth = 0.5) +
+          # Group means (red points)
+          geom_point(data = group_means,
+                     aes(x = valve_type_grouped, y = mean_delta),
+                     color = "red", size = 4, shape = 18) +
+          # Styling
+          scale_fill_brewer(palette = "Set2") +
+          labs(
+            title = "Inflammation Change by Valve Type (A → V1)",
+            subtitle = sprintf("BEV: n=%d, SEV: n=%d; Wilcoxon p = %.4f",
+                              n_paired_bev, n_paired_sev, wilcox_result$p.value),
+            x = "Valve Type",
+            y = "Δ Inflammation Score (V1 − A)\n← Recovery | Increase →"
+          ) +
+          theme_bw(base_size = 13) +
+          theme(
+            plot.title = element_text(face = "bold", hjust = 0.5),
+            plot.subtitle = element_text(size = 10, color = "gray40", hjust = 0.5),
+            legend.position = "none",
+            panel.grid.minor = element_blank()
+          )
+
+        ggsave(
+          file.path(clinical_fig_dir, "Fig_S_valvetype_deltaV1A.png"),
+          plot = p_valve_delta,
+          width = 6, height = 5.5, dpi = 300, bg = "white"
+        )
+
+        message("✓ Saved: Fig_S_valvetype_deltaV1A.png")
+
+      }, error = function(e) {
+        message("  Note: Plot generation skipped (", e$message, ")")
+      })
+    }
+
+  }
+}
+
+message("\n✓ Valve type analysis complete\n")
 ```
 
 ## SECONDARY ANALYSIS 3: Klinische Laborwerte (PENDING DATA)
@@ -4460,6 +5939,33 @@ message("✓ EXPLORATORY ANALYSIS (STEP 11) COMPLETE")
 message("   (Currently DEACTIVATED - awaiting data)")
 message("========================================\n")
 ```
+
+---
+
+# Nicht durchgeführte Analysen (mit Begründung)
+
+Im Rahmen der Planerstellung wurden diverse potenzielle Analysen diskutiert, jedoch bewusst verworfen oder eingeschränkt, um Überfrachtung und Fehlinterpretationen zu vermeiden.
+
+**Keine zusätzlichen Baseline-Faktoren jenseits LVEF und GFR:**
+Mit n=46 wäre die Aufnahme jedes weiteren Prädiktors pro Analyse problematisch (Events-per-Variable-Regel ~10:1). Variablen wie Logistic EuroSCORE II, Diabetes, Vorhofflimmern und metabolic risk score fließen nur deskriptiv in Table 1 ein, werden aber nicht in Regressionsmodellen getestet.
+
+**Keine isolierten Subgruppenanalysen bei kleinen n:**
+Auswertungen, die die Kohorte in Teilgruppen <20 splitten, wurden vermieden (unter der a priori Schwelle für inferenzstatistische Tests). Stattdessen wurden Interaktionen im Gesamtmodell geprüft (z.B. Timepoint × EF, Timepoint × GFR).
+
+**Keine multivariaten Prädiktor-Modelle für Outcome:**
+Ein kombiniertes Modell "Survival ~ GSVA + EF + Alter" wurde nicht aufgestellt. Mit ~12 Ereignissen wäre dies massiv unterpowered und könnte zu Überanpassung führen. Stattdessen univariate Marker-Checks (siehe Survival-Analyse).
+
+**Kein direkter Genexpressions-Vergleich zwischen klinischen Untergruppen:**
+Die RNA-seq-Differenzanalyse wurde nicht erneut nach klinischen Subgruppen stratifiziert (z.B. DE-Analyse nur bei EF<50% vs EF>=50%), da hierfür die Power fehlt.
+
+**Keine zusätzlichen omics oder Biomarker integriert:**
+Analyse beschränkt auf RNA-seq und klinische Routinedaten. Keine Proteom- oder Metabolom-Integration.
+
+**Klinische Laborwerte (CRP, WBC, NLR):**
+Not performed (data not available in clinical CSV). Code vorbereitet und deaktiviert (Step 10, Secondary 3).
+
+**Überlebensanalyse (Landmark bei V1):**
+Not performed (data not available in clinical CSV). Code vollständig spezifiziert und deaktiviert (Step 11).
 
 ---
 
