@@ -29,7 +29,7 @@ Dieses Dokument integriert klinische Variablen (Demografie, Komorbiditäten, Ech
 
 ---
 
-# Setup
+# Setup: Pakete, Parameter, Verzeichnisse
 
 ```{r}
 #| label: setup-packages
@@ -56,7 +56,6 @@ suppressPackageStartupMessages({
   library(immunedeconv)
   library(SummarizedExperiment)
   library(patchwork)
-  library(immunedeconv)
   library(org.Hs.eg.db)
   library(digest)
   library(emmeans)
@@ -126,7 +125,7 @@ message("✓ Setup complete")
 
 # SCHRITT 1: Datenimport & Encodingfix
 
-**Ziel:** Clinical CSV mit korrektem Encoding/Locale importieren, Plausibilitätschecks durchführen
+**Ziel:** Clinical CSV mit korrektem Encoding/Locale importieren, Plausibilitätschecks und Extreme-Werte-Identifikation durchführen
 
 
 ```{r}
@@ -154,10 +153,10 @@ if (file.exists(clinical_cache)) {
     show_col_types = FALSE
   ) %>%
     janitor::clean_names()
-  
+
   if (!"labor_nr" %in% names(clinical_raw)) {
-  stop("Expected ID column 'labor_nr' not found after clean_names(). Check clinical CSV header.")
-}
+    stop("Expected ID column 'labor_nr' not found after clean_names(). Check clinical CSV header.")
+  }
 
   # Typ-Validierung: Numerische Spalten müssen numeric sein
   numeric_vars <- c("age", "bmi", "pr_errechnete_gfr_mdrd", "log_euroscore_ii",
@@ -280,7 +279,7 @@ clinical_clean <- clinical_raw %>%
     # --------------------------------------------------------
     gfr_cont = pr_errechnete_gfr_mdrd,
     bmi_cont = bmi,
-    euroscore_ii_percent = log_euroscore_ii,  # NOTE: nur umbenannt; siehe comment unten
+    euroscore_ii_percent = log_euroscore_ii,  # Umbenennung für Klarheit (ist bereits in Prozent)
     ef_cont = pr_echo_ef_percent,
 
     # --------------------------------------------------------
@@ -333,9 +332,9 @@ clinical_clean <- clinical_raw %>%
 
     # --------------------------------------------------------
     # cardiometabolic burden (metabolic syndrome proxy)
-    # NOTE: das ist NICHT atp-iii / ncep-mets, da waist/hdl/tg/glucose fehlen.
-    # score 0–4: diabetes, dyslipidemia, hypertension, bmi≥30
-    # missing wird als "no" behandelt, um score stabil zu halten.
+    # NOTE: das ist NICHT ATP-III / NCEP-MetS, da Waist/HDL/TG/Glucose fehlen.
+    # Score 0–4: Diabetes, Dyslipidämie, Hypertonie, BMI≥30
+    # KONSERVATIVE ANNAHME: Missing → FALSE (keine Erkrankung), um Score stabil zu halten.
     # --------------------------------------------------------
     metabolic_risk_score =
       (tidyr::replace_na(diabetes == "yes", FALSE)) +
@@ -352,6 +351,7 @@ clinical_clean <- clinical_raw %>%
 
     # --------------------------------------------------------
     # yes/no zu logical konvertieren (für model covariates)
+    # KONSERVATIVE ANNAHME: Missing → FALSE (keine Erkrankung)
     # --------------------------------------------------------
     dplyr::across(
       c(atrial_fibrillation_flutter, copd, diabetes, dyslipedemia, hypertension,
@@ -463,7 +463,7 @@ if (length(available_comorbidities) >= 2) {
           is.na(.x) ~ NA_integer_,
           is.logical(.x) ~ as.integer(.x),
           is.numeric(.x) ~ as.integer(.x),
-          is.factor(.x)  ~ as.integer(as.character(.x)),
+          is.factor(.x) ~ as.integer(as.character(.x) %in% c("yes", "true", "1")),  # Factor → Character → Boolean → Integer
           is.character(.x) ~ as.integer(.x %in% c("yes", "true", "1")),
           TRUE ~ NA_integer_
         )
@@ -480,7 +480,7 @@ if (length(available_comorbidities) >= 2) {
 
     comorbidity_cor_matrix <- stats::cor(comorbidity_data, use = "pairwise.complete.obs")
 
-    message("\n--- COMORBIDITY CORRELATION MATRIX (pearson on 0/1; ~phi) ---")
+    message("\n--- COMORBIDITY CORRELATION MATRIX (Pearson auf 0/1 = Phi-Koeffizient) ---")
     print(round(comorbidity_cor_matrix, 2))
 
     # identify pairs in upper triangle only (avoid duplicates)
@@ -625,22 +625,18 @@ if (length(pids_rnaseq_only) > 0) {
 # ============================================================
 
 sample_meta_clinical <- clinical_sample_meta %>%
-  left_join(clinical_clean, by = "pid", suffix = c("_rnaseq", "_clinical"))
+  left_join(clinical_clean, by = "pid", suffix = c("_rnaseq", "_clinical")) %>%
+  dplyr::mutate(
+    # Join-Indikator: hat dieser RNA-seq PID irgendeinen Clinical-Match?
+    has_clinical = !is.na(age)  # age ist eine Core-Variable; NA → kein Clinical-Match
+  )
 
-# Validierung: Row count muss identisch sein (kein Expansion)
+# Validierung: Row count muss identisch sein (kein Expansion durch Join)
 stopifnot(nrow(sample_meta_clinical) == nrow(clinical_sample_meta))
 
 # ============================================================
 # POST-JOIN VALIDIERUNG
 # ============================================================
-
-# Join-Indikator: hat dieser RNA-seq PID irgendeinen Clinical-Match?
-sample_meta_clinical <- clinical_sample_meta %>%
-  left_join(clinical_clean %>% dplyr::mutate(has_clinical = TRUE),
-            by = "pid", suffix = c("_rnaseq", "_clinical")) %>%
-  dplyr::mutate(has_clinical = dplyr::if_else(is.na(has_clinical), FALSE, has_clinical))
-
-stopifnot(nrow(sample_meta_clinical) == nrow(clinical_sample_meta))
 
 n_mapped  <- sum(sample_meta_clinical$has_clinical)
 join_rate <- n_mapped / nrow(sample_meta_clinical)
@@ -1077,8 +1073,7 @@ if (file.exists(clinical_deconv_cache_combined)) {
 
   message("\n⏳ Running MCP-counter for validation...")
   message("   Method: enrichment-based (dimensionless scores)")
-  message("   Note: developed/validated mainly for tissue microenvironment; use in
-          blood is a limitation")
+  message("   Note: developed/validated mainly for tissue microenvironment; use in blood is a limitation")
 
   clinical_deconv_mcp <- tryCatch({
     immunedeconv::deconvolute(
@@ -2146,8 +2141,7 @@ message("=== SCHRITT 6: GSVA Pathway-Scores ===")
       message("\n--- GSVA COMPOSITE CREATED ---")
       message("  Samples: ", nrow(clinical_gsva_composite))
       message("  First 3 sample_ids: ", paste(head(clinical_gsva_composite$sample_id, 3), collapse = ", "))
-      message("  First 3 inflammation scores: ", paste(round(head(clinical_gsva_composite$clinical_inflammation_score, 3), 3), collapse
-  = ", "))
+      message("  First 3 inflammation scores: ", paste(round(head(clinical_gsva_composite$clinical_inflammation_score, 3), 3), collapse = ", "))
 
       # Range-Validierung
       message("\n--- COMPOSITE-SCORE RANGE ---")
@@ -2425,7 +2419,7 @@ message("=== SCHRITT 6: GSVA Pathway-Scores ===")
   message("\n--- TRIPLET COMPLETE-CASE DATASET (Sensitivity/Utility subset) ---")
   message("  Samples: ", nrow(sample_meta_clinical_triplets_complete))
   message("  Patients: ", n_distinct(sample_meta_clinical_triplets_complete$pid))
-  message("  Criteria: Complete triplets (A+V1+V2) + age + inflammation_core_score")
+  message("  Criteria: Complete triplets (A+V1+V2) + age + clinical_inflammation_score")
   message("  → This is NOT the primary analysis dataset")
   message("  → Primary models (Step 9+) use ALL available samples (unbalanced OK)")
 
