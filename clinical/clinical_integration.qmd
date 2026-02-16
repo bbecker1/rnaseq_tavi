@@ -5600,7 +5600,1341 @@ message("========================================\n")
 
 ---
 
-# SCHRITT 11: EXPLORATORY ANALYSIS - Survival
+# SCHRITT 11: Transkriptom-weite klinische Integration
+
+**Ziel:** Systematische Prüfung, ob klinische Baseline-Variablen mit dem **gesamten Transkriptom** assoziieren — nicht nur mit dem a-priori definierten Inflammation-Composite-Score (Schritt 9/10).
+
+**Motivation:**
+Die bisherigen Analysen (Schritte 9–10) testen Klinik → GSVA-Composite (3 Pathways) und waren überwiegend nicht signifikant. Hier wird der Suchraum unbiased geöffnet:
+
+- **11a:** Alle 50 Hallmark-Pathways × klinische Variablen (GSVA breit)
+- **11b:** PCA-Achsen × klinische Variablen (unbiased, keine Pathway-Vorselektion)
+
+**Methodische Basis:**
+- Hänzelmann et al. 2013 (GSVA): Sample-level Pathway-Scores
+- Ritchie et al. 2015 (limma): Empirische Bayes-Moderation
+- Kontrolle: BH-FDR innerhalb jeder klinischen Variable über Pathways/PCs
+
+## 11.0 Voraussetzungen: Daten laden
+
+```{r}
+#| label: step11-prereq-load
+#| echo: false
+#| warning: false
+
+message("========================================")
+message("SCHRITT 11: Transkriptom-weite Integration")
+message("========================================\n")
+
+# ============================================================
+# Voraussetzungen: sample_meta_clinical + GSVA + VST laden
+# ============================================================
+
+# --- sample_meta_clinical (aus Step 3/6, oder Cache) ---
+if (!exists("sample_meta_clinical")) {
+  smc_path <- file.path(clinical_cache_dir, "sample_meta_clinical.rds")
+  if (file.exists(smc_path)) {
+    sample_meta_clinical <- readRDS(smc_path)
+    message("✓ sample_meta_clinical aus Cache geladen: ", nrow(sample_meta_clinical), " Samples")
+  } else {
+    stop("❌ sample_meta_clinical nicht gefunden. Bitte Schritte 1–6 ausführen.")
+  }
+}
+
+# --- Volle GSVA-Hallmark-Matrix (50 Pathways × Samples) ---
+gsva_hallmark_full_path <- "../../../res/cache/gsva_hallmark_scores.rds"
+if (!file.exists(gsva_hallmark_full_path)) {
+  stop("❌ GSVA-Hallmark-Cache nicht gefunden: ", gsva_hallmark_full_path,
+       "\n   Bitte DEanalysis.qmd (Chunk gsva-hallmark) ausführen.")
+}
+gsva_hallmark_full <- readRDS(gsva_hallmark_full_path)
+message("✓ GSVA-Hallmark-Matrix geladen: ", nrow(gsva_hallmark_full), " Pathways × ",
+        ncol(gsva_hallmark_full), " Samples")
+
+# --- VST-Matrix (für PCA) ---
+# Zwei mögliche Cache-Dateien (mit/ohne Hash-Suffix)
+vst_candidates <- c(
+  "../../../res/cache/vst_blind_TRUE.rds",
+  list.files("../../../res/cache", pattern = "^vst_blind_TRUE.*\\.rds$", full.names = TRUE)
+)
+vst_candidates <- unique(vst_candidates[file.exists(vst_candidates)])
+
+if (length(vst_candidates) == 0) {
+  message("⚠️ VST-Cache nicht gefunden — PCA-Analyse (11b) wird übersprungen")
+  vst_available <- FALSE
+} else {
+  # Lade die neueste Datei (falls mehrere Versionen existieren)
+  vst_obj <- readRDS(vst_candidates[length(vst_candidates)])
+
+  # Extrahiere Matrix (SummarizedExperiment oder direkt Matrix)
+  if (inherits(vst_obj, "SummarizedExperiment") || inherits(vst_obj, "DESeqTransform")) {
+    vst_mat <- SummarizedExperiment::assay(vst_obj)
+  } else if (is.matrix(vst_obj)) {
+    vst_mat <- vst_obj
+  } else {
+    stop("❌ Unerwartetes Format des VST-Cache: ", class(vst_obj))
+  }
+
+  message("✓ VST-Matrix geladen: ", nrow(vst_mat), " Gene × ", ncol(vst_mat), " Samples")
+  vst_available <- TRUE
+}
+
+# --- Klinische Variablen für systematisches Screening definieren ---
+# Nur Variablen mit ausreichender Varianz/Fallzahl
+clinical_screen_vars <- list(
+  continuous = c("pr_errechnete_gfr_mdrd", "pr_echo_ef_percent", "euroscore_ii_percent", "age", "bmi"),
+  binary     = c("diabetes", "gfr_impaired", "valve_type_grouped", "sex")
+)
+
+# Prüfe Verfügbarkeit in sample_meta_clinical
+avail_cont <- intersect(clinical_screen_vars$continuous, names(sample_meta_clinical))
+avail_bin  <- intersect(clinical_screen_vars$binary, names(sample_meta_clinical))
+
+message(sprintf("\nKlinische Screening-Variablen: %d kontinuierlich, %d binär",
+                length(avail_cont), length(avail_bin)))
+message("  Kontinuierlich: ", paste(avail_cont, collapse = ", "))
+message("  Binär: ", paste(avail_bin, collapse = ", "))
+
+message("\n✓ Voraussetzungen für Schritt 11 erfüllt")
+```
+
+## 11a: Breites GSVA-Hallmark-Screening (50 Pathways × Klinik)
+
+**Fragestellung:** Welche der 50 MSigDB-Hallmark-Pathways assoziieren mit klinischen Baseline-Variablen — jenseits der a-priori definierten Inflammation-Signatur?
+
+**Design:**
+- Pro Pathway × klinische Variable: LMM mit `gsva_score ~ timepoint + clinical_var + (1|pid)`
+- Multiple Testing: BH-FDR pro klinische Variable über 50 Pathways
+- Visualisierung: Heatmap (signierte -log10 p-Werte)
+
+```{r}
+#| label: step11a-gsva-broad-clinical
+#| echo: false
+#| warning: false
+
+message("========================================")
+message("11a: Breites GSVA-Hallmark-Screening")
+message("========================================\n")
+
+# ============================================================
+# Datenaufbereitung: GSVA-Matrix in Long-Format
+# ============================================================
+
+# Transponiere GSVA-Matrix: Samples × Pathways
+gsva_long <- gsva_hallmark_full %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("pathway") %>%
+  tidyr::pivot_longer(
+    cols = -pathway,
+    names_to = "sample_id",
+    values_to = "gsva_score"
+  )
+
+# Merge mit klinischen Daten
+gsva_long <- gsva_long %>%
+  inner_join(
+    sample_meta_clinical %>%
+      dplyr::select(sample_id, pid, timepoint, age, sex,
+                    any_of(c(avail_cont, avail_bin))),
+    by = "sample_id"
+  )
+
+# Timepoint als Faktor sicherstellen
+gsva_long$timepoint <- factor(gsva_long$timepoint, levels = c("A", "V1", "V2"))
+
+n_pathways <- n_distinct(gsva_long$pathway)
+n_samples  <- n_distinct(gsva_long$sample_id)
+n_patients <- n_distinct(gsva_long$pid)
+
+message(sprintf("Daten: %d Pathways × %d Samples (%d Patienten)", n_pathways, n_samples, n_patients))
+message(sprintf("Beobachtungen: %d (long format)", nrow(gsva_long)))
+
+# ============================================================
+# Systematisches Screening: LMM pro Pathway × Klinik-Variable
+# ============================================================
+
+# Sammle alle Ergebnisse
+gsva_broad_results <- list()
+
+# --- Kontinuierliche Variablen ---
+for (cvar in avail_cont) {
+
+  message(sprintf("\n--- Klinische Variable: %s (kontinuierlich) ---", cvar))
+
+  # z-Standardisierung innerhalb der Analyse (Vergleichbarkeit der Effektgrößen)
+  gsva_long[[paste0(cvar, "_z")]] <- as.numeric(scale(gsva_long[[cvar]]))
+
+  # Filtere NAs für diese Variable
+  gsva_sub <- gsva_long %>%
+    filter(!is.na(.data[[paste0(cvar, "_z")]]))
+
+  if (n_distinct(gsva_sub$pid) < 20) {
+    message(sprintf("  ⚠️ SKIPPED: n = %d Patienten (< 20)", n_distinct(gsva_sub$pid)))
+    next
+  }
+
+  cvar_z <- paste0(cvar, "_z")
+  n_ok <- 0
+  n_fail <- 0
+  pw_results <- list()
+
+  for (pw in unique(gsva_sub$pathway)) {
+
+    pw_data <- gsva_sub %>% filter(pathway == pw)
+
+    # LMM: gsva_score ~ timepoint + clinical_var_z + (1|pid)
+    fit <- tryCatch({
+      lmerTest::lmer(
+        as.formula(paste0("gsva_score ~ timepoint + ", cvar_z, " + (1|pid)")),
+        data = pw_data,
+        REML = TRUE,
+        control = lme4::lmerControl(optimizer = "bobyqa", calc.derivs = FALSE)
+      )
+    }, error = function(e) NULL, warning = function(w) {
+      suppressWarnings(
+        lmerTest::lmer(
+          as.formula(paste0("gsva_score ~ timepoint + ", cvar_z, " + (1|pid)")),
+          data = pw_data,
+          REML = TRUE,
+          control = lme4::lmerControl(optimizer = "bobyqa", calc.derivs = FALSE)
+        )
+      )
+    })
+
+    if (is.null(fit)) { n_fail <- n_fail + 1; next }
+
+    # Extrahiere Koeffizienten der klinischen Variable
+    coef_tbl <- tryCatch(
+      broom.mixed::tidy(fit, conf.int = TRUE) %>%
+        filter(effect == "fixed", term == cvar_z),
+      error = function(e) NULL
+    )
+
+    if (is.null(coef_tbl) || nrow(coef_tbl) == 0) { n_fail <- n_fail + 1; next }
+
+    pw_results[[pw]] <- coef_tbl %>%
+      mutate(pathway = pw, clinical_var = cvar, var_type = "continuous",
+             n_obs = nrow(pw_data), n_patients = n_distinct(pw_data$pid))
+
+    n_ok <- n_ok + 1
+  }
+
+  if (length(pw_results) > 0) {
+    pw_df <- bind_rows(pw_results)
+    pw_df$p_adj <- p.adjust(pw_df$p.value, method = "BH")
+    gsva_broad_results[[cvar]] <- pw_df
+    n_sig <- sum(pw_df$p_adj < 0.05, na.rm = TRUE)
+    message(sprintf("  ✓ %d/%d Pathways konvergiert, %d Modelle fehlgeschlagen",
+                    n_ok, n_ok + n_fail, n_fail))
+    message(sprintf("  → %d Pathways FDR < 0.05", n_sig))
+  }
+}
+
+# --- Binäre Variablen ---
+for (bvar in avail_bin) {
+
+  message(sprintf("\n--- Klinische Variable: %s (binär) ---", bvar))
+
+  gsva_sub <- gsva_long %>%
+    filter(!is.na(.data[[bvar]]))
+
+  # Gruppengröße prüfen
+  group_n <- gsva_sub %>%
+    distinct(pid, .keep_all = TRUE) %>%
+    dplyr::count(.data[[bvar]])
+
+  if (any(group_n$n < clinical_params$min_n_per_group)) {
+    message(sprintf("  ⚠️ SKIPPED: Mindestens eine Gruppe n < %d",
+                    clinical_params$min_n_per_group))
+    message("    ", paste(capture.output(print(as.data.frame(group_n))), collapse = "\n    "))
+    next
+  }
+
+  # Sicherstellen: Faktor
+  gsva_sub[[bvar]] <- factor(gsva_sub[[bvar]])
+
+  n_ok <- 0
+  n_fail <- 0
+  pw_results <- list()
+
+  for (pw in unique(gsva_sub$pathway)) {
+
+    pw_data <- gsva_sub %>% filter(pathway == pw)
+
+    fit <- tryCatch({
+      lmerTest::lmer(
+        as.formula(paste0("gsva_score ~ timepoint + ", bvar, " + (1|pid)")),
+        data = pw_data,
+        REML = TRUE,
+        control = lme4::lmerControl(optimizer = "bobyqa", calc.derivs = FALSE)
+      )
+    }, error = function(e) NULL, warning = function(w) {
+      suppressWarnings(
+        lmerTest::lmer(
+          as.formula(paste0("gsva_score ~ timepoint + ", bvar, " + (1|pid)")),
+          data = pw_data,
+          REML = TRUE,
+          control = lme4::lmerControl(optimizer = "bobyqa", calc.derivs = FALSE)
+        )
+      )
+    })
+
+    if (is.null(fit)) { n_fail <- n_fail + 1; next }
+
+    coef_tbl <- tryCatch(
+      broom.mixed::tidy(fit, conf.int = TRUE) %>%
+        filter(effect == "fixed", !term %in% c("(Intercept)", "timepointV1", "timepointV2")),
+      error = function(e) NULL
+    )
+
+    if (is.null(coef_tbl) || nrow(coef_tbl) == 0) { n_fail <- n_fail + 1; next }
+
+    pw_results[[pw]] <- coef_tbl %>%
+      mutate(pathway = pw, clinical_var = bvar, var_type = "binary",
+             n_obs = nrow(pw_data), n_patients = n_distinct(pw_data$pid))
+
+    n_ok <- n_ok + 1
+  }
+
+  if (length(pw_results) > 0) {
+    pw_df <- bind_rows(pw_results)
+    pw_df$p_adj <- p.adjust(pw_df$p.value, method = "BH")
+    gsva_broad_results[[bvar]] <- pw_df
+    n_sig <- sum(pw_df$p_adj < 0.05, na.rm = TRUE)
+    message(sprintf("  ✓ %d/%d Pathways konvergiert, %d Modelle fehlgeschlagen",
+                    n_ok, n_ok + n_fail, n_fail))
+    message(sprintf("  → %d Pathways FDR < 0.05", n_sig))
+  }
+}
+
+# ============================================================
+# Ergebnistabelle zusammenführen und exportieren
+# ============================================================
+
+if (length(gsva_broad_results) > 0) {
+
+  gsva_broad_all <- bind_rows(gsva_broad_results)
+
+  # Kürze Pathway-Namen für Lesbarkeit
+  gsva_broad_all <- gsva_broad_all %>%
+    mutate(pathway_short = gsub("^HALLMARK_", "", pathway))
+
+  # Export
+  write.csv(
+    gsva_broad_all,
+    file.path(clinical_output_dir, "step11a_gsva_broad_clinical_association.csv"),
+    row.names = FALSE
+  )
+  message(sprintf("\n✓ Gespeichert: step11a_gsva_broad_clinical_association.csv (%d Zeilen)", nrow(gsva_broad_all)))
+
+  # ============================================================
+  # Zusammenfassungstabelle: Signifikante Assoziationen
+  # ============================================================
+
+  gsva_sig_summary <- gsva_broad_all %>%
+    filter(p_adj < 0.05) %>%
+    arrange(p_adj) %>%
+    dplyr::select(clinical_var, pathway_short, estimate, conf.low, conf.high, p.value, p_adj, n_patients)
+
+  if (nrow(gsva_sig_summary) > 0) {
+    message(sprintf("\n--- %d signifikante Assoziationen (FDR < 0.05) ---", nrow(gsva_sig_summary)))
+    safe_print(head(gsva_sig_summary, 20))
+  } else {
+    message("\n--- Keine signifikanten Assoziationen (FDR < 0.05) ---")
+    message("Hinweis: Auch bei n = 46 können moderate Effekte unter der FDR-Schwelle bleiben.")
+    message("Nominell signifikante Ergebnisse (p < 0.05, ohne FDR):")
+    gsva_nom_summary <- gsva_broad_all %>%
+      filter(p.value < 0.05) %>%
+      arrange(p.value) %>%
+      dplyr::select(clinical_var, pathway_short, estimate, conf.low, conf.high, p.value, p_adj, n_patients)
+    safe_print(head(gsva_nom_summary, 15))
+  }
+
+  # ============================================================
+  # Heatmap: Pathways × Klinik (signierte -log10 p)
+  # ============================================================
+
+  # Aufbereitung: Pivot zu Matrix (Pathways × Variablen)
+  heatmap_data <- gsva_broad_all %>%
+    mutate(
+      signed_logp = -log10(pmax(p.value, 1e-10)) * sign(estimate)
+    ) %>%
+    dplyr::select(pathway_short, clinical_var, signed_logp) %>%
+    # Bei binären Variablen: nur erste Stufe (nicht-Referenz)
+    distinct(pathway_short, clinical_var, .keep_all = TRUE) %>%
+    tidyr::pivot_wider(
+      names_from = clinical_var,
+      values_from = signed_logp,
+      values_fill = 0
+    ) %>%
+    tibble::column_to_rownames("pathway_short")
+
+  if (ncol(heatmap_data) >= 2 && nrow(heatmap_data) >= 5) {
+
+    # FDR-Markierung: Sternchen-Matrix
+    fdr_matrix <- gsva_broad_all %>%
+      mutate(fdr_star = case_when(
+        p_adj < 0.001 ~ "***",
+        p_adj < 0.01  ~ "**",
+        p_adj < 0.05  ~ "*",
+        TRUE          ~ ""
+      )) %>%
+      distinct(pathway_short, clinical_var, .keep_all = TRUE) %>%
+      dplyr::select(pathway_short, clinical_var, fdr_star) %>%
+      tidyr::pivot_wider(
+        names_from = clinical_var,
+        values_from = fdr_star,
+        values_fill = ""
+      ) %>%
+      tibble::column_to_rownames("pathway_short")
+
+    # Ordne gleich wie Heatmap
+    fdr_matrix <- fdr_matrix[rownames(heatmap_data), colnames(heatmap_data), drop = FALSE]
+
+    # Farbpalette: blau (negativ) → weiß → rot (positiv)
+    heatmap_breaks <- seq(-4, 4, length.out = 101)
+    heatmap_colors <- colorRampPalette(c("#2166AC", "#F7F7F7", "#B2182B"))(100)
+
+    # Begrenze Werte auf [-4, 4] (Skalierung)
+    heatmap_mat <- as.matrix(heatmap_data)
+    heatmap_mat[heatmap_mat > 4]  <- 4
+    heatmap_mat[heatmap_mat < -4] <- -4
+
+    heatmap_file <- file.path(clinical_fig_dir, "step11a_gsva_broad_clinical_heatmap.png")
+
+    png(heatmap_file, width = 10, height = 14, units = "in", res = 150)
+    pheatmap::pheatmap(
+      heatmap_mat,
+      display_numbers = as.matrix(fdr_matrix),
+      fontsize_number = 8,
+      color = heatmap_colors,
+      breaks = heatmap_breaks,
+      cluster_rows = TRUE,
+      cluster_cols = FALSE,
+      border_color = "grey90",
+      fontsize_row = 7,
+      fontsize_col = 9,
+      main = "GSVA Hallmark × Klinische Variablen\n(signiertes -log10 p, * FDR < 0.05)",
+      angle_col = 45
+    )
+    dev.off()
+    message("✓ Heatmap gespeichert: ", basename(heatmap_file))
+
+  } else {
+    message("⚠️ Heatmap übersprungen: zu wenige Variablen/Pathways für sinnvolle Darstellung")
+  }
+
+  # ============================================================
+  # Sensitivity: Top-5 Pathways pro Variable als Spaghetti-Plot
+  # ============================================================
+
+  gsva_top5 <- gsva_broad_all %>%
+    group_by(clinical_var) %>%
+    arrange(p.value) %>%
+    slice_head(n = 5) %>%
+    ungroup()
+
+  if (nrow(gsva_top5) > 0) {
+    write.csv(
+      gsva_top5 %>%
+        dplyr::select(clinical_var, pathway_short, estimate, conf.low, conf.high, p.value, p_adj),
+      file.path(clinical_output_dir, "step11a_gsva_broad_top5_per_variable.csv"),
+      row.names = FALSE
+    )
+    message("✓ Top-5 Pathways pro Variable gespeichert: step11a_gsva_broad_top5_per_variable.csv")
+  }
+
+} else {
+  message("⚠️ Keine GSVA-Screening-Ergebnisse generiert")
+}
+
+message("\n✓ 11a: GSVA-Hallmark-Screening abgeschlossen")
+```
+
+## 11b: PCA × Klinische Variablen
+
+**Fragestellung:** Welche Hauptkomponenten der Gesamtexpression assoziieren mit klinischen Baseline-Variablen?
+
+**Design:**
+- PCA auf VST-Matrix (blind, alle Timepoints)
+- Longitudinal: `PC_k ~ timepoint + clinical_var + (1|pid)` pro PC × Variable
+- Baseline-Querschnitt (nur Zeitpunkt A): `PC_k ~ clinical_var + age + sex`
+- Multiple Testing: BH-FDR über 10 PCs × m Variablen, getrennt nach Modelltyp
+- Interpretation: Top-Loadings der assoziierten PCs (biologische Achsen)
+
+```{r}
+#| label: step11b-pca-clinical
+#| echo: false
+#| warning: false
+
+message("========================================")
+message("11b: PCA × Klinische Variablen")
+message("========================================\n")
+
+if (!vst_available) {
+  message("⚠️ VST-Matrix nicht verfügbar — Analyse übersprungen")
+  message("   Bitte DEanalysis.qmd (VST-Chunk) ausführen und erneut rendern")
+} else {
+
+  # ============================================================
+  # PCA berechnen
+  # ============================================================
+
+  # PCA auf transponierter VST-Matrix (Samples in Zeilen)
+  pca_result <- prcomp(t(vst_mat), center = TRUE, scale. = TRUE)
+
+  # Varianzanteile
+  pca_var_pct <- round(100 * (pca_result$sdev^2 / sum(pca_result$sdev^2)), 2)
+  n_pcs <- min(10, ncol(pca_result$x))  # Maximal 10 PCs
+
+  message(sprintf("PCA: %d Samples, %d Gene", ncol(vst_mat), nrow(vst_mat)))
+  message(sprintf("Top %d PCs erklären %.1f%% der Gesamtvarianz",
+                  n_pcs, sum(pca_var_pct[1:n_pcs])))
+  for (i in 1:min(5, n_pcs)) {
+    message(sprintf("  PC%d: %.1f%%", i, pca_var_pct[i]))
+  }
+
+  # PC-Scores als Dataframe
+  pc_scores <- as.data.frame(pca_result$x[, 1:n_pcs])
+  pc_scores$sample_id <- rownames(pc_scores)
+
+  # Merge mit klinischen Daten
+  pc_clinical <- pc_scores %>%
+    inner_join(
+      sample_meta_clinical %>%
+        dplyr::select(sample_id, pid, timepoint, age, sex,
+                      any_of(c(avail_cont, avail_bin))),
+      by = "sample_id"
+    )
+
+  pc_clinical$timepoint <- factor(pc_clinical$timepoint, levels = c("A", "V1", "V2"))
+
+  message(sprintf("Nach Merge: %d Samples mit klinischen Daten", nrow(pc_clinical)))
+
+  # ============================================================
+  # A) Longitudinale Assoziation: PC ~ timepoint + Klinik + (1|pid)
+  # ============================================================
+
+  message("\n--- A) Longitudinale Modelle ---")
+
+  pca_long_results <- list()
+
+  all_vars <- c(avail_cont, avail_bin)
+
+  for (cvar in all_vars) {
+
+    # Bestimme Variablentyp
+    is_cont <- cvar %in% avail_cont
+
+    # z-Standardisierung für kontinuierliche Variablen
+    if (is_cont) {
+      pc_clinical[[paste0(cvar, "_z")]] <- as.numeric(scale(pc_clinical[[cvar]]))
+      model_var <- paste0(cvar, "_z")
+    } else {
+      pc_clinical[[cvar]] <- factor(pc_clinical[[cvar]])
+      model_var <- cvar
+    }
+
+    pc_sub <- pc_clinical %>%
+      filter(!is.na(.data[[cvar]]))
+
+    # Stichproben-Check
+    if (n_distinct(pc_sub$pid) < 20) next
+
+    for (pc_idx in 1:n_pcs) {
+      pc_name <- paste0("PC", pc_idx)
+
+      fit <- tryCatch({
+        lmerTest::lmer(
+          as.formula(paste0(pc_name, " ~ timepoint + ", model_var, " + (1|pid)")),
+          data = pc_sub,
+          REML = TRUE,
+          control = lme4::lmerControl(optimizer = "bobyqa", calc.derivs = FALSE)
+        )
+      }, error = function(e) NULL)
+
+      if (is.null(fit)) next
+
+      # Koeffizient der klinischen Variable extrahieren
+      coef_tbl <- tryCatch(
+        broom.mixed::tidy(fit, conf.int = TRUE) %>%
+          filter(effect == "fixed",
+                 !term %in% c("(Intercept)", "timepointV1", "timepointV2")),
+        error = function(e) NULL
+      )
+
+      if (is.null(coef_tbl) || nrow(coef_tbl) == 0) next
+
+      pca_long_results[[paste0(cvar, "_", pc_name)]] <- coef_tbl %>%
+        mutate(pc = pc_name, pc_var_pct = pca_var_pct[pc_idx],
+               clinical_var = cvar, var_type = ifelse(is_cont, "continuous", "binary"),
+               model_type = "longitudinal",
+               n_obs = nrow(pc_sub), n_patients = n_distinct(pc_sub$pid))
+    }
+  }
+
+  if (length(pca_long_results) > 0) {
+    pca_long_df <- bind_rows(pca_long_results)
+    pca_long_df$p_adj <- p.adjust(pca_long_df$p.value, method = "BH")
+
+    n_sig_long <- sum(pca_long_df$p_adj < 0.05, na.rm = TRUE)
+    message(sprintf("  %d Tests durchgeführt, %d FDR < 0.05", nrow(pca_long_df), n_sig_long))
+  } else {
+    pca_long_df <- tibble()
+    message("  Keine longitudinalen Ergebnisse")
+  }
+
+  # ============================================================
+  # B) Baseline-Querschnitt (nur Zeitpunkt A): PC ~ Klinik + age + sex
+  # ============================================================
+
+  message("\n--- B) Baseline-Querschnitt (Zeitpunkt A) ---")
+
+  pc_baseline <- pc_clinical %>%
+    filter(timepoint == "A")
+
+  message(sprintf("Baseline-Samples: n = %d", nrow(pc_baseline)))
+
+  pca_baseline_results <- list()
+
+  for (cvar in all_vars) {
+
+    is_cont <- cvar %in% avail_cont
+
+    # Confounders: age + sex (aber nicht, wenn cvar selbst age oder sex ist)
+    confounders <- c()
+    if (cvar != "age" && "age" %in% names(pc_baseline)) confounders <- c(confounders, "age")
+    if (cvar != "sex" && "sex" %in% names(pc_baseline)) confounders <- c(confounders, "sex")
+    covariate_str <- if (length(confounders) > 0) paste0(" + ", paste(confounders, collapse = " + ")) else ""
+
+    if (is_cont) {
+      pc_baseline[[paste0(cvar, "_z")]] <- as.numeric(scale(pc_baseline[[cvar]]))
+      model_var <- paste0(cvar, "_z")
+    } else {
+      pc_baseline[[cvar]] <- factor(pc_baseline[[cvar]])
+      model_var <- cvar
+    }
+
+    pc_sub_bl <- pc_baseline %>%
+      filter(!is.na(.data[[cvar]]))
+
+    if (nrow(pc_sub_bl) < 20) next
+
+    for (pc_idx in 1:n_pcs) {
+      pc_name <- paste0("PC", pc_idx)
+
+      fit_bl <- tryCatch({
+        lm(as.formula(paste0(pc_name, " ~ ", model_var, covariate_str)),
+           data = pc_sub_bl)
+      }, error = function(e) NULL)
+
+      if (is.null(fit_bl)) next
+
+      coef_tbl_bl <- tryCatch(
+        broom::tidy(fit_bl, conf.int = TRUE) %>%
+          filter(!term %in% c("(Intercept)", "age", "sexmale", "sexfemale")),
+        error = function(e) NULL
+      )
+
+      if (is.null(coef_tbl_bl) || nrow(coef_tbl_bl) == 0) next
+
+      pca_baseline_results[[paste0(cvar, "_", pc_name)]] <- coef_tbl_bl %>%
+        mutate(pc = pc_name, pc_var_pct = pca_var_pct[pc_idx],
+               clinical_var = cvar, var_type = ifelse(is_cont, "continuous", "binary"),
+               model_type = "baseline_A",
+               n_obs = nrow(pc_sub_bl), n_patients = nrow(pc_sub_bl))
+    }
+  }
+
+  if (length(pca_baseline_results) > 0) {
+    pca_baseline_df <- bind_rows(pca_baseline_results)
+    pca_baseline_df$p_adj <- p.adjust(pca_baseline_df$p.value, method = "BH")
+
+    n_sig_bl <- sum(pca_baseline_df$p_adj < 0.05, na.rm = TRUE)
+    message(sprintf("  %d Tests durchgeführt, %d FDR < 0.05", nrow(pca_baseline_df), n_sig_bl))
+  } else {
+    pca_baseline_df <- tibble()
+    message("  Keine Baseline-Ergebnisse")
+  }
+
+  # ============================================================
+  # Ergebnisse zusammenführen und exportieren
+  # ============================================================
+
+  pca_all_results <- bind_rows(pca_long_df, pca_baseline_df)
+
+  if (nrow(pca_all_results) > 0) {
+
+    write.csv(
+      pca_all_results,
+      file.path(clinical_output_dir, "step11b_pca_clinical_association.csv"),
+      row.names = FALSE
+    )
+    message(sprintf("\n✓ Gespeichert: step11b_pca_clinical_association.csv (%d Zeilen)", nrow(pca_all_results)))
+
+    # --- Zusammenfassung signifikanter Befunde ---
+    pca_sig <- pca_all_results %>%
+      filter(p_adj < 0.05) %>%
+      arrange(p_adj) %>%
+      dplyr::select(model_type, clinical_var, pc, pc_var_pct, estimate, conf.low, conf.high, p.value, p_adj)
+
+    if (nrow(pca_sig) > 0) {
+      message(sprintf("\n--- %d signifikante PC-Klinik-Assoziationen (FDR < 0.05) ---", nrow(pca_sig)))
+      safe_print(pca_sig)
+    } else {
+      message("\n--- Keine signifikanten PC-Klinik-Assoziationen (FDR < 0.05) ---")
+      message("Nominelle Befunde (p < 0.05):")
+      pca_nom <- pca_all_results %>%
+        filter(p.value < 0.05) %>%
+        arrange(p.value) %>%
+        dplyr::select(model_type, clinical_var, pc, pc_var_pct, estimate, p.value, p_adj)
+      safe_print(head(pca_nom, 15))
+    }
+
+    # ============================================================
+    # Heatmap: PCs × Klinik (signierte -log10 p)
+    # ============================================================
+
+    # Nur longitudinale Ergebnisse für kompakte Darstellung
+    if (nrow(pca_long_df) > 0) {
+
+      pca_heatmap_data <- pca_long_df %>%
+        mutate(signed_logp = -log10(pmax(p.value, 1e-10)) * sign(estimate)) %>%
+        distinct(pc, clinical_var, .keep_all = TRUE) %>%
+        dplyr::select(pc, clinical_var, signed_logp) %>%
+        tidyr::pivot_wider(names_from = clinical_var, values_from = signed_logp, values_fill = 0) %>%
+        tibble::column_to_rownames("pc")
+
+      # FDR-Sternchen
+      pca_fdr_matrix <- pca_long_df %>%
+        mutate(fdr_star = case_when(
+          p_adj < 0.001 ~ "***",
+          p_adj < 0.01  ~ "**",
+          p_adj < 0.05  ~ "*",
+          TRUE          ~ ""
+        )) %>%
+        distinct(pc, clinical_var, .keep_all = TRUE) %>%
+        dplyr::select(pc, clinical_var, fdr_star) %>%
+        tidyr::pivot_wider(names_from = clinical_var, values_from = fdr_star, values_fill = "") %>%
+        tibble::column_to_rownames("pc")
+
+      pca_fdr_matrix <- pca_fdr_matrix[rownames(pca_heatmap_data), colnames(pca_heatmap_data), drop = FALSE]
+
+      pca_heatmap_mat <- as.matrix(pca_heatmap_data)
+      pca_heatmap_mat[pca_heatmap_mat > 4]  <- 4
+      pca_heatmap_mat[pca_heatmap_mat < -4] <- -4
+
+      # Zeilen-Labels mit Varianzanteil
+      pc_labels <- paste0(rownames(pca_heatmap_mat), " (", pca_var_pct[1:nrow(pca_heatmap_mat)], "%)")
+
+      pca_heatmap_file <- file.path(clinical_fig_dir, "step11b_pca_clinical_heatmap.png")
+
+      png(pca_heatmap_file, width = 8, height = 6, units = "in", res = 150)
+      pheatmap::pheatmap(
+        pca_heatmap_mat,
+        display_numbers = as.matrix(pca_fdr_matrix),
+        fontsize_number = 9,
+        color = colorRampPalette(c("#2166AC", "#F7F7F7", "#B2182B"))(100),
+        breaks = seq(-4, 4, length.out = 101),
+        cluster_rows = FALSE,
+        cluster_cols = FALSE,
+        border_color = "grey90",
+        fontsize_row = 9,
+        fontsize_col = 9,
+        labels_row = pc_labels,
+        main = "PCA × Klinische Variablen (longitudinal)\n(signiertes -log10 p, * FDR < 0.05)"
+      )
+      dev.off()
+      message("✓ PCA-Heatmap gespeichert: ", basename(pca_heatmap_file))
+    }
+
+    # ============================================================
+    # Top-Loadings der stärksten PCs: biologische Interpretation
+    # ============================================================
+
+    # Identifiziere PCs mit mindestens einem nominellen Signal
+    pcs_with_signal <- pca_all_results %>%
+      filter(p.value < 0.05) %>%
+      pull(pc) %>%
+      unique()
+
+    if (length(pcs_with_signal) > 0) {
+
+      message(sprintf("\n--- Top-Loadings für %d PCs mit Signal ---", length(pcs_with_signal)))
+
+      loadings_all <- list()
+
+      for (pc_name in pcs_with_signal) {
+        pc_idx <- as.integer(gsub("PC", "", pc_name))
+        pc_loadings <- pca_result$rotation[, pc_idx]
+
+        # Top 50 Gene (nach absolutem Loading)
+        top_idx <- order(abs(pc_loadings), decreasing = TRUE)[1:min(50, length(pc_loadings))]
+
+        loadings_all[[pc_name]] <- tibble(
+          pc = pc_name,
+          gene_id = names(pc_loadings[top_idx]),
+          loading = pc_loadings[top_idx],
+          abs_loading = abs(pc_loadings[top_idx]),
+          direction = ifelse(pc_loadings[top_idx] > 0, "positive", "negative")
+        )
+      }
+
+      loadings_df <- bind_rows(loadings_all)
+
+      write.csv(
+        loadings_df,
+        file.path(clinical_output_dir, "step11b_pca_top_loadings.csv"),
+        row.names = FALSE
+      )
+      message("✓ Top-Loadings gespeichert: step11b_pca_top_loadings.csv")
+
+      # Kurzübersicht
+      for (pc_name in pcs_with_signal) {
+        top5 <- loadings_df %>%
+          filter(pc == pc_name) %>%
+          arrange(desc(abs_loading)) %>%
+          head(5)
+        message(sprintf("  %s Top-5: %s", pc_name, paste(top5$gene_id, collapse = ", ")))
+      }
+
+    } else {
+      message("\nKeine PCs mit nominellem Signal (p < 0.05) — Loadings-Export übersprungen")
+    }
+
+  } else {
+    message("\n⚠️ Keine PCA-Ergebnisse generiert")
+  }
+
+  message("\n✓ 11b: PCA-Klinik-Assoziation abgeschlossen")
+}
+```
+
+```{r}
+#| label: step11-completion
+#| echo: false
+#| warning: false
+
+message("========================================")
+message("✓ TRANSKRIPTOM-WEITE INTEGRATION (SCHRITT 11) COMPLETE")
+message("========================================\n")
+
+# Zusammenfassung der Ergebnisse aus 11a, 11b, 11c
+message("--- Schritt 11 Zusammenfassung ---")
+
+if (exists("gsva_broad_all") && nrow(gsva_broad_all) > 0) {
+  n_gsva_tests <- nrow(gsva_broad_all)
+  n_gsva_fdr   <- sum(gsva_broad_all$p_adj < 0.05, na.rm = TRUE)
+  n_gsva_nom   <- sum(gsva_broad_all$p.value < 0.05, na.rm = TRUE)
+  message(sprintf("11a GSVA breit: %d Tests, %d FDR < 0.05, %d nominal < 0.05",
+                  n_gsva_tests, n_gsva_fdr, n_gsva_nom))
+
+  # FDR-Signal identifizieren
+  if (n_gsva_fdr > 0) {
+    fdr_sig <- gsva_broad_all %>% filter(p_adj < 0.05) %>% arrange(p_adj)
+    message("  → FDR-signifikant: ", paste(fdr_sig$pathway_short, "×", fdr_sig$clinical_var, collapse = ", "))
+  }
+} else {
+  message("11a GSVA breit: nicht ausgeführt oder keine Ergebnisse")
+}
+
+if (exists("pca_all_results") && nrow(pca_all_results) > 0) {
+  n_pca_tests <- nrow(pca_all_results)
+  n_pca_fdr   <- sum(pca_all_results$p_adj < 0.05, na.rm = TRUE)
+  n_pca_nom   <- sum(pca_all_results$p.value < 0.05, na.rm = TRUE)
+  message(sprintf("11b PCA-Klinik: %d Tests, %d FDR < 0.05, %d nominal < 0.05",
+                  n_pca_tests, n_pca_fdr, n_pca_nom))
+} else {
+  message("11b PCA-Klinik: nicht ausgeführt oder keine Ergebnisse")
+}
+
+# 11c Follow-up (PEROXISOME × Sex)
+perox_followup_exists <- file.exists(file.path(clinical_output_dir, "step11c_peroxisome_sex_descriptives.csv"))
+if (perox_followup_exists) {
+  message("11c Follow-up: PEROXISOME × Geschlecht (Cohen's d, Trajektorien, Gene-level, Sensitivität)")
+} else {
+  message("11c Follow-up: nicht ausgeführt")
+}
+
+message("\nOutput-Dateien:")
+step11_files <- list.files(clinical_output_dir, pattern = "^step11")
+step11_figs  <- list.files(clinical_fig_dir, pattern = "^step11")
+for (f in c(step11_files, step11_figs)) message("  → ", f)
+```
+
+## 11c: Follow-up — PEROXISOME × Geschlecht (FDR-signifikanter Befund)
+
+**Befund:** Von 400 GSVA-Tests war **HALLMARK_PEROXISOME × sex** der einzige FDR-korrigierte signifikante Treffer (β = –0.083, FDR = 0.048).
+
+**Biologischer Kontext:**
+Peroxisomen sind zentral für den Lipid-Metabolismus (sehr langkettige Fettsäuren, Plasmalogen-Biosynthese) und zeigen dokumentierte Geschlechtsunterschiede (Lodhi & Semenkovich 2014, Cell Metab).
+
+**Ziel dieser Follow-up-Analyse:**
+1. Effektgröße quantifizieren (Cohen's d)
+2. Trajektorien visualisieren (Konstanz über Zeit prüfen)
+3. Gene-level Treiber identifizieren
+4. Sensitivität nach Adjustierung für Age/BMI
+
+```{r}
+#| label: step11c-followup-peroxisome-effect-size
+#| echo: false
+#| warning: false
+
+message("========================================")
+message("11c: Follow-up PEROXISOME × Geschlecht")
+message("========================================\n")
+
+# ============================================================
+# A) Effektgröße & deskriptive Statistik
+# ============================================================
+
+message("--- A) Effektgröße (Cohen's d) ---\n")
+
+# Lade GSVA-Matrix
+gsva_hallmark_full_path <- "../../../res/cache/gsva_hallmark_scores.rds"
+if (!file.exists(gsva_hallmark_full_path)) {
+  stop("❌ GSVA-Cache nicht gefunden: ", gsva_hallmark_full_path)
+}
+gsva_full <- readRDS(gsva_hallmark_full_path)
+
+# Extrahiere Peroxisom-Score
+perox_score <- gsva_full["HALLMARK_PEROXISOME", ]
+
+# Merge mit klinischen Daten
+perox_data <- data.frame(
+  sample_id = names(perox_score),
+  perox_gsva = as.numeric(perox_score),
+  stringsAsFactors = FALSE
+) %>%
+  inner_join(
+    sample_meta_clinical %>%
+      dplyr::select(sample_id, pid, timepoint, sex, age, any_of("bmi")),
+    by = "sample_id"
+  ) %>%
+  filter(!is.na(sex), !is.na(perox_gsva))
+
+perox_data$timepoint <- factor(perox_data$timepoint, levels = c("A", "V1", "V2"))
+
+message(sprintf("Daten: %d Samples, %d Patienten",
+                nrow(perox_data), n_distinct(perox_data$pid)))
+
+# Deskriptive Statistik nach Geschlecht (gepooled über Timepoints)
+perox_summary <- perox_data %>%
+  group_by(sex) %>%
+  summarise(
+    n_samples = n(),
+    n_patients = n_distinct(pid),
+    mean_perox = mean(perox_gsva, na.rm = TRUE),
+    sd_perox = sd(perox_gsva, na.rm = TRUE),
+    median_perox = median(perox_gsva, na.rm = TRUE),
+    q25 = quantile(perox_gsva, 0.25, na.rm = TRUE),
+    q75 = quantile(perox_gsva, 0.75, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+message("Deskriptive Statistik (Peroxisom-Score nach Geschlecht):")
+safe_print(perox_summary)
+
+# Cohen's d (Effektgröße)
+perox_male <- perox_data %>% filter(sex == "male") %>% pull(perox_gsva)
+perox_female <- perox_data %>% filter(sex == "female") %>% pull(perox_gsva)
+
+cohens_d_result <- effectsize::cohens_d(perox_male, perox_female)
+
+message(sprintf("\nCohen's d (male vs female): %.3f, 95%% CI [%.3f, %.3f]",
+                cohens_d_result$Cohens_d,
+                cohens_d_result$CI_low,
+                cohens_d_result$CI_high))
+
+# Interpretation nach Cohen (1988)
+d_abs <- abs(cohens_d_result$Cohens_d)
+if (d_abs < 0.2) {
+  d_interp <- "klein (|d| < 0.2)"
+} else if (d_abs < 0.5) {
+  d_interp <- "klein bis mittel (0.2 ≤ |d| < 0.5)"
+} else if (d_abs < 0.8) {
+  d_interp <- "mittel (0.5 ≤ |d| < 0.8)"
+} else {
+  d_interp <- "groß (|d| ≥ 0.8)"
+}
+message(sprintf("  → Effektgröße: %s", d_interp))
+
+# Export
+write.csv(
+  perox_summary,
+  file.path(clinical_output_dir, "step11c_peroxisome_sex_descriptives.csv"),
+  row.names = FALSE
+)
+message("\n✓ Gespeichert: step11c_peroxisome_sex_descriptives.csv")
+```
+
+```{r}
+#| label: step11c-followup-peroxisome-trajectories
+#| echo: false
+#| warning: false
+
+message("\n--- B) Trajektorien-Plot (Konstanz über Zeit prüfen) ---\n")
+
+# Aggregiere zu Mittelwert ± SE pro Timepoint × Sex
+perox_traj <- perox_data %>%
+  group_by(timepoint, sex) %>%
+  summarise(
+    n = n(),
+    mean_perox = mean(perox_gsva, na.rm = TRUE),
+    sd_perox = sd(perox_gsva, na.rm = TRUE),
+    se_perox = sd_perox / sqrt(n),
+    .groups = "drop"
+  )
+
+message("Trajektorien-Daten:")
+safe_print(perox_traj)
+
+# Plot: Linien mit Fehlerbalken
+library(ggplot2)
+
+p_perox_traj <- ggplot(perox_traj, aes(x = timepoint, y = mean_perox,
+                                        group = sex, color = sex)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 3.5) +
+  geom_errorbar(aes(ymin = mean_perox - se_perox,
+                    ymax = mean_perox + se_perox),
+                width = 0.15, size = 0.9) +
+  scale_color_manual(
+    values = c("male" = "#2166AC", "female" = "#B2182B"),
+    labels = c("male" = "Männer", "female" = "Frauen")
+  ) +
+  labs(
+    title = "HALLMARK_PEROXISOME × Geschlecht",
+    subtitle = "Mittelwert ± SE pro Zeitpunkt (FDR = 0.048)",
+    x = "Zeitpunkt",
+    y = "GSVA-Score (Peroxisom-Aktivität)",
+    color = "Geschlecht"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 11, color = "grey30")
+  )
+
+traj_file <- file.path(clinical_fig_dir, "step11c_peroxisome_sex_trajectories.png")
+ggsave(traj_file, p_perox_traj, width = 7, height = 5.5, dpi = 150)
+
+message("✓ Trajektorien-Plot gespeichert: ", basename(traj_file))
+
+# Interpretation
+male_range <- perox_traj %>% filter(sex == "male") %>% pull(mean_perox) %>% range()
+female_range <- perox_traj %>% filter(sex == "female") %>% pull(mean_perox) %>% range()
+lines_parallel <- all(perox_traj %>%
+                      group_by(timepoint) %>%
+                      summarise(diff = diff(mean_perox)) %>%
+                      pull(diff) %>%
+                      abs() %>%
+                      diff() %>%
+                      abs() < 0.02)
+
+if (lines_parallel) {
+  message("  → Linien verlaufen parallel → Geschlechtsunterschied ist zeitkonstant")
+} else {
+  message("  → Linien nicht parallel → mögliche Interaktion mit Zeitverlauf")
+}
+```
+
+```{r}
+#| label: step11c-followup-peroxisome-gene-level
+#| echo: false
+#| warning: false
+
+message("\n--- C) Gene-level Treiber identifizieren ---\n")
+
+# Lade Peroxisom-Geneset
+library(msigdbr)
+perox_genes <- msigdbr(species = "Homo sapiens", category = "H") %>%
+  filter(gs_name == "HALLMARK_PEROXISOME") %>%
+  pull(gene_symbol) %>%
+  unique()
+
+message(sprintf("HALLMARK_PEROXISOME: %d Gene im MSigDB", length(perox_genes)))
+
+# VST-Matrix laden (aus 11b, oder neu)
+if (!exists("vst_mat")) {
+  vst_candidates <- c(
+    "../../../res/cache/vst_blind_TRUE.rds",
+    list.files("../../../res/cache", pattern = "^vst_blind_TRUE.*\\.rds$", full.names = TRUE)
+  )
+  vst_candidates <- unique(vst_candidates[file.exists(vst_candidates)])
+
+  if (length(vst_candidates) == 0) {
+    message("⚠️ VST-Matrix nicht verfügbar — Gene-level-Analyse übersprungen")
+    vst_available_gene <- FALSE
+  } else {
+    vst_obj <- readRDS(vst_candidates[length(vst_candidates)])
+    if (inherits(vst_obj, "SummarizedExperiment") || inherits(vst_obj, "DESeqTransform")) {
+      vst_mat <- SummarizedExperiment::assay(vst_obj)
+    } else if (is.matrix(vst_obj)) {
+      vst_mat <- vst_obj
+    } else {
+      stop("❌ Unerwartetes VST-Format")
+    }
+    vst_available_gene <- TRUE
+  }
+} else {
+  vst_available_gene <- TRUE
+}
+
+if (vst_available_gene) {
+
+  # VST-Matrix nutzt Ensembl-IDs → Mapping nötig
+  # Rownames: z.B. "ENSG00000000003.16"
+  # Entferne Versionsnummern für Mapping
+  vst_ensembl <- gsub("\\..*$", "", rownames(vst_mat))
+  names(vst_ensembl) <- rownames(vst_mat)
+
+  # Mapping: Ensembl → Gene Symbol via org.Hs.eg.db
+  ensembl_to_symbol <- tryCatch({
+    suppressMessages(
+      AnnotationDbi::select(
+        org.Hs.eg.db,
+        keys = unique(vst_ensembl),
+        columns = c("SYMBOL"),
+        keytype = "ENSEMBL"
+      )
+    )
+  }, error = function(e) {
+    message("⚠️ Gene-Annotation fehlgeschlagen: ", conditionMessage(e))
+    NULL
+  })
+
+  if (is.null(ensembl_to_symbol) || nrow(ensembl_to_symbol) == 0) {
+    message("⚠️ Ensembl→Symbol Mapping fehlgeschlagen — Gene-level übersprungen")
+    vst_available_gene <- FALSE
+  }
+}
+
+if (vst_available_gene) {
+
+  # Erstelle Lookup: Gene Symbol → Ensembl-ID (in VST-Matrix)
+  symbol_to_vst_row <- data.frame(
+    ensembl_id = vst_ensembl,
+    vst_row = names(vst_ensembl),
+    stringsAsFactors = FALSE
+  ) %>%
+    left_join(ensembl_to_symbol, by = c("ensembl_id" = "ENSEMBL")) %>%
+    filter(!is.na(SYMBOL))
+
+  # Finde Peroxisom-Gene in VST (via Symbol-Mapping)
+  perox_genes_mapped <- symbol_to_vst_row %>%
+    filter(SYMBOL %in% perox_genes)
+
+  message(sprintf("  → %d/%d Gene in VST-Matrix gefunden (via Ensembl-Mapping)",
+                  n_distinct(perox_genes_mapped$SYMBOL), length(perox_genes)))
+
+  if (nrow(perox_genes_mapped) < 5) {
+    message("⚠️ Zu wenige Peroxisom-Gene verfügbar (<5) — Gene-level übersprungen")
+  } else {
+
+    # Extrahiere VST-Werte für diese Gene
+    perox_expr <- vst_mat[perox_genes_mapped$vst_row, , drop = FALSE]
+
+    # Behandle duplicate Symbole (falls ein Symbol mehrere Ensembl-IDs hat)
+    # → Nimm Median pro Symbol über duplicate IDs
+    if (any(duplicated(perox_genes_mapped$SYMBOL))) {
+      message(sprintf("  ⚠️ %d duplicate Gene-Symbole → Median über Ensembl-IDs berechnet",
+                      sum(duplicated(perox_genes_mapped$SYMBOL))))
+
+      perox_expr_agg <- lapply(unique(perox_genes_mapped$SYMBOL), function(sym) {
+        rows <- perox_genes_mapped$vst_row[perox_genes_mapped$SYMBOL == sym]
+        if (length(rows) == 1) {
+          perox_expr[rows, ]
+        } else {
+          # Median über Zeilen (Gene mit gleichem Symbol)
+          apply(perox_expr[rows, , drop = FALSE], 2, median, na.rm = TRUE)
+        }
+      })
+      perox_expr <- do.call(rbind, perox_expr_agg)
+      rownames(perox_expr) <- unique(perox_genes_mapped$SYMBOL)
+    } else {
+      rownames(perox_expr) <- perox_genes_mapped$SYMBOL
+    }
+
+    message(sprintf("  → %d unique Gene für Tests verfügbar", nrow(perox_expr)))
+
+    # Gene-level Tests: male vs female (t-Test, gepooled über Timepoints)
+    perox_gene_tests <- lapply(rownames(perox_expr), function(gene) {
+
+      gene_data <- data.frame(
+        sample_id = colnames(perox_expr),
+        expr = perox_expr[gene, ],
+        stringsAsFactors = FALSE
+      ) %>%
+        inner_join(
+          sample_meta_clinical %>% dplyr::select(sample_id, sex),
+          by = "sample_id"
+        ) %>%
+        filter(!is.na(sex), !is.na(expr))
+
+      # t-Test
+      test_res <- tryCatch(
+        t.test(expr ~ sex, data = gene_data),
+        error = function(e) NULL
+      )
+
+      if (is.null(test_res)) return(NULL)
+
+      tibble(
+        gene = gene,
+        mean_male = mean(gene_data$expr[gene_data$sex == "male"], na.rm = TRUE),
+        mean_female = mean(gene_data$expr[gene_data$sex == "female"], na.rm = TRUE),
+        diff = mean_male - mean_female,
+        t_stat = test_res$statistic,
+        p_value = test_res$p.value,
+        n_male = sum(gene_data$sex == "male"),
+        n_female = sum(gene_data$sex == "female")
+      )
+    }) %>%
+      bind_rows()
+
+    # FDR-Korrektur über alle Peroxisom-Gene
+    perox_gene_tests$p_adj <- p.adjust(perox_gene_tests$p_value, method = "BH")
+
+    # Sortiere nach adjustiertem p-Wert
+    perox_gene_tests <- perox_gene_tests %>%
+      arrange(p_adj)
+
+    # Top-10 Treiber
+    perox_top_drivers <- perox_gene_tests %>%
+      head(10)
+
+    message("Top-10 Gene mit stärkstem Geschlechtsunterschied (Peroxisom-Pathway):")
+    safe_print(perox_top_drivers[, c("gene", "diff", "p_value", "p_adj")])
+
+    # Export
+    write.csv(
+      perox_gene_tests,
+      file.path(clinical_output_dir, "step11c_peroxisome_gene_level_sex.csv"),
+      row.names = FALSE
+    )
+    message("\n✓ Gespeichert: step11c_peroxisome_gene_level_sex.csv")
+
+    # Zusammenfassung
+    n_sig_genes <- sum(perox_gene_tests$p_adj < 0.05, na.rm = TRUE)
+    message(sprintf("  → %d/%d Gene FDR < 0.05 (Geschlechtsunterschied)",
+                    n_sig_genes, nrow(perox_gene_tests)))
+
+    if (n_sig_genes > 0) {
+      sig_genes <- perox_gene_tests %>%
+        filter(p_adj < 0.05) %>%
+        pull(gene)
+      message(sprintf("  → Signifikante Gene: %s", paste(sig_genes, collapse = ", ")))
+    }
+  }
+}
+```
+
+```{r}
+#| label: step11c-followup-peroxisome-sensitivity
+#| echo: false
+#| warning: false
+
+message("\n--- D) Sensitivitätsanalyse: Adjustierung für Age/BMI ---\n")
+
+# Prüfe, ob Sex-Effekt nach Kontrolle für Age (und optional BMI) bestehen bleibt
+
+# Bereite Daten vor (vollständige Fälle mit Age)
+perox_sens <- perox_data %>%
+  filter(!is.na(age), !is.na(sex), !is.na(perox_gsva))
+
+# Optional: BMI hinzufügen (falls verfügbar)
+has_bmi <- "bmi" %in% names(perox_sens)
+if (has_bmi) {
+  perox_sens <- perox_sens %>%
+    filter(!is.na(bmi)) %>%
+    mutate(bmi_z = as.numeric(scale(bmi)))
+  message(sprintf("Sensitivitäts-Daten: %d Samples (mit Age + BMI)", nrow(perox_sens)))
+} else {
+  message(sprintf("Sensitivitäts-Daten: %d Samples (mit Age, BMI nicht verfügbar)", nrow(perox_sens)))
+}
+
+if (nrow(perox_sens) < 30) {
+  message("⚠️ SKIPPED: Zu wenige Samples für Sensitivitätsanalyse (n < 30)")
+} else {
+
+  # Modell 1: Mit Sex + Age (+ BMI falls verfügbar)
+  if (has_bmi) {
+    formula_full <- as.formula("perox_gsva ~ timepoint + sex + age + bmi_z + (1|pid)")
+    model_with_sex <- lmerTest::lmer(formula_full, data = perox_sens, REML = TRUE)
+    covar_str <- "Age + BMI"
+  } else {
+    formula_full <- as.formula("perox_gsva ~ timepoint + sex + age + (1|pid)")
+    model_with_sex <- lmerTest::lmer(formula_full, data = perox_sens, REML = TRUE)
+    covar_str <- "Age"
+  }
+
+  # Modell 2: Ohne Sex (nur Confounders)
+  if (has_bmi) {
+    formula_reduced <- as.formula("perox_gsva ~ timepoint + age + bmi_z + (1|pid)")
+  } else {
+    formula_reduced <- as.formula("perox_gsva ~ timepoint + age + (1|pid)")
+  }
+  model_without_sex <- lmerTest::lmer(formula_reduced, data = perox_sens, REML = TRUE)
+
+  # Likelihood-Ratio-Test
+  lr_test <- anova(model_without_sex, model_with_sex)
+
+  message(sprintf("Likelihood-Ratio-Test: Sex-Effekt nach Adjustierung für %s", covar_str))
+  message(sprintf("  Chi² = %.3f, df = %d, p = %.4f",
+                  lr_test$Chisq[2], lr_test$Df[2], lr_test$`Pr(>Chisq)`[2]))
+
+  # Koeffizienten des vollen Modells
+  coef_full <- broom.mixed::tidy(model_with_sex, conf.int = TRUE) %>%
+    filter(effect == "fixed", grepl("sex", term))
+
+  if (nrow(coef_full) > 0) {
+    message(sprintf("\nSex-Koeffizient (adjustiert für %s):", covar_str))
+    message(sprintf("  β = %.3f, 95%% CI [%.3f, %.3f], p = %.4f",
+                    coef_full$estimate, coef_full$conf.low,
+                    coef_full$conf.high, coef_full$p.value))
+
+    # Vergleich mit univariatem Effekt (aus 11a)
+    univariate_beta <- -0.083  # Aus Haupt-GSVA-Screening
+    beta_change_pct <- 100 * (coef_full$estimate - univariate_beta) / abs(univariate_beta)
+
+    message(sprintf("  → Veränderung vs. univariat (β = %.3f): %.1f%%",
+                    univariate_beta, beta_change_pct))
+
+    if (abs(beta_change_pct) < 10) {
+      message("    Interpretation: Effekt stabil, unabhängig von Confoundern")
+    } else if (abs(beta_change_pct) < 30) {
+      message("    Interpretation: Moderate Abschwächung, partielle Mediation möglich")
+    } else {
+      message("    Interpretation: Starke Abschwächung, Confounder-Effekt wahrscheinlich")
+    }
+  }
+
+  # Export Sensitivitätsergebnisse
+  sens_summary <- tibble(
+    model = c("Univariat (aus 11a)", sprintf("Adjustiert (%s)", covar_str)),
+    beta = c(univariate_beta, coef_full$estimate),
+    conf_low = c(-0.1303415, coef_full$conf.low),
+    conf_high = c(-0.03561698, coef_full$conf.high),
+    p_value = c(0.0009691508, coef_full$p.value),
+    n_samples = c(nrow(perox_data), nrow(perox_sens))
+  )
+
+  write.csv(
+    sens_summary,
+    file.path(clinical_output_dir, "step11c_peroxisome_sex_sensitivity.csv"),
+    row.names = FALSE
+  )
+  message("\n✓ Gespeichert: step11c_peroxisome_sex_sensitivity.csv")
+}
+
+message("\n✓ 11c: Follow-up PEROXISOME × Geschlecht abgeschlossen")
+```
+
+---
+
+# SCHRITT 12: EXPLORATORY ANALYSIS - Survival
 
 **Status: DEACTIVATED (Überlebens-/Outcome-Daten noch nicht verfügbar)**
 
@@ -5631,13 +6965,13 @@ Sind baseline-nahe Inflammationsmarker (GSVA, MLR) mit klinischen Outcomes assoz
 - Ergebnisse benötigen externe Validierung
 
 ```{r}
-#| label: step11-survival-DEACTIVATED
+#| label: step12-survival-DEACTIVATED
 #| echo: false
 #| warning: false
 #| eval: false
 
 message("\n========================================")
-message("SCHRITT 11: SURVIVAL ANALYSIS (EXPLORATORY)")
+message("SCHRITT 12: SURVIVAL ANALYSIS (EXPLORATORY)")
 message("⚠️  STATUS: DEACTIVATED - Data pending")
 message("========================================\n")
 
@@ -5983,7 +7317,8 @@ clinical_steps_completed <- c(
   "8. Table 1" = file.exists(file.path(clinical_output_dir, "table1_clinical_characteristics.csv")),
   "9. Primary Analysis" = file.exists(file.path(clinical_cache_dir, "primary_model.rds")),
   "10. Secondary Analyses" = file.exists(file.path(clinical_output_dir, "secondary_ef_summary.csv")),
-  "11. Exploratory (Survival)" = file.exists(file.path(clinical_cache_dir, "exploratory_survival_results.rds"))
+  "11. Transkriptom-weite Integration" = file.exists(file.path(clinical_output_dir, "step11a_gsva_broad_clinical_association.csv")),
+  "12. Exploratory (Survival)" = file.exists(file.path(clinical_cache_dir, "exploratory_survival_results.rds"))
 )
 
 message("\n--- COMPLETED STEPS ---")
@@ -5994,7 +7329,7 @@ for (step_name in names(clinical_steps_completed)) {
 
 # Zähle abgeschlossene Schritte
 n_completed <- sum(clinical_steps_completed)
-message(sprintf("\n✓ %d/11 Schritte abgeschlossen", n_completed))
+message(sprintf("\n✓ %d/12 Schritte abgeschlossen", n_completed))
 
 # Output-Files
 message("\n--- OUTPUT FILES ---")
@@ -6013,17 +7348,19 @@ if (dir.exists(clinical_fig_dir)) {
 message("\n=== NEXT STEPS ===")
 message("1. Review Primary Analysis (GSVA Inflammation Timecourse)")
 message("2. Review Secondary Analyses (EF, MLR)")
-message("3. Check Figures in: ", clinical_fig_dir)
-message("4. Activate Lab Analysis (Schritt 10) when data available")
-message("5. Activate Survival Analysis (Schritt 11) when follow-up data available")
+message("3. Review Transkriptom-weite Integration (Schritt 11: GSVA breit, PCA)")
+message("4. Check Figures in: ", clinical_fig_dir)
+message("5. Activate Lab Analysis (Schritt 10) when data available")
+message("6. Activate Survival Analysis (Schritt 12) when follow-up data available")
 
 message("\n⚠️  IMPORTANT NOTE ⚠️")
 message("Note: Observational study – associations do not imply causality.")
 message("All findings require external validation before clinical application.")
 
-message("\n✓ CLINICAL INTEGRATION abgeschlossen (Schritte 1-11)")
-message("   Primary: 1 confirmatory endpoint")
+message("\n✓ CLINICAL INTEGRATION abgeschlossen (Schritte 1-12)")
+message("   Primary: 1 confirmatory endpoint (Inflammation Timecourse)")
 message("   Secondary: 2 active (EF, MLR) + 1 deactivated (Lab)")
+message("   Transkriptom-weit: GSVA breit (11a), PCA × Klinik (11b), Follow-up PEROXISOME × Sex (11c)")
 message("   Exploratory: 1 deactivated (Survival)")
 ```
 
