@@ -6410,6 +6410,364 @@ if (!vst_available) {
 }
 ```
 
+## 11b2: Einzelgen-Assoziationen × Klinische Variablen (MVP-1)
+
+**Strategie:** Teste hochvariable Gene (Top 5000 nach Varianz) gegen klinische Prädiktoren, um transkriptom-weite Assoziationen jenseits von Pathway-Aggregaten zu identifizieren.
+
+**Methodik:**
+- LMM pro Gen: `gene_expr ~ timepoint + clinical_var_z + (1|pid)`
+- FDR-Korrektur innerhalb jeder klinischen Variable
+- Fokus auf kontinuierliche Variablen (stärkere Power)
+
+```{r}
+#| label: step11b2-single-gene-clinical
+#| echo: false
+#| warning: false
+
+if (exists("vst_mat") && exists("sample_meta_clinical")) {
+
+  message("\n=== 11b2: Einzelgen × Klinische Variablen ===\n")
+
+  # 1. Hochvariable Gene identifizieren (Top 5000)
+  gene_vars <- apply(vst_mat, 1, stats::var, na.rm = TRUE)
+  top_var_genes <- names(sort(gene_vars, decreasing = TRUE)[1:min(5000, length(gene_vars))])
+
+  message(sprintf("Hochvariable Gene für Tests: %d (aus %d total)",
+                  length(top_var_genes), nrow(vst_mat)))
+
+  # 2. VST-Subset für hochvariable Gene
+  vst_hvg <- vst_mat[top_var_genes, ]
+
+  # 3. Definiere klinische Screening-Variablen (kontinuierlich bevorzugt)
+  clinical_vars_continuous <- c("age", "bmi", "pr_errechnete_GFR_MDRD",
+                                "Log_Euroscore_II", "pr_Echo_EF_percent")
+  clinical_vars_binary <- c("male", "diabetes", "dyslipedemia", "hypertension",
+                            "Atrial_Fibrillation_Flutter", "COPD", "pAVK")
+
+  # Alle verfügbaren Variablen filtern (case-sensitive check)
+  available_clinical <- intersect(
+    c(clinical_vars_continuous, clinical_vars_binary),
+    names(sample_meta_clinical)
+  )
+
+  # Falls keine direkten Matches: versuche case-insensitive
+  if (length(available_clinical) < 3) {
+    meta_names <- names(sample_meta_clinical)
+    available_clinical <- c()
+    for (clin_var_name in c(clinical_vars_continuous, clinical_vars_binary)) {
+      match_idx <- which(tolower(meta_names) == tolower(clin_var_name))
+      if (length(match_idx) > 0) {
+        available_clinical <- c(available_clinical, meta_names[match_idx[1]])
+      }
+    }
+    available_clinical <- unique(available_clinical)
+  }
+
+  message(sprintf("Klinische Variablen für Tests: %d", length(available_clinical)))
+  message("  → ", paste(available_clinical, collapse = ", "))
+
+  # 4. Prepare clinical data mit standardisierten kontinuierlichen Variablen
+  # Identifiziere welche verfügbaren Variablen kontinuierlich sind
+  available_continuous <- intersect(clinical_vars_continuous, available_clinical)
+
+  clinical_screening_data <- sample_meta_clinical %>%
+    dplyr::select(sample_id, pid, timepoint, all_of(available_clinical))
+
+  # Standardisiere nur kontinuierliche Variablen
+  if (length(available_continuous) > 0) {
+    for (cont_var in available_continuous) {
+      clinical_screening_data[[paste0(cont_var, "_z")]] <- as.numeric(scale(clinical_screening_data[[cont_var]]))
+    }
+  }
+
+  # 5. Gene-Level Tests (parallelisiert über Gene für Effizienz)
+  library(lme4)
+  library(lmerTest)
+  library(broom.mixed)
+
+  message("\n--- Einzelgen-Tests laufen (kann mehrere Minuten dauern) ---")
+
+  # Container für Ergebnisse
+  gene_clinical_results <- list()
+
+  # Funktion: Test für ein Gen × eine klinische Variable
+  test_gene_clinical <- function(gene_id, gene_expr, clinical_var, clin_data) {
+
+    # Merge Expression + Klinische Daten
+    test_data <- data.frame(
+      sample_id = names(gene_expr),
+      gene_expr = gene_expr,
+      stringsAsFactors = FALSE
+    )
+
+    test_data <- merge(test_data, clin_data, by = "sample_id", all.x = FALSE)
+
+    # Entferne NA in timepoint/pid
+    test_data <- test_data[!is.na(test_data$timepoint) & !is.na(test_data$pid), ]
+
+    # Variable Name (mit _z suffix falls standardisiert)
+    var_name <- if (paste0(clinical_var, "_z") %in% names(test_data)) {
+      paste0(clinical_var, "_z")
+    } else {
+      clinical_var
+    }
+
+    # Prüfe ob Variable existiert
+    if (!var_name %in% names(test_data)) return(NULL)
+
+    # Vollständige Fälle (explizit ohne dplyr NSE)
+    complete_cases <- !is.na(test_data[[var_name]]) & !is.na(test_data$gene_expr)
+    test_data <- test_data[complete_cases, ]
+
+    # Mindestens 30 Samples erforderlich
+    if (nrow(test_data) < 30) return(NULL)
+
+    # LMM - verwende explizite data.frame column references
+    tryCatch({
+
+      # Baue Daten-Frame für Modell (nur benötigte Spalten)
+      model_data <- data.frame(
+        gene_expr = test_data$gene_expr,
+        timepoint = test_data$timepoint,
+        pid = test_data$pid,
+        clinical_predictor = test_data[[var_name]],
+        stringsAsFactors = FALSE
+      )
+
+      # Fit Modell mit fixem Variablennamen
+      model <- lmer(gene_expr ~ timepoint + clinical_predictor + (1|pid),
+                    data = model_data,
+                    REML = TRUE)
+
+      # Koeffizienten extrahieren
+      coefs <- broom.mixed::tidy(model, conf.int = TRUE)
+      coefs_clin <- coefs[coefs$effect == "fixed" & coefs$term == "clinical_predictor", ]
+
+      if (nrow(coefs_clin) == 0) return(NULL)
+
+      # Rückgabe
+      data.frame(
+        gene_id = gene_id,
+        clinical_var = clinical_var,
+        estimate = coefs_clin$estimate,
+        std.error = coefs_clin$std.error,
+        statistic = coefs_clin$statistic,
+        p.value = coefs_clin$p.value,
+        conf.low = coefs_clin$conf.low,
+        conf.high = coefs_clin$conf.high,
+        n_samples = nrow(model_data),
+        stringsAsFactors = FALSE
+      )
+
+    }, error = function(e) NULL)
+  }
+
+  # Loop über klinische Variablen (pro Variable FDR-Korrektur)
+  for (clin_var in available_clinical) {
+
+    message(sprintf("\n  Testing: %s (%d/%d)",
+                    clin_var,
+                    which(available_clinical == clin_var),
+                    length(available_clinical)))
+
+    # Teste alle hochvariablen Gene gegen diese Variable
+    results_per_var <- lapply(top_var_genes, function(gene_id) {
+      test_gene_clinical(gene_id, vst_hvg[gene_id, ], clin_var, clinical_screening_data)
+    }) %>%
+      bind_rows()
+
+    if (is.null(results_per_var) || nrow(results_per_var) == 0) {
+      message(sprintf("    → Keine Ergebnisse für %s", clin_var))
+      next
+    }
+
+    # FDR-Korrektur über alle Gene für diese Variable
+    results_per_var$p_adj <- p.adjust(results_per_var$p.value, method = "BH")
+
+    # Speichere Ergebnisse
+    gene_clinical_results[[clin_var]] <- results_per_var
+
+    # Log Summary
+    n_fdr <- sum(results_per_var$p_adj < 0.05, na.rm = TRUE)
+    n_nom <- sum(results_per_var$p.value < 0.05, na.rm = TRUE)
+    message(sprintf("    → Tests: %d, FDR<0.05: %d, nominal<0.05: %d",
+                    nrow(results_per_var), n_fdr, n_nom))
+  }
+
+  # 6. Kombiniere alle Ergebnisse
+  gene_clinical_all <- bind_rows(gene_clinical_results) %>%
+    arrange(clinical_var, p_adj)
+
+  message(sprintf("\n✓ Alle Tests abgeschlossen: %d Gen-Klinik-Assoziationen",
+                  nrow(gene_clinical_all)))
+
+  # 7. Export: Vollständige Ergebnisse
+  write.csv(
+    gene_clinical_all,
+    file.path(clinical_output_dir, "step11b2_single_gene_clinical_all.csv"),
+    row.names = FALSE
+  )
+  message("✓ Gespeichert: step11b2_single_gene_clinical_all.csv")
+
+  # 8. Export: Top-Hits (FDR < 0.1 ODER Top 50 pro Variable)
+  gene_clinical_top <- gene_clinical_all %>%
+    group_by(clinical_var) %>%
+    mutate(rank = row_number()) %>%
+    filter(p_adj < 0.1 | rank <= 50) %>%
+    ungroup() %>%
+    arrange(clinical_var, p_adj)
+
+  write.csv(
+    gene_clinical_top,
+    file.path(clinical_output_dir, "step11b2_single_gene_clinical_top_hits.csv"),
+    row.names = FALSE
+  )
+  message(sprintf("✓ Gespeichert: step11b2_single_gene_clinical_top_hits.csv (%d Hits)",
+                  nrow(gene_clinical_top)))
+
+  # 9. Zusammenfassung: FDR-signifikante Befunde
+  fdr_sig_summary <- gene_clinical_all %>%
+    filter(p_adj < 0.05) %>%
+    group_by(clinical_var) %>%
+    summarise(
+      n_genes_fdr = n(),
+      top_gene = gene_id[which.min(p_adj)],
+      min_fdr = min(p_adj),
+      .groups = "drop"
+    )
+
+  if (nrow(fdr_sig_summary) > 0) {
+    message("\n--- FDR-signifikante Gen-Assoziationen (FDR < 0.05) ---")
+    print(fdr_sig_summary)
+  } else {
+    message("\n⚠️ Keine FDR-signifikanten Gen-Assoziationen (FDR < 0.05)")
+  }
+
+  # 10. Visualisierung: Heatmap (Top N Gene × Klinische Variablen, signierte -log10 p)
+
+  # Pivot: Gene × Clinical Variables (p-Werte)
+  top_n_per_var <- 10  # Top 10 Gene pro Variable
+
+  top_genes_per_var <- gene_clinical_all %>%
+    group_by(clinical_var) %>%
+    arrange(p.value) %>%
+    slice_head(n = top_n_per_var) %>%
+    ungroup()
+
+  # Unique Top-Gene
+  unique_top_genes <- unique(top_genes_per_var$gene_id)
+
+  message(sprintf("\n--- Heatmap: Top %d Gene pro Variable (%d unique Gene) ---",
+                  top_n_per_var, length(unique_top_genes)))
+
+  # Matrix: Genes × Clinical Variables (signierte -log10 p)
+  heatmap_data <- gene_clinical_all %>%
+    filter(gene_id %in% unique_top_genes) %>%
+    mutate(
+      signed_log10p = sign(estimate) * (-log10(p.value)),
+      signed_log10p = pmax(pmin(signed_log10p, 10), -10)  # Cap bei ±10
+    ) %>%
+    dplyr::select(gene_id, clinical_var, signed_log10p) %>%
+    pivot_wider(names_from = clinical_var, values_from = signed_log10p, values_fill = 0)
+
+  # Convert to matrix
+  heatmap_mat <- as.matrix(heatmap_data[, -1])
+  rownames(heatmap_mat) <- heatmap_data$gene_id
+
+  # Plot
+  library(pheatmap)
+
+  pdf(file.path(clinical_fig_dir, "step11b2_single_gene_clinical_heatmap.pdf"),
+      width = 8, height = 12)
+
+  pheatmap(
+    heatmap_mat,
+    cluster_rows = TRUE,
+    cluster_cols = FALSE,
+    show_rownames = nrow(heatmap_mat) <= 100,  # Nur bei wenigen Genen
+    color = colorRampPalette(c("blue3", "white", "red3"))(100),
+    breaks = seq(-10, 10, length.out = 101),
+    main = sprintf("Einzelgen × Klinische Variablen (Top %d/Variable)", top_n_per_var),
+    fontsize = 9,
+    fontsize_row = 7,
+    angle_col = 45
+  )
+
+  dev.off()
+  message("✓ Heatmap gespeichert: step11b2_single_gene_clinical_heatmap.pdf")
+
+  # 11. Visualisierung: Volcano Plots (Top 3 klinische Variablen mit meisten Hits)
+
+  top_3_vars <- fdr_sig_summary %>%
+    arrange(desc(n_genes_fdr)) %>%
+    head(3) %>%
+    pull(clinical_var)
+
+  if (length(top_3_vars) == 0) {
+    # Falls keine FDR-Hits: nimm Variablen mit meisten nominellen Hits
+    top_3_vars <- gene_clinical_all %>%
+      filter(p.value < 0.05) %>%
+      group_by(clinical_var) %>%
+      summarise(n = n(), .groups = "drop") %>%
+      arrange(desc(n)) %>%
+      head(3) %>%
+      pull(clinical_var)
+  }
+
+  if (length(top_3_vars) > 0) {
+
+    message(sprintf("\n--- Volcano Plots für Top %d Variablen ---", length(top_3_vars)))
+
+    pdf(file.path(clinical_fig_dir, "step11b2_single_gene_clinical_volcano.pdf"),
+        width = 14, height = 5)
+
+    par(mfrow = c(1, length(top_3_vars)))
+
+    for (plot_var in top_3_vars) {
+
+      var_data <- gene_clinical_all %>% filter(clinical_var == plot_var)
+
+      # Volcano Plot
+      plot(
+        var_data$estimate,
+        -log10(var_data$p.value),
+        pch = 20,
+        col = ifelse(var_data$p_adj < 0.05, "red",
+                     ifelse(var_data$p.value < 0.05, "orange", "grey70")),
+        xlab = "Effekt (β)",
+        ylab = "-log10(p-value)",
+        main = paste0(plot_var, "\n(", sum(var_data$p_adj < 0.05), " FDR<0.05, ",
+                      sum(var_data$p.value < 0.05), " nom<0.05)"),
+        cex = 0.5
+      )
+
+      # Threshold-Linien
+      abline(h = -log10(0.05), lty = 2, col = "grey50")
+      abline(v = 0, lty = 1, col = "grey30")
+
+      # Legende
+      legend("topright",
+             legend = c("FDR<0.05", "p<0.05", "n.s."),
+             col = c("red", "orange", "grey70"),
+             pch = 20,
+             cex = 0.7,
+             bty = "n")
+    }
+
+    dev.off()
+    message("✓ Volcano Plots gespeichert: step11b2_single_gene_clinical_volcano.pdf")
+  }
+
+  message("\n✓ 11b2: Einzelgen-Klinik-Assoziation abgeschlossen")
+
+} else {
+  message("\n⚠️ 11b2: VST-Matrix oder Sample-Metadaten nicht verfügbar — übersprungen")
+}
+
+# Cleanup: Entferne eventuelle var-Objekte (falls durch Fehler erstellt)
+if (exists("var", inherits = FALSE)) rm(var)
+```
+
 ```{r}
 #| label: step11-completion
 #| echo: false
@@ -6419,7 +6777,7 @@ message("========================================")
 message("✓ TRANSKRIPTOM-WEITE INTEGRATION (SCHRITT 11) COMPLETE")
 message("========================================\n")
 
-# Zusammenfassung der Ergebnisse aus 11a, 11b, 11c
+# Zusammenfassung der Ergebnisse aus 11a, 11b, 11b2, 11c
 message("--- Schritt 11 Zusammenfassung ---")
 
 if (exists("gsva_broad_all") && nrow(gsva_broad_all) > 0) {
@@ -6446,6 +6804,29 @@ if (exists("pca_all_results") && nrow(pca_all_results) > 0) {
                   n_pca_tests, n_pca_fdr, n_pca_nom))
 } else {
   message("11b PCA-Klinik: nicht ausgeführt oder keine Ergebnisse")
+}
+
+if (exists("gene_clinical_all") && nrow(gene_clinical_all) > 0) {
+  n_gene_tests <- nrow(gene_clinical_all)
+  n_gene_fdr   <- sum(gene_clinical_all$p_adj < 0.05, na.rm = TRUE)
+  n_gene_nom   <- sum(gene_clinical_all$p.value < 0.05, na.rm = TRUE)
+  message(sprintf("11b2 Einzelgen-Klinik: %d Tests, %d FDR < 0.05, %d nominal < 0.05",
+                  n_gene_tests, n_gene_fdr, n_gene_nom))
+
+  # FDR-Signal identifizieren
+  if (n_gene_fdr > 0) {
+    gene_fdr_summary <- gene_clinical_all %>%
+      filter(p_adj < 0.05) %>%
+      group_by(clinical_var) %>%
+      summarise(n = n(), .groups = "drop") %>%
+      arrange(desc(n))
+    message("  → FDR-signifikante Gene pro Variable:")
+    for (i in 1:nrow(gene_fdr_summary)) {
+      message(sprintf("     %s: %d Gene", gene_fdr_summary$clinical_var[i], gene_fdr_summary$n[i]))
+    }
+  }
+} else {
+  message("11b2 Einzelgen-Klinik: nicht ausgeführt oder keine Ergebnisse")
 }
 
 # 11c Follow-up (PEROXISOME × Sex)
