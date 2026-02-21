@@ -883,20 +883,14 @@ message("=== SCHRITT 5: Cell-type Deconvolution (Dual-Method) ===")
 # === METHODOLOGIE (Literatur-basiert) ===
 #
 # Strategie: Dual-Method Validation (CIBERSORT + MCP-counter)
-# Literatur:
-#   - Avila Cobos et al. 2020 (Nat Commun): "Benchmarking of deconvolution pipelines"
-#   - Nadel et al. 2021 (Brief Bioinform): "Thousands of clinical samples"
-#   - Sturm et al. 2020 (Methods Mol Biol): "immunedeconv package"
 #
 # Rationale für Dual-Method:
 #   - Einzelne Methode kann method-specific bias haben
 #   - Cross-Validation erhöht Robustheit
 #
 # === METHODE 1: CIBERSORT (primär, fraction-based) ===
-# Literatur: Newman et al. 2015, Nat Methods
 #
 # === METHODE 2: MCP-counter (Validierung, enrichment-based) ===
-# Literatur: Becht et al. 2016, Genome Biol
 #
 # → VST-Daten sind UNGEEIGNET (variance-stabilized, log-scale)
 # → Lade DESeq2 raw counts, normalisiere zu CPM
@@ -1827,9 +1821,14 @@ if (file.exists(clinical_deconv_cache_combined)) {
     clinical_deconv_qc_summary <- NULL
   }
 
-  # ============================================================
-  # STEP 6: Merge mit sample_meta_clinical
-  # ============================================================
+} # Ende des else-Blocks (Cache-Miss → Neuberechnung)
+
+# ============================================================
+# STEP 6: Merge mit sample_meta_clinical
+# ============================================================
+# WICHTIG: Dieser Block muss IMMER laufen (Cache-Hit UND Neuberechnung),
+# da sample_meta_clinical aus seinem eigenen Cache (Step 3) geladen wird
+# und die Deconvolution-Spalten nicht zwingend enthaelt.
 
 if (!is.null(clinical_deconv_combined)) {
 
@@ -2020,7 +2019,6 @@ if (!is.null(clinical_deconv_combined)) {
 } else {
   message("⚠️ Deconvolution nicht durchgeführt → wird als Limitation dokumentiert")
   message("   Begründung: CIBERSORT/MCP-counter nicht verfügbar oder fehlgeschlagen")
-  }
 }
 
 ```
@@ -2043,8 +2041,6 @@ message("=== SCHRITT 6: GSVA Pathway-Scores ===")
 
   # ============================================================
   # Ziel: Lade GSVA-Scores aus DEanalysis.qmd, erstelle A-priori Composite
-  # A-priori Basis: RESULTS_STORY.md (Inflammation Core)
-  # Literatur: Hänzelmann et al. 2013 (GSVA original)
   # ============================================================
 
   # Cache-Pfad
@@ -3744,6 +3740,257 @@ message("  ✓ Model diagnostics saved: primary_model_diagnostics.csv")
 
 message("\n========================================")
 message("✓ PRIMARY ANALYSIS COMPLETE")
+message("========================================")
+```
+
+### Sensitivity: Cell-Composition Adjusted Primary Model (MLR)
+
+**Fragestellung:** Bleibt der primäre GSVA-Inflammations-Timecourse nach Adjustierung für Zellkomposition (Myeloid-Lymphoid Ratio) bestehen?
+
+**Reviewer-Kontext:** Direkte Antwort auf die Kernfrage "Ist das Signal nur Zellmix-getrieben?" — Report von Attenuation, VIF und Residualsignal.
+
+```{r}
+#| label: step9-sensitivity-celladjusted-mlr
+#| echo: false
+#| warning: false
+#| message: false
+
+# ============================================================
+# SENSITIVITY: Cell-Composition Adjusted Primary Model
+# ============================================================
+# Model: clinical_inflammation_score ~ timepoint + mlr_cibersort + (1|pid)
+# Purpose: Assess whether primary timepoint effect survives cell-composition adjustment
+# Output: New files only (no overwrite of primary_*.csv)
+# ============================================================
+
+message("\n========================================")
+message("SENSITIVITY: Cell-Adjusted Primary (MLR)")
+message("========================================\n")
+
+# ------------------------------------------------------------
+# PREREQUISITE CHECKS (fail-fast)
+# ------------------------------------------------------------
+if (!exists("sample_meta_clinical")) {
+  stop("FEHLER: sample_meta_clinical nicht gefunden. Bitte vorherige Steps ausfuehren.")
+}
+
+required_cols_base <- c("pid", "timepoint", "clinical_inflammation_score")
+required_cols_cib <- c("CIBERSORT_Monocyte", "CIBERSORT_Neutrophil",
+                       "CIBERSORT_t_cell_total", "CIBERSORT_nk_cell_total")
+
+missing_base <- setdiff(required_cols_base, names(sample_meta_clinical))
+if (length(missing_base) > 0) {
+  stop("FEHLER: Fehlende Spalten in sample_meta_clinical: ", paste(missing_base, collapse = ", "))
+}
+
+missing_cib <- setdiff(required_cols_cib, names(sample_meta_clinical))
+if (length(missing_cib) > 0) {
+  stop("FEHLER: CIBERSORT-Spalten fehlen in sample_meta_clinical: ", paste(missing_cib, collapse = ", "),
+       "\n  Bitte Step 5 (Deconvolution) ausfuehren.")
+}
+
+# ------------------------------------------------------------
+# DATA PREPARATION
+# ------------------------------------------------------------
+epsilon <- 0.01
+
+celladj_data <- sample_meta_clinical %>%
+  filter(timepoint %in% c("A", "V1", "V2")) %>%
+  filter(!is.na(clinical_inflammation_score)) %>%
+  mutate(
+    mlr_cibersort = log2((CIBERSORT_Monocyte + CIBERSORT_Neutrophil + epsilon) /
+                          (CIBERSORT_t_cell_total + CIBERSORT_nk_cell_total + epsilon))
+  ) %>%
+  filter(!is.na(mlr_cibersort)) %>%
+  droplevels()
+
+celladj_data$timepoint <- factor(celladj_data$timepoint, levels = c("A", "V1", "V2"))
+
+# Validate timepoint levels
+if (!identical(levels(celladj_data$timepoint), c("A", "V1", "V2"))) {
+  stop("FEHLER: timepoint levels nicht exakt c('A','V1','V2'). Levels: ",
+       paste(levels(celladj_data$timepoint), collapse = ", "))
+}
+
+n_patients_celladj <- n_distinct(celladj_data$pid)
+n_obs_celladj <- nrow(celladj_data)
+message(sprintf("  Cell-adjusted analysis: n_patients = %d, n_obs = %d", n_patients_celladj, n_obs_celladj))
+
+# ------------------------------------------------------------
+# FIT: Cell-Adjusted LMM
+# ------------------------------------------------------------
+message("\nFitting cell-adjusted model...")
+
+adjusted_model <- lmerTest::lmer(
+  clinical_inflammation_score ~ timepoint + mlr_cibersort + (1 | pid),
+  data = celladj_data,
+  REML = TRUE
+)
+
+message("  Model fitted successfully")
+
+# Singularity check
+singular_flag <- lme4::isSingular(adjusted_model, tol = 1e-4)
+if (singular_flag) {
+  warning("Cell-adjusted model is singular — interpret with caution")
+}
+
+# VIF / Collinearity
+vif_vals <- tryCatch(car::vif(adjusted_model), error = function(e) NULL)
+vif_max <- if (!is.null(vif_vals)) max(vif_vals) else NA
+if (!is.na(vif_max) && vif_max > 10) {
+  warning(sprintf("High VIF detected (max = %.2f) — collinearity concern", vif_max))
+}
+message(sprintf("  VIF max: %.2f %s",
+                ifelse(is.na(vif_max), NA, vif_max),
+                ifelse(!is.na(vif_max) && vif_max > 5, "(elevated)", "(acceptable)")))
+
+# ------------------------------------------------------------
+# TYPE-III ANOVA
+# ------------------------------------------------------------
+adj_anova <- anova(adjusted_model, type = 3)
+
+tp_row <- which(rownames(adj_anova) == "timepoint")
+mlr_row <- which(rownames(adj_anova) == "mlr_cibersort")
+
+message("\n  Type-III ANOVA (cell-adjusted):")
+if (length(tp_row) > 0) {
+  message(sprintf("    timepoint:      F(%.0f, %.1f) = %.2f, p = %.2e",
+                  adj_anova$NumDF[tp_row], adj_anova$DenDF[tp_row],
+                  adj_anova$`F value`[tp_row], adj_anova$`Pr(>F)`[tp_row]))
+}
+if (length(mlr_row) > 0) {
+  message(sprintf("    mlr_cibersort:  F(%.0f, %.1f) = %.2f, p = %.2e",
+                  adj_anova$NumDF[mlr_row], adj_anova$DenDF[mlr_row],
+                  adj_anova$`F value`[mlr_row], adj_anova$`Pr(>F)`[mlr_row]))
+}
+
+# ------------------------------------------------------------
+# EMMs and CONTRASTS
+# ------------------------------------------------------------
+adj_emms <- emmeans::emmeans(adjusted_model, ~ timepoint)
+adj_emms_df <- as.data.frame(adj_emms)
+
+adj_contrasts <- emmeans::contrast(adj_emms,
+                                    list("V1 - A" = c(-1, 1, 0),
+                                         "V2 - A" = c(-1, 0, 1),
+                                         "V2 - V1" = c(0, -1, 1)),
+                                    adjust = "none")
+adj_contrasts_df <- as.data.frame(summary(adj_contrasts, infer = c(TRUE, TRUE)))
+
+# Holm adjustment (for comparability, not new confirmatory claim)
+adj_contrasts_df$p_holm <- p.adjust(adj_contrasts_df$p.value, method = "holm")
+
+message("\n  Cell-adjusted contrasts:")
+for (i in 1:nrow(adj_contrasts_df)) {
+  message(sprintf("    %s: delta = %.3f (95%% CI: %.3f - %.3f), p = %.4f, p_holm = %.4f",
+                  adj_contrasts_df$contrast[i],
+                  adj_contrasts_df$estimate[i],
+                  adj_contrasts_df$lower.CL[i],
+                  adj_contrasts_df$upper.CL[i],
+                  adj_contrasts_df$p.value[i],
+                  adj_contrasts_df$p_holm[i]))
+}
+
+# ------------------------------------------------------------
+# COMPARISON TABLE: Unadjusted vs Cell-Adjusted
+# ------------------------------------------------------------
+# Requires primary_contrasts_df from Step 9 (should exist in environment)
+if (exists("primary_contrasts_df") && nrow(primary_contrasts_df) == 3) {
+
+  comparison_df <- data.frame(
+    contrast = adj_contrasts_df$contrast,
+    estimate_unadj = primary_contrasts_df$estimate,
+    estimate_adj = adj_contrasts_df$estimate,
+    delta_estimate = adj_contrasts_df$estimate - primary_contrasts_df$estimate,
+    attenuation_pct = ifelse(
+      abs(primary_contrasts_df$estimate) > 1e-6,
+      round(100 * (1 - adj_contrasts_df$estimate / primary_contrasts_df$estimate), 1),
+      NA_real_
+    ),
+    p_unadj = primary_contrasts_df$p.value,
+    p_adj = adj_contrasts_df$p.value,
+    p_holm_unadj = primary_contrasts_df$p_holm,
+    p_holm_adj = adj_contrasts_df$p_holm,
+    stringsAsFactors = FALSE
+  )
+
+  message("\n  Comparison (unadjusted vs cell-adjusted):")
+  for (i in 1:nrow(comparison_df)) {
+    message(sprintf("    %s: %.3f -> %.3f (attenuation: %.1f%%)",
+                    comparison_df$contrast[i],
+                    comparison_df$estimate_unadj[i],
+                    comparison_df$estimate_adj[i],
+                    comparison_df$attenuation_pct[i]))
+  }
+
+} else {
+  warning("primary_contrasts_df not available — comparison table skipped")
+  comparison_df <- NULL
+}
+
+# ------------------------------------------------------------
+# DIAGNOSTICS SUMMARY
+# ------------------------------------------------------------
+adj_diagnostics_df <- data.frame(
+  metric = c("n_patients", "n_obs", "F_timepoint", "p_timepoint",
+             "F_mlr", "p_mlr", "VIF_max", "singular", "shapiro_p_resid"),
+  value = c(
+    n_patients_celladj,
+    n_obs_celladj,
+    ifelse(length(tp_row) > 0, adj_anova$`F value`[tp_row], NA),
+    ifelse(length(tp_row) > 0, adj_anova$`Pr(>F)`[tp_row], NA),
+    ifelse(length(mlr_row) > 0, adj_anova$`F value`[mlr_row], NA),
+    ifelse(length(mlr_row) > 0, adj_anova$`Pr(>F)`[mlr_row], NA),
+    vif_max,
+    as.numeric(singular_flag),
+    tryCatch(shapiro.test(residuals(adjusted_model))$p.value, error = function(e) NA)
+  ),
+  stringsAsFactors = FALSE
+)
+
+# ------------------------------------------------------------
+# EXPORTS (new files only)
+# ------------------------------------------------------------
+write.csv(adj_diagnostics_df,
+          file.path(clinical_output_dir, "primary_celladjusted_mlr_diagnostics.csv"),
+          row.names = FALSE)
+
+write.csv(adj_emms_df,
+          file.path(clinical_output_dir, "primary_celladjusted_mlr_emms.csv"),
+          row.names = FALSE)
+
+write.csv(adj_contrasts_df,
+          file.path(clinical_output_dir, "primary_celladjusted_mlr_contrasts.csv"),
+          row.names = FALSE)
+
+if (!is.null(comparison_df)) {
+  write.csv(comparison_df,
+            file.path(clinical_output_dir, "primary_celladjusted_comparison.csv"),
+            row.names = FALSE)
+}
+
+# Cache model object
+saveRDS(adjusted_model,
+        file.path(clinical_cache_dir, "primary_model_celladjusted_mlr.rds"))
+
+message("\n  Exports:")
+message("    primary_celladjusted_mlr_diagnostics.csv")
+message("    primary_celladjusted_mlr_emms.csv")
+message("    primary_celladjusted_mlr_contrasts.csv")
+if (!is.null(comparison_df)) message("    primary_celladjusted_comparison.csv")
+message("    primary_model_celladjusted_mlr.rds (cache)")
+
+# ------------------------------------------------------------
+# INLINE SUMMARY TABLE (visible in rendered QMD)
+# ------------------------------------------------------------
+message("\n--- Cell-Adjusted Sensitivity Summary ---")
+if (!is.null(comparison_df)) {
+  safe_print(comparison_df)
+}
+
+message("\n========================================")
+message("SENSITIVITY: Cell-Adjusted Primary COMPLETE")
 message("========================================")
 ```
 
@@ -5560,6 +5807,204 @@ if (min(n_bev, n_sev) < clinical_params$min_n_per_group) {
 message("\n✓ Valve type analysis complete\n")
 ```
 
+## SECONDARY: Metabolic Risk Score als fokussierter klinischer Modifier
+
+**Fragestellung:** Ist ein konservativ definierter kardio-metabolischer Burden (metabolic_risk_score, 0-4: Diabetes, Dyslipidaemie, Hypertonie, BMI>=30; in Step 2 definiert) mit dem Inflammationsniveau longitudinal assoziiert?
+
+**Rahmung:** Fokussierte Secondary-Analyse mit einem vorab definierten Composite; kein Screening. Ein einzelner Test (metabolic_risk_score) bei alpha=0.05.
+
+```{r}
+#| label: step10-secondary-metabolicrisk
+#| echo: false
+#| warning: false
+#| message: false
+
+# ============================================================
+# SECONDARY: metabolic_risk_score as focused clinical modifier
+# ============================================================
+# Model: clinical_inflammation_score ~ timepoint + metabolic_risk_score + age + sex + (1|pid)
+# Fallback (VIF/convergence): drop age + sex
+# One focused test → alpha = 0.05 (no additional screening)
+# ============================================================
+
+message("\n========================================")
+message("SECONDARY: Metabolic Risk Score Modifier")
+message("========================================\n")
+
+# ------------------------------------------------------------
+# PREREQUISITE CHECKS
+# ------------------------------------------------------------
+if (!exists("sample_meta_clinical")) {
+  stop("FEHLER: sample_meta_clinical nicht gefunden.")
+}
+
+metab_required <- c("pid", "timepoint", "clinical_inflammation_score", "metabolic_risk_score", "age", "sex")
+metab_missing <- setdiff(metab_required, names(sample_meta_clinical))
+if ("metabolic_risk_score" %in% metab_missing) {
+  stop("FEHLER: metabolic_risk_score fehlt in sample_meta_clinical. Bitte Schritt 2 (Variable Engineering) ausfuehren.")
+}
+if (length(metab_missing) > 0) {
+  stop("FEHLER: Fehlende Spalten: ", paste(metab_missing, collapse = ", "))
+}
+
+# ------------------------------------------------------------
+# DATA PREPARATION
+# ------------------------------------------------------------
+metab_data <- sample_meta_clinical %>%
+  filter(timepoint %in% c("A", "V1", "V2")) %>%
+  filter(!is.na(clinical_inflammation_score),
+         !is.na(metabolic_risk_score)) %>%
+  droplevels()
+
+metab_data$timepoint <- factor(metab_data$timepoint, levels = c("A", "V1", "V2"))
+
+if (!identical(levels(metab_data$timepoint), c("A", "V1", "V2"))) {
+  stop("FEHLER: timepoint levels nicht exakt c('A','V1','V2').")
+}
+
+n_patients_metab <- n_distinct(metab_data$pid)
+n_obs_metab <- nrow(metab_data)
+message(sprintf("  Data: n_patients = %d, n_obs = %d", n_patients_metab, n_obs_metab))
+message(sprintf("  metabolic_risk_score range: %d - %d (mean = %.2f)",
+                min(metab_data$metabolic_risk_score, na.rm = TRUE),
+                max(metab_data$metabolic_risk_score, na.rm = TRUE),
+                mean(metab_data$metabolic_risk_score, na.rm = TRUE)))
+
+# Score distribution (patient-level)
+score_dist <- metab_data %>%
+  distinct(pid, .keep_all = TRUE) %>%
+  dplyr::count(metabolic_risk_score)
+message("  Score distribution (patient-level):")
+for (i in 1:nrow(score_dist)) {
+  message(sprintf("    Score %d: n = %d", score_dist$metabolic_risk_score[i], score_dist$n[i]))
+}
+
+# ------------------------------------------------------------
+# MODEL FIT (full model first, fallback if needed)
+# ------------------------------------------------------------
+model_used <- "full"
+has_covariates <- !any(is.na(metab_data$age)) && !any(is.na(metab_data$sex))
+
+if (has_covariates) {
+  metab_model <- tryCatch({
+    lmerTest::lmer(
+      clinical_inflammation_score ~ timepoint + metabolic_risk_score + age + sex + (1 | pid),
+      data = metab_data,
+      REML = FALSE
+    )
+  }, error = function(e) {
+    message("  Full model failed: ", e$message)
+    NULL
+  })
+
+  # VIF check — if problematic, fall back
+  if (!is.null(metab_model)) {
+    metab_vif <- tryCatch(car::vif(metab_model), error = function(e) NULL)
+    if (!is.null(metab_vif) && max(metab_vif) > 10) {
+      message(sprintf("  VIF > 10 (max = %.2f) — falling back to reduced model", max(metab_vif)))
+      metab_model <- NULL
+    }
+  }
+} else {
+  metab_model <- NULL
+}
+
+# Fallback: reduced model without age+sex
+if (is.null(metab_model)) {
+  model_used <- "reduced (no age/sex)"
+  message("  Fitting reduced model (timepoint + metabolic_risk_score only)")
+  metab_model <- lmerTest::lmer(
+    clinical_inflammation_score ~ timepoint + metabolic_risk_score + (1 | pid),
+    data = metab_data,
+    REML = FALSE
+  )
+}
+
+message(sprintf("  Model used: %s", model_used))
+
+# Singularity check
+metab_singular <- lme4::isSingular(metab_model, tol = 1e-4)
+if (metab_singular) {
+  warning("metabolic_risk model is singular — interpret with caution")
+}
+
+# ------------------------------------------------------------
+# TYPE-III ANOVA
+# ------------------------------------------------------------
+metab_anova <- anova(metab_model, type = 3)
+
+message("\n  Type-III ANOVA:")
+for (term_name in rownames(metab_anova)) {
+  message(sprintf("    %s: F(%.0f, %.1f) = %.2f, p = %.4f",
+                  term_name,
+                  metab_anova[term_name, "NumDF"],
+                  metab_anova[term_name, "DenDF"],
+                  metab_anova[term_name, "F value"],
+                  metab_anova[term_name, "Pr(>F)"]))
+}
+
+# ------------------------------------------------------------
+# COEFFICIENTS
+# ------------------------------------------------------------
+metab_coefs <- broom.mixed::tidy(metab_model, conf.int = TRUE) %>%
+  filter(effect == "fixed")
+
+message("\n  Fixed effects:")
+for (i in 1:nrow(metab_coefs)) {
+  message(sprintf("    %s: beta = %.4f (95%% CI: %.4f - %.4f), p = %.4f",
+                  metab_coefs$term[i],
+                  metab_coefs$estimate[i],
+                  metab_coefs$conf.low[i],
+                  metab_coefs$conf.high[i],
+                  metab_coefs$p.value[i]))
+}
+
+# ------------------------------------------------------------
+# EXPORTS
+# ------------------------------------------------------------
+# ANOVA table
+metab_anova_export <- as.data.frame(metab_anova) %>%
+  tibble::rownames_to_column("term")
+metab_anova_export$model_used <- model_used
+metab_anova_export$n_patients <- n_patients_metab
+metab_anova_export$n_obs <- n_obs_metab
+metab_anova_export$singular <- metab_singular
+
+write.csv(metab_anova_export,
+          file.path(clinical_output_dir, "secondary_metabolicrisk_type3_anova.csv"),
+          row.names = FALSE)
+
+# Coefficients
+metab_coefs_export <- metab_coefs
+metab_coefs_export$model_used <- model_used
+metab_coefs_export$n_patients <- n_patients_metab
+
+write.csv(metab_coefs_export,
+          file.path(clinical_output_dir, "secondary_metabolicrisk_coefficients.csv"),
+          row.names = FALSE)
+
+message("\n  Exports:")
+message("    secondary_metabolicrisk_type3_anova.csv")
+message("    secondary_metabolicrisk_coefficients.csv")
+
+# ------------------------------------------------------------
+# INLINE SUMMARY
+# ------------------------------------------------------------
+metab_score_row <- metab_anova_export %>% filter(term == "metabolic_risk_score")
+if (nrow(metab_score_row) > 0) {
+  message(sprintf("\n  RESULT: metabolic_risk_score F = %.2f, p = %.4f (%s)",
+                  metab_score_row$`F value`,
+                  metab_score_row$`Pr(>F)`,
+                  ifelse(metab_score_row$`Pr(>F)` < 0.05, "significant", "not significant")))
+}
+
+safe_print(metab_anova_export %>% dplyr::select(term, `F value`, `Pr(>F)`, n_patients, model_used))
+
+message("\n========================================")
+message("SECONDARY: Metabolic Risk Score COMPLETE")
+message("========================================")
+```
+
 ## SECONDARY ANALYSIS 3: Klinische Laborwerte (PENDING DATA)
 
 **Status:** Code vorbereitet, aber **DEAKTIVIERT** (eval: false)
@@ -5587,6 +6032,195 @@ message("⚠️ Lab analysis DEACTIVATED (data pending)\n")
 ```
 
 **Hinweis:** Diese Analyse wird aktiviert, sobald Laborwerte verfügbar sind.
+
+## EXPLORATORY: Delta(V1-A) Praediktor-Analyse (akute inflammatorische Response)
+
+**Fragestellung:** Welche wenigen, vorher festgelegten Baseline-Parameter erklaeren die akute Inflammationszunahme (Delta V1-A) ueber baseline score-Adjustierung hinaus?
+
+**Design:**
+- Outcome: delta_V1_A = score(V1) - score(A)
+- A-priori Praediktoren (genau 3): age, gfr_cont, metabolic_risk_score
+- Pro Praediktor getrenntes OLS mit score_A als Kovariable (Regression-to-mean-Kontrolle)
+- MCP: BH-FDR ueber 3 Tests
+
+```{r}
+#| label: step10-exploratory-delta-predictors
+#| echo: false
+#| warning: false
+#| message: false
+
+# ============================================================
+# EXPLORATORY: Delta(V1-A) Predictor Analysis
+# ============================================================
+# Outcome: delta_V1_A = score(V1) - score(A)
+# Predictors (a-priori, exactly 3): age, gfr_cont, metabolic_risk_score
+# Model: delta_V1_A ~ predictor_z + score_A (OLS, per predictor)
+# MCP: BH-FDR over 3 tests
+# ============================================================
+
+message("\n========================================")
+message("EXPLORATORY: Delta(V1-A) Predictor Analysis")
+message("========================================\n")
+
+# ------------------------------------------------------------
+# PREREQUISITE CHECKS
+# ------------------------------------------------------------
+if (!exists("sample_meta_clinical")) {
+  stop("FEHLER: sample_meta_clinical nicht gefunden.")
+}
+
+delta_required <- c("pid", "timepoint", "clinical_inflammation_score", "age", "metabolic_risk_score")
+delta_missing <- setdiff(delta_required, names(sample_meta_clinical))
+if (length(delta_missing) > 0) {
+  stop("FEHLER: Fehlende Spalten: ", paste(delta_missing, collapse = ", "))
+}
+
+# gfr_cont must exist (not derived automatically)
+if (!"gfr_cont" %in% names(sample_meta_clinical)) {
+  stop("FEHLER: gfr_cont nicht in sample_meta_clinical gefunden. ",
+       "Bitte Schritt 2 Variable Engineering ausfuehren (gfr_cont = pr_errechnete_gfr_mdrd).")
+}
+
+# ------------------------------------------------------------
+# CONSTRUCT PATIENT-LEVEL WIDE TABLE
+# ------------------------------------------------------------
+delta_wide <- sample_meta_clinical %>%
+  filter(timepoint %in% c("A", "V1")) %>%
+  filter(!is.na(clinical_inflammation_score)) %>%
+  dplyr::select(pid, timepoint, clinical_inflammation_score,
+                age, gfr_cont, metabolic_risk_score) %>%
+  tidyr::pivot_wider(
+    id_cols = c(pid, age, gfr_cont, metabolic_risk_score),
+    names_from = timepoint,
+    values_from = clinical_inflammation_score,
+    names_prefix = "score_"
+  ) %>%
+  filter(!is.na(score_A), !is.na(score_V1)) %>%
+  mutate(delta_V1_A = score_V1 - score_A)
+
+n_delta_patients <- nrow(delta_wide)
+message(sprintf("  Patients with A + V1: n = %d", n_delta_patients))
+
+if (n_delta_patients < 30) {
+  message("  WARNING: Low power (n < 30) — interpret effect sizes, not p-values")
+}
+
+# ------------------------------------------------------------
+# FIT MODELS (one per a-priori predictor)
+# ------------------------------------------------------------
+predictors <- c("age", "gfr_cont", "metabolic_risk_score")
+delta_results <- list()
+
+for (pred in predictors) {
+
+  pred_data <- delta_wide %>% filter(!is.na(.data[[pred]]))
+  n_pred <- nrow(pred_data)
+
+  if (n_pred < 10) {
+    message(sprintf("  SKIPPED %s: n = %d (< 10)", pred, n_pred))
+    next
+  }
+
+  # Standardize predictor
+  pred_data[[paste0(pred, "_z")]] <- as.numeric(scale(pred_data[[pred]]))
+
+  # OLS: delta_V1_A ~ predictor_z + score_A
+  formula_str <- paste0("delta_V1_A ~ ", pred, "_z + score_A")
+  fit <- lm(as.formula(formula_str), data = pred_data)
+
+  # Extract predictor coefficient
+  coef_tbl <- tryCatch({
+    tidy_fit <- broom::tidy(fit, conf.int = TRUE)
+    tidy_fit %>% filter(term == paste0(pred, "_z"))
+  }, error = function(e) NULL)
+
+  if (is.null(coef_tbl) || nrow(coef_tbl) == 0) {
+    message(sprintf("  FAILED to extract coefficient for %s", pred))
+    next
+  }
+
+  # Model diagnostics
+  r_sq <- summary(fit)$r.squared
+  sigma <- summary(fit)$sigma
+
+  # Robust SE (HC3)
+  robust_se <- NA_real_
+  robust_ci_low <- NA_real_
+  robust_ci_high <- NA_real_
+  tryCatch({
+    if (requireNamespace("sandwich", quietly = TRUE) &&
+        requireNamespace("lmtest", quietly = TRUE)) {
+      robust_test <- lmtest::coeftest(fit, vcov = sandwich::vcovHC(fit, type = "HC3"))
+      pred_z_name <- paste0(pred, "_z")
+      robust_se <- robust_test[pred_z_name, "Std. Error"]
+      robust_ci_low <- coef_tbl$estimate - 1.96 * robust_se
+      robust_ci_high <- coef_tbl$estimate + 1.96 * robust_se
+    }
+  }, error = function(e) NULL)
+
+  delta_results[[pred]] <- data.frame(
+    predictor = pred,
+    beta = coef_tbl$estimate,
+    se = coef_tbl$std.error,
+    conf.low = coef_tbl$conf.low,
+    conf.high = coef_tbl$conf.high,
+    p_value = coef_tbl$p.value,
+    robust_se = robust_se,
+    robust_ci_low = robust_ci_low,
+    robust_ci_high = robust_ci_high,
+    n_patients = n_pred,
+    r_squared = r_sq,
+    sigma = sigma,
+    note = "adjusted for score_A; predictor standardized (z)",
+    stringsAsFactors = FALSE
+  )
+
+  message(sprintf("  %s: beta = %.4f (95%% CI: %.4f - %.4f), p = %.4f, n = %d",
+                  pred, coef_tbl$estimate, coef_tbl$conf.low, coef_tbl$conf.high,
+                  coef_tbl$p.value, n_pred))
+}
+
+# ------------------------------------------------------------
+# COMBINE AND APPLY BH-FDR
+# ------------------------------------------------------------
+if (length(delta_results) > 0) {
+
+  delta_models_df <- bind_rows(delta_results)
+  delta_models_df$p_adj <- p.adjust(delta_models_df$p_value, method = "BH")
+
+  message("\n  BH-adjusted p-values:")
+  for (i in 1:nrow(delta_models_df)) {
+    message(sprintf("    %s: p = %.4f, p_adj = %.4f %s",
+                    delta_models_df$predictor[i],
+                    delta_models_df$p_value[i],
+                    delta_models_df$p_adj[i],
+                    ifelse(delta_models_df$p_adj[i] < 0.05, "*", "ns")))
+  }
+
+  # ------------------------------------------------------------
+  # EXPORT
+  # ------------------------------------------------------------
+  write.csv(delta_models_df,
+            file.path(clinical_output_dir, "deltaV1A_predictor_models.csv"),
+            row.names = FALSE)
+
+  message("\n  Export: deltaV1A_predictor_models.csv")
+
+  # ------------------------------------------------------------
+  # INLINE SUMMARY TABLE
+  # ------------------------------------------------------------
+  message("\n--- Delta(V1-A) Predictor Results ---")
+  safe_print(delta_models_df %>%
+    dplyr::select(predictor, beta, conf.low, conf.high, p_value, p_adj, n_patients))
+
+} else {
+  message("  WARNING: No predictor models fitted successfully")
+}
+
+message("\n========================================")
+message("EXPLORATORY: Delta(V1-A) Predictors COMPLETE")
+message("========================================")
+```
 
 ```{r}
 #| label: step10-completion
@@ -6049,6 +6683,142 @@ if (length(gsva_broad_results) > 0) {
 }
 
 message("\n✓ 11a: GSVA-Hallmark-Screening abgeschlossen")
+```
+
+### 11a-Sensitivity: Global BH-FDR over all Step 11a Tests
+
+**Fragestellung:** Welche Step-11a Treffer bleiben unter globaler FDR-Kontrolle (alle ~400 Tests) bestehen?
+
+**Reviewer-Kontext:** Macht die Hypothesefamilie transparent; verhindert den Eindruck, dass ein einzelner Treffer aus 400 Tests als "Discovery" verkauft wird. Globales BH als konservative Obergrenze.
+
+```{r}
+#| label: step11a-sensitivity-global-fdr
+#| echo: false
+#| warning: false
+#| message: false
+
+# ============================================================
+# SENSITIVITY: Global BH-FDR for Step 11a
+# ============================================================
+# Adds p_adj_global (BH over ALL Step-11a tests) to existing results
+# Does NOT modify the original step11a_gsva_broad_clinical_association.csv
+# ============================================================
+
+message("\n========================================")
+message("SENSITIVITY: Step 11a Global BH-FDR")
+message("========================================\n")
+
+# ------------------------------------------------------------
+# LOAD existing Step 11a results
+# ------------------------------------------------------------
+step11a_path <- file.path(clinical_output_dir, "step11a_gsva_broad_clinical_association.csv")
+
+if (!file.exists(step11a_path)) {
+  stop("FEHLER: step11a_gsva_broad_clinical_association.csv nicht gefunden unter: ", step11a_path,
+       "\n  Bitte Step 11a zuerst ausfuehren.")
+}
+
+step11a_orig <- read.csv(step11a_path, stringsAsFactors = FALSE)
+
+# Validate required columns
+required_11a_cols <- c("p.value", "p_adj", "clinical_var", "pathway")
+missing_11a <- setdiff(required_11a_cols, names(step11a_orig))
+if (length(missing_11a) > 0) {
+  stop("FEHLER: Fehlende Spalten in step11a CSV: ", paste(missing_11a, collapse = ", "))
+}
+
+n_tests_total <- sum(!is.na(step11a_orig$p.value))
+message(sprintf("  Loaded Step 11a results: %d rows, %d with valid p-values", nrow(step11a_orig), n_tests_total))
+
+# ------------------------------------------------------------
+# COMPUTE global BH-FDR
+# ------------------------------------------------------------
+step11a_global <- step11a_orig
+step11a_global$p_adj_global <- NA_real_
+valid_p_idx <- !is.na(step11a_global$p.value)
+step11a_global$p_adj_global[valid_p_idx] <- p.adjust(step11a_global$p.value[valid_p_idx], method = "BH")
+
+# Verify row count unchanged
+stopifnot(nrow(step11a_global) == nrow(step11a_orig))
+message(sprintf("  Row count preserved: %d (original) == %d (with global FDR)", nrow(step11a_orig), nrow(step11a_global)))
+
+# Count hits
+n_sig_pervar <- sum(step11a_global$p_adj < 0.05, na.rm = TRUE)
+n_sig_global <- sum(step11a_global$p_adj_global < 0.05, na.rm = TRUE)
+
+message(sprintf("  Hits per-variable BH (p_adj < 0.05):  %d", n_sig_pervar))
+message(sprintf("  Hits global BH (p_adj_global < 0.05): %d", n_sig_global))
+
+# Sanity check: PEROXISOME × sex
+perox_sex <- step11a_global %>%
+  filter(grepl("PEROXISOME", pathway, ignore.case = TRUE),
+         clinical_var == "sex")
+
+if (nrow(perox_sex) > 0) {
+  message(sprintf("  Sanity: sex x PEROXISOME: p_adj = %.4f, p_adj_global = %.4f",
+                  perox_sex$p_adj[1], perox_sex$p_adj_global[1]))
+}
+
+# ------------------------------------------------------------
+# TOP HIT (global)
+# ------------------------------------------------------------
+top_hit_global <- step11a_global %>%
+  filter(!is.na(p_adj_global)) %>%
+  arrange(p_adj_global) %>%
+  slice_head(n = 1)
+
+# ------------------------------------------------------------
+# SUMMARY TABLE
+# ------------------------------------------------------------
+summary_11a_global <- data.frame(
+  metric = c("n_tests_total", "n_sig_pervar_BH", "n_sig_global_BH",
+             "top_hit_clinical_var", "top_hit_pathway",
+             "top_hit_estimate", "top_hit_p_value",
+             "top_hit_p_adj_pervar", "top_hit_p_adj_global"),
+  value = c(
+    as.character(n_tests_total),
+    as.character(n_sig_pervar),
+    as.character(n_sig_global),
+    if (nrow(top_hit_global) > 0) top_hit_global$clinical_var else NA,
+    if (nrow(top_hit_global) > 0) top_hit_global$pathway else NA,
+    if (nrow(top_hit_global) > 0) as.character(round(top_hit_global$estimate, 4)) else NA,
+    if (nrow(top_hit_global) > 0) as.character(signif(top_hit_global$p.value, 4)) else NA,
+    if (nrow(top_hit_global) > 0) as.character(signif(top_hit_global$p_adj, 4)) else NA,
+    if (nrow(top_hit_global) > 0) as.character(signif(top_hit_global$p_adj_global, 4)) else NA
+  ),
+  stringsAsFactors = FALSE
+)
+
+# ------------------------------------------------------------
+# EXPORTS (new files only)
+# ------------------------------------------------------------
+write.csv(step11a_global,
+          file.path(clinical_output_dir, "step11a_gsva_broad_clinical_association_with_globalFDR.csv"),
+          row.names = FALSE)
+
+write.csv(summary_11a_global,
+          file.path(clinical_output_dir, "step11a_globalFDR_summary.csv"),
+          row.names = FALSE)
+
+message("\n  Exports:")
+message("    step11a_gsva_broad_clinical_association_with_globalFDR.csv")
+message("    step11a_globalFDR_summary.csv")
+
+# ------------------------------------------------------------
+# INLINE REPORT
+# ------------------------------------------------------------
+message(sprintf("\n--- Global FDR Sensitivity ---"))
+message(sprintf("Unter globalem BH (alle %d Tests): %d Treffer (FDR < 0.05).", n_tests_total, n_sig_global))
+if (n_sig_global == 0) {
+  message("Kein einzelner Test ueberlebt die globale FDR-Korrektur.")
+  message(sprintf("Per-variable BH liefert %d Treffer — diese sind als screening-interne Priorisierung zu werten, nicht als Discovery-Claim.", n_sig_pervar))
+}
+
+safe_print(summary_11a_global)
+
+message("\n========================================")
+message("SENSITIVITY: Step 11a Global FDR COMPLETE")
+message("========================================")
 ```
 
 ## 11b: PCA × Klinische Variablen
